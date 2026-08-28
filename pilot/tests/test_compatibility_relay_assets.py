@@ -1369,6 +1369,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             environment = os.environ | {
                 "HOME": str(home),
                 "TMPDIR": str(tmp_dir),
+                "XDG_CONFIG_HOME": str(home / ".config"),
                 "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
                 "FAKE_ASSET_DIR": str(asset_dir),
                 "FAKE_RELEASE_METADATA": str(metadata_path),
