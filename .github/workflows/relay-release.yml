@@ -1,0 +1,299 @@
+name: Publish OpenCodex Relay release
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions: {}
+
+concurrency:
+  group: relay-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_REPOSITORY: novelKR/OpenCodex-OCI-Gateway
+  RELEASE_PUBLIC_KEY: config/trust/opencodex-relay-release-ed25519.pub
+
+jobs:
+  preflight:
+    if: github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Bind the release tag, public main, and required checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          [[ "${GITHUB_REF_TYPE}" == tag ]] || {
+            printf 'ERROR: Relay release must run from a tag\n' >&2
+            exit 1
+          }
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || {
+            printf 'ERROR: Relay release tag must be strict SemVer without a v prefix\n' >&2
+            exit 1
+          }
+          [[ "$(git cat-file -t "refs/tags/${version}" 2>/dev/null || true)" == commit ]] || {
+            printf 'ERROR: Relay release tag must be lightweight\n' >&2
+            exit 1
+          }
+          tag_commit="$(git rev-parse --verify "refs/tags/${version}^{commit}")"
+          head_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          [[ "$tag_commit" == "$GITHUB_SHA" && "$head_commit" == "$GITHUB_SHA" ]] || {
+            printf 'ERROR: workflow checkout does not match the Relay release tag\n' >&2
+            exit 1
+          }
+
+          remote_tag="$(gh api "repos/${RELEASE_REPOSITORY}/git/ref/tags/${version}")"
+          [[ "$(jq -r '.object.type' <<<"$remote_tag")" == commit ]] || {
+            printf 'ERROR: remote Relay release tag is not lightweight\n' >&2
+            exit 1
+          }
+          [[ "$(jq -r '.object.sha' <<<"$remote_tag")" == "$GITHUB_SHA" ]] || {
+            printf 'ERROR: remote Relay release tag does not match the workflow commit\n' >&2
+            exit 1
+          }
+          [[ "$(gh api "repos/${RELEASE_REPOSITORY}/commits/main" --jq .sha)" == "$GITHUB_SHA" ]] || {
+            printf 'ERROR: Relay release tag is not the current public main commit\n' >&2
+            exit 1
+          }
+
+          check_runs="$(gh api "repos/${RELEASE_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100")"
+          for required_check in linux macos analyze; do
+            jq -e --arg name "$required_check" '
+              [.check_runs[] | select(.name == $name)]
+              | sort_by(.started_at)
+              | last
+              | (.status == "completed" and .conclusion == "success")
+            ' <<<"$check_runs" >/dev/null || {
+              printf 'ERROR: required check is not successful for %s: %s\n' "$GITHUB_SHA" "$required_check" >&2
+              exit 1
+            }
+          done
+
+          [[ "$(gh api "repos/${RELEASE_REPOSITORY}/immutable-releases" --jq .enabled)" == true ]] || {
+            printf 'ERROR: immutable GitHub Releases must be enabled before tagging\n' >&2
+            exit 1
+          }
+          release_error="$(mktemp)"
+          trap 'rm -f -- "$release_error"' EXIT
+          if gh api "repos/${RELEASE_REPOSITORY}/releases/tags/${version}" >/dev/null 2>"$release_error"; then
+            printf 'ERROR: Relay release already exists: %s\n' "$version" >&2
+            exit 1
+          fi
+          grep -F 'HTTP 404' "$release_error" >/dev/null || {
+            cat "$release_error" >&2
+            exit 1
+          }
+      - name: Validate the public checkout and release contracts
+        run: |
+          set -euo pipefail
+          tools/check-public-checkout.sh HEAD
+          python3 -m unittest \
+            pilot.tests.test_public_core_publication.PublicCorePublicationTests.test_relay_release_workflow_is_public_only_and_fail_closed \
+            pilot.tests.test_compatibility_relay_assets.CompatibilityRelayAssetTests.test_public_github_release_path_is_explicit_and_fail_closed
+          git diff --check
+
+  publish:
+    needs: preflight
+    runs-on: macos-26
+    environment:
+      name: relay-release
+      url: ${{ steps.publish.outputs.release_url }}
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          cache-dependency-path: client/relay/go.sum
+          go-version: "1.24.x"
+      - name: Build with the v2 manifest signing key
+        id: build
+        env:
+          RELEASE_SIGNING_KEY_B64: ${{ secrets.OPENCODEX_RELAY_RELEASE_SIGNING_KEY_B64_V2 }}
+        run: |
+          set -euo pipefail
+          [[ -n "$RELEASE_SIGNING_KEY_B64" ]] || {
+            printf 'ERROR: Relay release signing key is unavailable\n' >&2
+            exit 1
+          }
+          version="${GITHUB_REF_NAME}"
+          release_root="${RUNNER_TEMP}/relay-release/${version}"
+          key_path="${RUNNER_TEMP}/opencodex-relay-release-signing-key-v2.pem"
+          key_public_der="${RUNNER_TEMP}/opencodex-relay-release-signing-key-v2.der"
+          trusted_public_der="${RUNNER_TEMP}/opencodex-relay-release-trusted-v2.der"
+          cleanup() {
+            rm -f -- "$key_path" "$key_public_der" "$trusted_public_der"
+          }
+          trap cleanup EXIT
+          umask 077
+          mkdir -p "$release_root"
+          printf '%s' "$RELEASE_SIGNING_KEY_B64" | base64 -D > "$key_path"
+          chmod 0600 "$key_path"
+          openssl pkey -in "$key_path" -text -noout 2>/dev/null | grep -Eq '^ED25519 Private-Key:' || {
+            printf 'ERROR: environment secret is not an Ed25519 private key\n' >&2
+            exit 1
+          }
+          openssl pkey -in "$key_path" -pubout -outform DER > "$key_public_der"
+          openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY" -outform DER > "$trusted_public_der"
+          cmp -s "$key_public_der" "$trusted_public_der" || {
+            printf 'ERROR: environment signing key does not match the tracked v2 public key\n' >&2
+            exit 1
+          }
+          ./client/relay/scripts/build-release.sh "$version" \
+            --github-repo "$RELEASE_REPOSITORY" \
+            --signing-key "$key_path" \
+            --output "$release_root"
+          printf 'artifact_dir=%s\n' "$release_root" >> "$GITHUB_OUTPUT"
+      - name: Independently verify the release bundle
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          release_root="${{ steps.build.outputs.artifact_dir }}"
+          manifest="${release_root}/manifest-${version}.json"
+          signature="${release_root}/manifest-${version}.sig"
+          expected_assets="$(
+            printf '%s\n' \
+              OpenCodexRelay.app.zip \
+              THIRD_PARTY_NOTICES.md \
+              "manifest-${version}.json" \
+              "manifest-${version}.sig" \
+              opencodex-relay_linux_amd64 \
+              opencodex-relay_linux_arm64 \
+              opencodex-relayctl_linux_amd64 \
+              opencodex-relayctl_linux_arm64 | LC_ALL=C sort
+          )"
+          actual_assets="$(find "$release_root" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+          [[ "$actual_assets" == "$expected_assets" ]] || {
+            printf 'ERROR: release output is not the exact eight-asset set\n' >&2
+            diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$actual_assets") >&2 || true
+            exit 1
+          }
+
+          signature_bin="${RUNNER_TEMP}/manifest-${version}.sig.bin"
+          trap 'rm -f -- "$signature_bin"' EXIT
+          base64 -D < "$signature" > "$signature_bin"
+          openssl pkeyutl -verify -pubin -inkey "$RELEASE_PUBLIC_KEY" -rawin \
+            -in "$manifest" -sigfile "$signature_bin"
+          python3 - "$release_root" "$version" "$RELEASE_REPOSITORY" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          version = sys.argv[2]
+          repository = sys.argv[3]
+          manifest = json.loads((root / f"manifest-{version}.json").read_text(encoding="utf-8"))
+          if manifest.get("version") != version or manifest.get("compatibility_revision") != 4:
+              raise SystemExit("manifest version or compatibility revision mismatch")
+          artifacts = manifest.get("artifacts")
+          documents = manifest.get("documents")
+          if not isinstance(artifacts, list) or len(artifacts) != 5:
+              raise SystemExit("manifest must contain five artifacts")
+          if not isinstance(documents, list) or len(documents) != 1:
+              raise SystemExit("manifest must contain one notices document")
+          expected_prefix = f"https://github.com/{repository}/releases/download/{version}/"
+          for entry in [*artifacts, *documents]:
+              path = root / entry["file"]
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"manifest entry is not a regular file: {entry['file']}")
+              if entry["url"] != expected_prefix + entry["file"]:
+                  raise SystemExit(f"manifest URL mismatch: {entry['file']}")
+              if hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+                  raise SystemExit(f"manifest hash mismatch: {entry['file']}")
+          macos = next((entry for entry in artifacts if entry.get("component") == "macos_menu_bar_bundle"), None)
+          if macos is None or macos.get("os") != "darwin" or macos.get("arch") != "arm64":
+              raise SystemExit("manifest has no darwin/arm64 app bundle")
+          if macos.get("bundle_id") != "io.github.novelkr.opencodex-relay" or macos.get("signing_mode") != "adhoc":
+              raise SystemExit("manifest macOS signing identity mismatch")
+          PY
+
+          extract_root="${RUNNER_TEMP}/relay-release-verify-${version}"
+          rm -rf -- "$extract_root"
+          mkdir -p "$extract_root"
+          ditto -x -k "${release_root}/OpenCodexRelay.app.zip" "$extract_root"
+          app="${extract_root}/OpenCodexRelay.app"
+          plist="${app}/Contents/Info.plist"
+          [[ -d "$app" && ! -L "$app" && -f "$plist" && ! -L "$plist" ]] || {
+            printf 'ERROR: archive has no regular OpenCodexRelay.app bundle\n' >&2
+            exit 1
+          }
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" == io.github.novelkr.opencodex-relay ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" == "$version" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "${version%%-*}" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexBundleIdentifier' "$plist")" == com.openai.codex ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexTeamIdentifier' "$plist")" == 2DC432GLL2 ]]
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          helper="${app}/Contents/Library/HelperTools/OpenCodexRelayPrivilegedHelper"
+          installer="${app}/Contents/Library/Helpers/OpenCodexRelayHelperInstaller"
+          app_binary="${app}/Contents/MacOS/OpenCodexRelay"
+          relay="${app}/Contents/Library/Helpers/opencodex-relay"
+          relayctl="${app}/Contents/Library/Helpers/opencodex-relayctl"
+          for component in "$app" "$app_binary" "$helper" "$installer" "$relay" "$relayctl"; do
+            details="$(codesign -dvvv --verbose=4 "$component" 2>&1)"
+            grep -Fx 'Signature=adhoc' <<<"$details" >/dev/null
+            grep -Fx 'TeamIdentifier=not set' <<<"$details" >/dev/null
+            grep -E '^CodeDirectory .*flags=.*\(.*runtime.*\)' <<<"$details" >/dev/null
+          done
+          codesign -dvvv "$helper" 2>&1 | grep -Fx 'Identifier=io.github.novelkr.opencodex-relay.homebrew-guard.helper' >/dev/null
+          codesign -dvvv "$installer" 2>&1 | grep -Fx 'Identifier=io.github.novelkr.opencodex-relay.homebrew-guard.installer' >/dev/null
+          helper_cdhash="$(codesign -dvvv "$helper" 2>&1 | sed -nE 's/^CDHash=([0-9a-f]+)$/\1/p')"
+          [[ -n "$helper_cdhash" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardHelperRequirement' "$plist")" == "cdhash H\"${helper_cdhash}\"" ]]
+          for executable in "$app_binary" "$helper" "$installer" "$relay" "$relayctl"; do
+            [[ "$(lipo -archs "$executable")" == arm64 ]]
+          done
+          if spctl -a -vv "$app"; then
+            printf 'ERROR: ad-hoc bundle unexpectedly passed Gatekeeper trust assessment\n' >&2
+            exit 1
+          fi
+          printf 'gatekeeper_approval=manual expected_for=adhoc\n'
+      - name: Attest the eight release assets
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: "${{ steps.build.outputs.artifact_dir }}/*"
+      - name: Publish the immutable GitHub Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          remote_tag="$(gh api "repos/${RELEASE_REPOSITORY}/git/ref/tags/${version}")"
+          [[ "$(jq -r '.object.type' <<<"$remote_tag")" == commit ]]
+          [[ "$(jq -r '.object.sha' <<<"$remote_tag")" == "$GITHUB_SHA" ]]
+          if gh release view "$version" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            printf 'ERROR: Relay release appeared after preflight: %s\n' "$version" >&2
+            exit 1
+          fi
+          ./client/relay/scripts/publish-github-release.sh "$version" \
+            --repo "$RELEASE_REPOSITORY" \
+            --input "${{ steps.build.outputs.artifact_dir }}" \
+            --public-key "$RELEASE_PUBLIC_KEY"
+          release_url="$(gh release view "$version" --repo "$RELEASE_REPOSITORY" --json url --jq .url)"
+          printf 'release_url=%s\n' "$release_url" >> "$GITHUB_OUTPUT"
+          {
+            printf '## OpenCodex Relay %s\n\n' "$version"
+            printf 'Immutable release: %s\n\n' "$release_url"
+            printf '```text\n'
+            shasum -a 256 "${{ steps.build.outputs.artifact_dir }}"/*
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"

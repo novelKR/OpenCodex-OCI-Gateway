@@ -43,46 +43,28 @@ it exits and starts again.
 
 ## Native relay release path
 
-Build the four Linux helpers and the self-contained Hardened Runtime, ad-hoc-signed
-`OpenCodexRelay.app.zip` on a trusted macOS release workstation. The Ed25519
-private signing key stays off-repo. Publish the explicit version directory,
-those five components, `THIRD_PARTY_NOTICES.md`, and its manifest and signature
-together. Each client verifies the manifest signature, selected component
-checksums, and the signed notice checksum before it updates `current`.
+The public GitHub Actions workflow builds the four Linux helpers and the
+self-contained Hardened Runtime, ad-hoc-signed `OpenCodexRelay.app.zip` on a
+`macos-26` runner. The protected v2 Ed25519 private signing key stays in the
+`relay-release` GitHub Environment and is exposed only to the build step. The
+workflow publishes the five components, `THIRD_PARTY_NOTICES.md`, manifest, and
+signature together as eight immutable assets. Each client verifies the manifest
+signature, selected component checksums, and signed notice checksum before it
+updates `current`.
 Revision 1 and 2 releases remain available for rollback; new builds use
 component-aware compatibility revision 4 with `signing_mode: "adhoc"`.
 
-```bash
-./client/relay/scripts/build-release.sh REPLACE_WITH_VERSION \
-  --base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
-  --signing-key /secure/off-repo/release-ed25519.pem \
-  --output /secure/release-staging/REPLACE_WITH_VERSION
-
-./client/relay/scripts/install-relay.sh install REPLACE_WITH_VERSION \
-  --release-base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
-  --public-key /secure/path/release-ed25519.pub \
-  --upstream https://REPLACE_WITH_API_HOSTNAME/v1
-```
-
 ### Public GitHub Release option
 
-Use the public Core repository's GitHub-specific source instead of `--base-url`.
-Enable immutable releases first and publish a tag equal to the exact semver version.
+Use a lightweight strict-SemVer tag without a `v` prefix. Before approving the
+protected Environment deployment, confirm the tag points to current public
+`main` and the exact commit has successful `linux`, `macos`, and `analyze`
+checks. Release `0.3.6` is the first version published through this path.
 
 ```bash
-./client/relay/scripts/build-release.sh 1.2.3 \
-  --github-repo OWNER/opencodex-relay-releases \
-  --signing-key /secure/off-repo/release-ed25519.pem \
-  --output /secure/release-staging/1.2.3
-
-./client/relay/scripts/publish-github-release.sh 1.2.3 \
-  --repo OWNER/opencodex-relay-releases \
-  --input /secure/release-staging/1.2.3 \
-  --public-key /secure/off-repo/release-ed25519.pub
-
 ./client/relay/scripts/install-relay.sh install 1.2.3 \
-  --github-repo OWNER/opencodex-relay-releases \
-  --public-key /secure/path/release-ed25519.pub \
+  --github-repo novelKR/OpenCodex-OCI-Gateway \
+  --public-key config/trust/opencodex-relay-release-ed25519.pub \
   --upstream https://REPLACE_WITH_API_HOSTNAME/v1
 ```
 

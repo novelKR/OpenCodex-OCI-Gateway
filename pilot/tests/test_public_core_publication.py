@@ -117,6 +117,49 @@ class PublicCorePublicationTests(unittest.TestCase):
         )
         self.assertIn('tools/verify-release-ref.sh "$version"', container)
 
+    def test_relay_release_workflow_is_public_only_and_fail_closed(self):
+        workflow = (
+            ROOT / ".github" / "workflows" / "relay-release.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('- "[0-9]*.[0-9]*.[0-9]*"', workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertEqual(
+            workflow.count(
+                "if: github.repository == 'novelKR/OpenCodex-OCI-Gateway' "
+                "&& github.event.repository.private == false"
+            ),
+            1,
+        )
+        self.assertIn("name: relay-release", workflow)
+        self.assertIn("checks: read", workflow)
+        self.assertIn("contents: write", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("attestations: write", workflow)
+        self.assertNotIn("packages: write", workflow)
+        self.assertEqual(
+            workflow.count("OPENCODEX_RELAY_RELEASE_SIGNING_KEY_B64_V2"), 1
+        )
+        self.assertIn("immutable-releases", workflow)
+        self.assertIn("for required_check in linux macos analyze", workflow)
+        self.assertIn("Relay release tag must be lightweight", workflow)
+        self.assertIn("current public main commit", workflow)
+        self.assertIn("build-release.sh \"$version\"", workflow)
+        self.assertIn("publish-github-release.sh \"$version\"", workflow)
+        self.assertIn("release output is not the exact eight-asset set", workflow)
+        self.assertIn("gatekeeper_approval=manual expected_for=adhoc", workflow)
+        self.assertIn("Signature=adhoc", workflow)
+        self.assertIn("TeamIdentifier=not set", workflow)
+        self.assertNotIn("notarytool", workflow)
+        self.assertNotIn("stapler", workflow)
+        for action in (
+            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+            "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
+        ):
+            self.assertIn(action, workflow)
+        self.assertNotRegex(workflow, r"uses: actions/[^@\n]+@v[0-9]+")
+
     def test_release_ref_verifier_binds_tag_workflow_and_checkout_commits(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = pathlib.Path(directory) / "repository"
