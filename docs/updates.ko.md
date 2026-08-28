@@ -39,45 +39,26 @@ cross-process snapshot이며 resident relay의 admission gate가 아니므로, �
 
 ## Native relay release 경로
 
-신뢰하는 macOS release workstation에서 Linux helper 네 개와 Hardened Runtime을 적용한
-self-contained ad-hoc `OpenCodexRelay.app.zip`을 빌드합니다. Ed25519 private signing key는
-저장소 밖에 둡니다. 명시 version directory, 다섯
-component, `THIRD_PARTY_NOTICES.md`, manifest와 signature를 함께 publish하고, 각 client는
+public GitHub Actions workflow가 `macos-26` runner에서 Linux helper 네 개와 Hardened
+Runtime을 적용한 self-contained ad-hoc `OpenCodexRelay.app.zip`을 빌드합니다. v2 Ed25519
+private signing key는 보호된 `relay-release` GitHub Environment에 두고 build step에만
+노출합니다. 다섯 component, `THIRD_PARTY_NOTICES.md`, manifest와 signature를 총 8개
+immutable asset으로 함께 publish하고, 각 client는
 `current`를 바꾸기 전에 manifest signature, 선택 component checksum, signed notice checksum을
 모두 검증합니다. revision 1/2는 rollback artifact로 남지만 새 build는
 `signing_mode: "adhoc"`을 포함하는 component-aware compatibility revision 4를 사용합니다.
 
-```bash
-./client/relay/scripts/build-release.sh REPLACE_WITH_VERSION \
-  --base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
-  --signing-key /secure/off-repo/release-ed25519.pem \
-  --output /secure/release-staging/REPLACE_WITH_VERSION
-
-./client/relay/scripts/install-relay.sh install REPLACE_WITH_VERSION \
-  --release-base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
-  --public-key /secure/path/release-ed25519.pub \
-  --upstream https://REPLACE_WITH_API_HOSTNAME/v1
-```
-
 ### public GitHub Release를 사용하는 경우
 
-public Core 저장소에서는 `--base-url` 대신 GitHub 전용 source를 사용할 수 있습니다. 먼저
-repository에 immutable releases를 활성화하고 release tag를 exact semver로 게시합니다.
+`v` 접두사가 없는 lightweight strict-SemVer tag를 사용합니다. 보호된 Environment 배포를
+승인하기 전에 tag가 현재 public `main`을 가리키고 exact commit의 `linux`, `macos`,
+`analyze` check가 모두 성공했는지 확인합니다. 이 경로로 게시하는 최초 release는
+`0.3.6`입니다.
 
 ```bash
-./client/relay/scripts/build-release.sh 1.2.3 \
-  --github-repo OWNER/opencodex-relay-releases \
-  --signing-key /secure/off-repo/release-ed25519.pem \
-  --output /secure/release-staging/1.2.3
-
-./client/relay/scripts/publish-github-release.sh 1.2.3 \
-  --repo OWNER/opencodex-relay-releases \
-  --input /secure/release-staging/1.2.3 \
-  --public-key /secure/off-repo/release-ed25519.pub
-
 ./client/relay/scripts/install-relay.sh install 1.2.3 \
-  --github-repo OWNER/opencodex-relay-releases \
-  --public-key /secure/path/release-ed25519.pub \
+  --github-repo novelKR/OpenCodex-OCI-Gateway \
+  --public-key config/trust/opencodex-relay-release-ed25519.pub \
   --upstream https://REPLACE_WITH_API_HOSTNAME/v1
 ```
 

@@ -643,20 +643,24 @@ compatibility alias only.
 
 ## Build and publish a release
 
-On a trusted release workstation, create an immutable version directory and
-publish the four Linux helpers, ad-hoc-signed `OpenCodexRelay.app.zip`,
-`THIRD_PARTY_NOTICES.md`, manifest, and signature together under
-`RELEASE_BASE/VERSION/`:
+The public release authority is `.github/workflows/relay-release.yml`. A
+lightweight strict-SemVer tag without a `v` prefix starts the workflow only in
+the public `novelKR/OpenCodex-OCI-Gateway` repository. The preflight binds that
+tag to current public `main`, requires the successful `linux`, `macos`, and
+`analyze` checks for the exact commit, and refuses an existing release or a
+repository without immutable releases enabled.
 
-```bash
-./client/relay/scripts/build-release.sh REPLACE_WITH_VERSION \
-  --base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
-  --signing-key /secure/off-repo/opencodex-relay-release-ed25519.pem \
-  --output /secure/release-staging/REPLACE_WITH_VERSION
-```
+The protected `relay-release` GitHub Environment holds the base64-encoded v2
+Ed25519 private key. The macOS job compares its derived public key with
+[`../../config/trust/opencodex-relay-release-ed25519.pub`](../../config/trust/opencodex-relay-release-ed25519.pub),
+builds and independently verifies exactly eight assets, attaches GitHub build
+provenance, and then calls `scripts/publish-github-release.sh`. The publisher
+creates a draft, verifies its exact asset set, publishes it, and removes the new
+release if immutable status cannot be confirmed. Release `0.3.6` is the first
+version using this public CI path.
 
-Do not commit the private key, a generated release directory, credentials, or
-live request logs. Manifest compatibility revision 4 signs component identity,
+Do not commit the private key, its base64 representation, a generated release
+directory, credentials, or live request logs. Manifest compatibility revision 4 signs component identity,
 the macOS bundle ID, `signing_mode: "adhoc"`, the final app zip hash, and the
 notice URL/SHA-256. The installer verifies the Ed25519 signature, every asset
 hash, the nested ad-hoc signatures, the absence of a Relay Team ID, and the
@@ -671,10 +675,9 @@ blocks app replacement. Retain the
 previous release directory so changing the `current` symlink can be rolled back
 by reinstalling the prior reviewed version.
 
-For a public immutable GitHub Release, build with `--github-repo OWNER/REPO`, publish the
-verified bundle with `scripts/publish-github-release.sh`, and install with
-`--github-repo OWNER/REPO`. A mode-`0600` token is optional when anonymous API
-rate limits are insufficient; details and the
+Install the exact public release with `--github-repo
+novelKR/OpenCodex-OCI-Gateway` and the tracked public key. A mode-`0600` token
+is optional when anonymous API rate limits are insufficient; details and the
 Remote-host command are in [`../../docs/local-codex-relay.md`](../../docs/local-codex-relay.md).
 
 The macOS app is deliberately not notarized and has no Apple publisher

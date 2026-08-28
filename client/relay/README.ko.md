@@ -395,13 +395,19 @@ python3 -m unittest pilot.tests.test_compatibility_relay_assets
 Remote UI 연결을 증명하지 않습니다. 배포 완료는 정본 운영 가이드의 live acceptance
 목록으로 별도 판정합니다.
 
-public immutable GitHub Release를 쓰는 경우 `build-release.sh --github-repo OWNER/REPO`로
-manifest를 만들고 `publish-github-release.sh`로 immutable release를 게시한 뒤,
-소비 host에서는 `install-relay.sh --github-repo OWNER/REPO`를 사용합니다. 익명 API rate
-limit이 부족할 때만 current-user `0600` token file을 선택적으로 지정하며,
-macOS release signing key는 `bootstrap-keychain-signing-key.sh`로 login Keychain에 만들고
-native Security API로 raw PEM을 읽습니다. `security -w` text conversion을 release key에
-사용하지 않습니다.
+public 배포의 정본은 `.github/workflows/relay-release.yml`입니다. `v` 접두사가 없는
+lightweight strict-SemVer tag만 public `novelKR/OpenCodex-OCI-Gateway` 저장소에서 workflow를
+시작합니다. preflight는 tag가 현재 public `main`과 일치하는지, exact commit의 `linux`,
+`macos`, `analyze`가 성공했는지, immutable releases가 켜져 있는지와 같은 version release가
+없는지를 확인합니다. 보호된 `relay-release` Environment의 v2 Ed25519 private key는 macOS
+build step에서만 사용하며 tracked public key와 일치해야 합니다. CI는 정확히 8개 asset과
+GitHub build provenance를 만들고 검증한 뒤 `publish-github-release.sh`로 immutable release를
+게시합니다. 이 public CI 경로의 최초 version은 `0.3.6`입니다.
+
+소비 host에서는 `install-relay.sh --github-repo novelKR/OpenCodex-OCI-Gateway`와
+`config/trust/opencodex-relay-release-ed25519.pub`를 사용합니다. 익명 API rate limit이 부족할
+때만 current-user `0600` token file을 선택적으로 지정합니다. private key, base64 secret,
+생성된 release directory는 저장소에 커밋하지 않습니다.
 revision 4 bundle은 Linux helper 네 개, Hardened Runtime ad-hoc `OpenCodexRelay.app.zip`,
 `THIRD_PARTY_NOTICES.md`, manifest, signature의 총 8개 asset입니다. manifest는 component,
 macOS bundle ID, `signing_mode: "adhoc"`, final zip hash, notice URL/SHA-256를 함께

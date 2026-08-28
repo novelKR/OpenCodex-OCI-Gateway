@@ -17,9 +17,9 @@ Before getting started, ensure you have:
 - **OCI Host**: A Linux instance (e.g., Ubuntu 24.04 on an OCI Always Free eligible `VM.Standard.E2.1.Micro` shape).
 - **Cloudflare Account**: A domain with Cloudflare Zero Trust (Tunnel and Access service tokens configured).
 - **Client Credentials**: A Cloudflare Access Service Token (Client ID and Secret) and a Gateway API Key configured on your host.
-- **Client Software**: On Apple Silicon macOS 26+, use a reviewed `OpenCodexRelay.app.zip` release when available. For Linux source builds, install Go 1.24+.
+- **Client Software**: On Apple Silicon macOS 26+, download the reviewed `OpenCodexRelay.app.zip` from this repository's immutable GitHub Releases. For Linux source builds, install Go 1.24+.
 
-> **macOS release status:** Check [Releases](https://github.com/novelKR/OpenCodex-OCI-Gateway/releases) for `OpenCodexRelay.app.zip`. If no archive is listed, a prebuilt app is not available yet; developers can follow the [local build guide](client/relay/README.md).
+> **macOS distribution:** Public Relay releases use SemVer tags without a `v` prefix (beginning with `0.3.6`). GitHub Actions builds and verifies every asset before publishing it as an immutable release. The app is ad-hoc signed with the Hardened Runtime, so first launch requires the macOS approval described below.
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ Choose your starting path:
 
 #### On macOS (Apple Silicon, macOS 26+)
 
-1. Download and expand `OpenCodexRelay.app.zip` from [Releases](https://github.com/novelKR/OpenCodex-OCI-Gateway/releases). If it is not listed, use the developer build path linked above.
+1. Download and expand `OpenCodexRelay.app.zip` from the exact version under [Releases](https://github.com/novelKR/OpenCodex-OCI-Gateway/releases). Developers who need an unpublished build should use the [local build guide](client/relay/README.md).
 2. Open the application. If macOS blocks it, navigate to **System Settings > Privacy & Security > Open Anyway**, then confirm **Open**.
 3. In Settings, select **Move to Applications** to relocate the app to `/Applications/OpenCodexRelay.app` (or `~/Applications/`).
 4. In **Control Center > Settings > Connect a self-hosted server**, select your authentication profile and enter your server URL and credentials.
@@ -75,8 +75,8 @@ For normal setups, use the signed installer. Store the three relay credentials l
 2. Install and launch the managed relay service:
    ```bash
    ./client/relay/scripts/install-relay.sh install REPLACE_WITH_VERSION \
-     --release-base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
-     --public-key /path/to/opencodex-relay-release-ed25519.pub \
+     --github-repo novelKR/OpenCodex-OCI-Gateway \
+     --public-key config/trust/opencodex-relay-release-ed25519.pub \
      --upstream https://REPLACE_WITH_API_HOSTNAME/v1
    ```
 
