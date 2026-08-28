@@ -698,6 +698,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn('--app-server-home must be an absolute path', installer)
         self.assertNotIn('--manage-app-server "$manage_app_server"', installer)
         self.assertIn("GitHub release repository must be public", publisher)
+        self.assertIn('gh api "repos/${repo}" --jq .visibility', publisher)
+        self.assertNotIn("gh api user", publisher)
         self.assertIn("--draft=false", publisher)
         self.assertIn("isImmutable", publisher)
         self.assertIn('release_files=("$manifest" "$signature" "$notices")', publisher)
@@ -1026,8 +1028,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 "printf '%s\\n' \"$*\" >> \"$FAKE_GH_LOG\"\n"
-                "if [[ ${1:-} == api && ${2:-} == user ]]; then printf 'publisher\\n'; exit 0; fi\n"
-                "if [[ ${1:-} == repo && ${2:-} == view ]]; then printf 'PUBLIC\\n'; exit 0; fi\n"
+                "if [[ ${1:-} == api && ${2:-} == repos/* ]]; then printf 'public\\n'; exit 0; fi\n"
                 "if [[ ${1:-} == release && ${2:-} == view ]]; then\n"
                 "  [[ -f $FAKE_GH_STATE/created ]] || exit 1\n"
                 "  if [[ \" $* \" == *\" --json isDraft,isImmutable \"* ]]; then printf 'false\\ttrue\\n'; exit 0; fi\n"

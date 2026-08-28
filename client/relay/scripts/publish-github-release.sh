@@ -80,9 +80,9 @@ command -v cmp >/dev/null || die 'cmp is required'
 command -v jq >/dev/null || die 'jq is required for component-aware manifests'
 require_ed25519_public_key "$public_key"
 
-GH_PROMPT_DISABLED=1 GH_HOST=github.com gh api user --jq .login >/dev/null || \
-  die 'GitHub authentication is unavailable; run gh auth login for the publishing account'
-[[ "$(GH_PROMPT_DISABLED=1 GH_HOST=github.com gh repo view "$repo" --json visibility --jq .visibility)" == "PUBLIC" ]] || \
+visibility="$(GH_PROMPT_DISABLED=1 GH_HOST=github.com gh api "repos/${repo}" --jq .visibility)" || \
+  die 'GitHub authentication cannot read the selected release repository'
+[[ "$visibility" == "public" ]] || \
   die 'GitHub release repository must be public'
 
 manifest="${input_dir}/manifest-${version}.json"
