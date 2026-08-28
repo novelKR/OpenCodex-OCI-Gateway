@@ -1,0 +1,515 @@
+#!/bin/bash
+# Root-managed, path-pinned launcher for the centrally managed OpenCodex service.
+
+set -Eeuo pipefail
+
+readonly SYSTEM_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+readonly RUNTIME_CONFIG="/etc/opencodex/runtime.json"
+readonly PRODUCTION_INVOKER="/usr/local/libexec/opencodex-runtime"
+readonly REQUIRED_UID="0"
+readonly SERVICE_USER="opencodex"
+readonly TRUSTED_RUNTIME_UIDS="0"
+readonly PACKAGE_NAME="@bitkyc08/opencodex"
+readonly PACKAGE_RELATIVE_DIR="lib/node_modules/${PACKAGE_NAME}"
+readonly OCX_RELATIVE_PATH="${PACKAGE_RELATIVE_DIR}/bin/ocx.mjs"
+readonly PACKAGE_MANIFEST_RELATIVE_PATH="${PACKAGE_RELATIVE_DIR}/package.json"
+readonly BUN_PACKAGE_RELATIVE_DIR="${PACKAGE_RELATIVE_DIR}/node_modules/bun"
+readonly BUN_MANIFEST_RELATIVE_PATH="${BUN_PACKAGE_RELATIVE_DIR}/package.json"
+readonly BUN_INSTALL_RELATIVE_PATH="${BUN_PACKAGE_RELATIVE_DIR}/install.js"
+readonly BUN_BINARY_RELATIVE_PATH="${BUN_PACKAGE_RELATIVE_DIR}/bin/bun.exe"
+readonly BUN_FALLBACK_BINARY_RELATIVE_PATH="${BUN_PACKAGE_RELATIVE_DIR}/bin/bun"
+readonly REAL_BUN_MIN_BYTES="1000000"
+
+home=""
+prefix=""
+node_bin=""
+npm_cli=""
+ocx_entry=""
+package_manifest=""
+bun_manifest=""
+bun_install=""
+bun_binary=""
+bun_fallback_binary=""
+runtime_config="${RUNTIME_CONFIG}"
+self_path=""
+
+# Validation itself must not resolve tools through an inherited caller PATH.
+export PATH="${SYSTEM_PATH}"
+unset BASH_ENV ENV NODE_OPTIONS
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  opencodex-runtime check
+  opencodex-runtime describe --json
+  opencodex-runtime prepare-bundled-bun VERSION
+  opencodex-runtime ocx [ARGS...]
+  opencodex-runtime npm [ARGS...]
+USAGE
+}
+
+numeric_uid() {
+  stat -c '%u' -- "$1" 2>/dev/null || stat -f '%u' -- "$1"
+}
+
+numeric_mode() {
+  stat -c '%a' -- "$1" 2>/dev/null || stat -f '%Lp' -- "$1"
+}
+
+numeric_size() {
+  stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1"
+}
+
+uid_is_trusted() {
+  local candidate="$1"
+  [[ " ${TRUSTED_RUNTIME_UIDS} " == *" ${candidate} "* ]]
+}
+
+require_trusted_directory_chain() {
+  local path="$1"
+  local uid
+  local mode
+  while :; do
+    [[ -d "${path}" && ! -L "${path}" ]] || die "runtime ancestor is not a regular directory: ${path}"
+    [[ "$(realpath -- "${path}")" == "${path}" ]] || die "runtime ancestor is noncanonical: ${path}"
+    uid="$(numeric_uid "${path}")"
+    uid_is_trusted "${uid}" || die "runtime ancestor has an unsafe owner: ${path}"
+    mode="$(numeric_mode "${path}")"
+    (( (8#${mode} & 8#022) == 0 )) || \
+      die "runtime ancestor is group- or world-writable: ${path}"
+    [[ "${path}" == "/" ]] && break
+    path="$(dirname -- "${path}")"
+  done
+}
+
+require_service_traversable_directory_chain() {
+  local path="$1"
+  local service_uid="$2"
+  local mode
+  local owner_uid
+  require_trusted_directory_chain "${path}"
+  while :; do
+    mode="$(numeric_mode "${path}")"
+    owner_uid="$(numeric_uid "${path}")"
+    if [[ "${owner_uid}" == "${service_uid}" ]]; then
+      (( (8#${mode} & 8#100) != 0 )) || \
+        die "runtime home ancestor is not service-traversable: ${path}"
+    else
+      (( (8#${mode} & 8#001) != 0 )) || \
+        die "runtime home ancestor is not service-traversable: ${path}"
+    fi
+    [[ "${path}" == "/" ]] && break
+    path="$(dirname -- "${path}")"
+  done
+}
+
+require_canonical_existing_path() {
+  local path="$1"
+  local kind="$2"
+  local canonical
+
+  [[ "${path}" == /* ]] || die "${kind} must be an absolute path"
+  [[ "${path}" != *$'\n'* && "${path}" != *$'\r'* && "${path}" != *$'\t'* ]] || \
+    die "${kind} contains a control character"
+  [[ ! -L "${path}" ]] || die "${kind} must not be a symbolic link: ${path}"
+  canonical="$(realpath -- "${path}")" || die "${kind} could not be canonicalized: ${path}"
+  [[ "${canonical}" == "${path}" ]] || die "${kind} must be canonical: ${path}"
+}
+
+require_safe_directory() {
+  local path="$1"
+  local kind="$2"
+  require_canonical_existing_path "${path}" "${kind}"
+  [[ -d "${path}" ]] || die "${kind} is not a directory: ${path}"
+}
+
+require_safe_runtime_file() {
+  local path="$1"
+  local kind="$2"
+  local access="$3"
+  local mode
+
+  require_canonical_existing_path "${path}" "${kind}"
+  [[ -f "${path}" ]] || die "${kind} is not a regular file: ${path}"
+  mode="$(numeric_mode "${path}")" || die "${kind} mode could not be read: ${path}"
+  (( (8#${mode} & 8#7000) == 0 )) || \
+    die "${kind} must not have setuid, setgid, or sticky bits: ${path}"
+  (( (8#${mode} & 8#022) == 0 )) || \
+    die "${kind} must not be group- or world-writable: ${path}"
+  case "${access}" in
+    executable)
+      [[ -x "${path}" ]] || die "${kind} is not executable: ${path}"
+      (( (8#${mode} & 8#005) == 8#005 )) || \
+        die "${kind} must be service-readable and executable: ${path}"
+      ;;
+    readable)
+      [[ -r "${path}" ]] || die "${kind} is not readable: ${path}"
+      (( (8#${mode} & 8#004) == 8#004 )) || \
+        die "${kind} must be service-readable: ${path}"
+      ;;
+    *) die "internal access mode is invalid" ;;
+  esac
+}
+
+require_managed_asset() {
+  local path="$1"
+  local expected_mode="$2"
+  local kind="$3"
+  local actual_uid
+  local actual_mode
+  local service_uid
+
+  require_canonical_existing_path "${path}" "${kind}"
+  [[ -f "${path}" ]] || die "${kind} is not a regular file: ${path}"
+  actual_uid="$(numeric_uid "${path}")" || die "${kind} owner could not be read: ${path}"
+  actual_mode="$(numeric_mode "${path}")" || die "${kind} mode could not be read: ${path}"
+  [[ "${actual_uid}" == "${REQUIRED_UID}" ]] || \
+    die "${kind} must be owned by uid ${REQUIRED_UID}: ${path}"
+  [[ "${actual_mode}" == "${expected_mode}" ]] || \
+    die "${kind} mode must be ${expected_mode}: ${path}"
+  service_uid="$(id -u "${SERVICE_USER}")" || die "OpenCodex service user is unavailable"
+  require_service_traversable_directory_chain "$(dirname -- "${path}")" "${service_uid}"
+}
+
+select_runtime_contract() {
+  local requested=""
+  local requested_canonical
+  local canary_directory
+
+  [[ "${BASH_SOURCE[0]}" == /* && ! -L "${BASH_SOURCE[0]}" ]] || \
+    die "runtime adapter invocation path must be an absolute regular file"
+  self_path="$(realpath -- "${BASH_SOURCE[0]}")" || \
+    die "runtime adapter path could not be canonicalized"
+  [[ "${self_path}" == "${BASH_SOURCE[0]}" ]] || \
+    die "runtime adapter path must be canonical"
+
+  if [[ "${OPENCODEX_RUNTIME_INTERNAL_CANARY_CONFIG+x}" == "x" ]]; then
+    [[ "${self_path}" != "${PRODUCTION_INVOKER}" ]] || \
+      die "production runtime adapter rejects the internal canary contract"
+    requested="${OPENCODEX_RUNTIME_INTERNAL_CANARY_CONFIG}"
+    [[ -n "${requested}" && "${requested}" == /* ]] || \
+      die "internal canary contract must be an absolute path"
+    if LC_ALL=C printf '%s' "${requested}" |
+      LC_ALL=C grep '[[:cntrl:]]' >/dev/null; then
+      die "internal canary contract contains a control character"
+    fi
+    [[ ! -L "${requested}" ]] || \
+      die "internal canary contract must not be a symbolic link"
+    requested_canonical="$(realpath -- "${requested}")" || \
+      die "internal canary contract could not be canonicalized"
+    [[ "${requested_canonical}" == "${requested}" ]] || \
+      die "internal canary contract must be canonical"
+    [[ "$(basename -- "${self_path}")" == "opencodex-runtime" &&
+       "$(basename -- "${requested_canonical}")" == "runtime.json" &&
+       "$(dirname -- "${self_path}")" == "$(dirname -- "${requested_canonical}")" ]] || \
+      die "internal canary adapter and contract must be a colocated managed pair"
+    canary_directory="$(dirname -- "${self_path}")"
+    [[ "$(basename -- "${canary_directory}")" == opencodex-runtime-canary.* &&
+       "$(numeric_uid "${canary_directory}")" == "${REQUIRED_UID}" &&
+       "$(numeric_mode "${canary_directory}")" == "711" ]] || \
+      die "internal canary directory must be a managed non-listable runtime directory"
+    runtime_config="${requested_canonical}"
+  fi
+  unset OPENCODEX_RUNTIME_INTERNAL_CANARY_CONFIG
+}
+
+load_contract() {
+  local prefix_owner_policy="${1:-root}"
+  local expected_ocx
+  local service_uid
+  local home_mode
+  local prefix_mode
+
+  select_runtime_contract
+  require_managed_asset "${self_path}" 755 "runtime adapter"
+  require_managed_asset "${runtime_config}" 644 "runtime contract"
+  [[ "$(stat -c '%s' -- "${runtime_config}" 2>/dev/null || stat -f '%z' -- "${runtime_config}")" -le 65536 ]] || \
+    die "runtime contract exceeds 64 KiB"
+
+  jq -e '
+    type == "object"
+    and keys == [
+      "home",
+      "node_bin",
+      "npm_cli",
+      "ocx_entry",
+      "prefix",
+      "runtime_kind",
+      "schema_version"
+    ]
+    and .schema_version == 1
+    and .runtime_kind == "node"
+    and ([.home, .prefix, .node_bin, .npm_cli, .ocx_entry] | all(
+      type == "string"
+      and length > 1
+      and startswith("/")
+      and (test("[\u0000-\u001f\u007f]") | not)
+    ))
+  ' "${runtime_config}" >/dev/null || die "runtime contract schema is invalid"
+
+  home="$(jq -er '.home' "${runtime_config}")"
+  prefix="$(jq -er '.prefix' "${runtime_config}")"
+  node_bin="$(jq -er '.node_bin' "${runtime_config}")"
+  npm_cli="$(jq -er '.npm_cli' "${runtime_config}")"
+  ocx_entry="$(jq -er '.ocx_entry' "${runtime_config}")"
+  expected_ocx="${prefix}/${OCX_RELATIVE_PATH}"
+  [[ "${ocx_entry}" == "${expected_ocx}" ]] || \
+    die "ocx_entry must be the package entry beneath prefix"
+  package_manifest="${prefix}/${PACKAGE_MANIFEST_RELATIVE_PATH}"
+  bun_manifest="${prefix}/${BUN_MANIFEST_RELATIVE_PATH}"
+  bun_install="${prefix}/${BUN_INSTALL_RELATIVE_PATH}"
+  bun_binary="${prefix}/${BUN_BINARY_RELATIVE_PATH}"
+  bun_fallback_binary="${prefix}/${BUN_FALLBACK_BINARY_RELATIVE_PATH}"
+
+  require_safe_directory "${home}" "runtime home"
+  require_safe_directory "${prefix}" "runtime prefix"
+  case "${home}" in
+    /|/home|/home/*|/root|/root/*|/run/user|/run/user/*)
+      die "runtime home is incompatible with the service sandbox"
+      ;;
+  esac
+  case "${prefix}" in
+    /|/home|/home/*|/root|/root/*|/run/user|/run/user/*)
+      die "runtime prefix is incompatible with the service sandbox"
+      ;;
+  esac
+  service_uid="$(id -u "${SERVICE_USER}")" || die "OpenCodex service user is unavailable"
+  [[ "$(numeric_uid "${home}")" == "${service_uid}" ]] || \
+    die "runtime home must be owned by ${SERVICE_USER}"
+  home_mode="$(numeric_mode "${home}")"
+  [[ "${home_mode}" == "700" ]] || \
+    die "runtime home mode must be 700"
+  require_service_traversable_directory_chain "$(dirname -- "${home}")" "${service_uid}"
+  case "${prefix_owner_policy}" in
+    root)
+      [[ "$(numeric_uid "${prefix}")" == "${REQUIRED_UID}" ]] || \
+        die "runtime prefix must be owned by uid ${REQUIRED_UID}"
+      ;;
+    service)
+      [[ "${EUID}" == "${service_uid}" ]] || \
+        die "npm must run as the OpenCodex service user"
+      [[ "$(numeric_uid "${prefix}")" == "${REQUIRED_UID}" ||
+         "$(numeric_uid "${prefix}")" == "${service_uid}" ]] || \
+        die "npm requires a root- or service-owned runtime prefix"
+      ;;
+    prepare)
+      [[ "${EUID}" == "${service_uid}" ]] || \
+        die "bundled Bun preparation must run as the OpenCodex service user"
+      [[ "$(numeric_uid "${prefix}")" == "${service_uid}" ]] || \
+        die "bundled Bun preparation requires a service-owned runtime prefix"
+      ;;
+    *) die "internal prefix-owner policy is invalid" ;;
+  esac
+  prefix_mode="$(numeric_mode "${prefix}")"
+  (( (8#${prefix_mode} & 8#022) == 0 )) || \
+    die "runtime prefix must not be group- or world-writable"
+  if [[ "$(numeric_uid "${prefix}")" == "${service_uid}" ]]; then
+    (( (8#${prefix_mode} & 8#500) == 8#500 )) || \
+      die "runtime prefix is not service-traversable"
+  else
+    (( (8#${prefix_mode} & 8#005) == 8#005 )) || \
+      die "runtime prefix is not service-traversable"
+  fi
+  require_service_traversable_directory_chain "$(dirname -- "${prefix}")" "${service_uid}"
+  [[ "${prefix}" != "${home}" &&
+     "${prefix}" != "${home}/"* &&
+     "${home}" != "${prefix}/"* ]] || \
+    die "runtime home and prefix must not overlap"
+  require_safe_runtime_file "${node_bin}" "Node executable" executable
+  require_safe_runtime_file "${npm_cli}" "npm CLI" readable
+  uid_is_trusted "$(numeric_uid "${node_bin}")" || die "Node executable has an unsafe owner"
+  uid_is_trusted "$(numeric_uid "${npm_cli}")" || die "npm CLI has an unsafe owner"
+  require_service_traversable_directory_chain "$(dirname -- "${node_bin}")" "${service_uid}"
+  require_service_traversable_directory_chain "$(dirname -- "${npm_cli}")" "${service_uid}"
+}
+
+require_managed_package_chain() {
+  local path="$1"
+  local expected_uid="${2:-${REQUIRED_UID}}"
+  local current
+  local mode
+  [[ "${path}" == "${prefix}/"* ]] || die "managed package file escaped runtime prefix"
+  current="$(dirname -- "${path}")"
+  while :; do
+    [[ -d "${current}" && ! -L "${current}" ]] || die "managed package ancestor is unsafe"
+    [[ "$(realpath -- "${current}")" == "${current}" ]] || \
+      die "managed package ancestor is noncanonical"
+    [[ "$(numeric_uid "${current}")" == "${expected_uid}" ]] || \
+      die "managed package ancestor has an unsafe owner"
+    mode="$(numeric_mode "${current}")"
+    (( (8#${mode} & 8#022) == 0 )) || \
+      die "managed package ancestor is group- or world-writable"
+    (( (8#${mode} & 8#001) != 0 )) || \
+      die "managed package ancestor is not service-traversable"
+    [[ "${current}" == "${prefix}" ]] && break
+    current="$(dirname -- "${current}")"
+    [[ "${current}" == "${prefix}" || "${current}" == "${prefix}/"* ]] || \
+      die "managed package ancestor escaped runtime prefix"
+  done
+}
+
+validate_full_installation() {
+  local expected_uid="${1:-${REQUIRED_UID}}"
+  local package_version
+
+  require_safe_runtime_file "${ocx_entry}" "OpenCodex CLI entry" readable
+  require_safe_runtime_file "${package_manifest}" "OpenCodex package manifest" readable
+  [[ "$(numeric_uid "${ocx_entry}")" == "${expected_uid}" ]] || \
+    die "OpenCodex CLI entry must be owned by uid ${expected_uid}"
+  [[ "$(numeric_uid "${package_manifest}")" == "${expected_uid}" ]] || \
+    die "OpenCodex package manifest must be owned by uid ${expected_uid}"
+  require_managed_package_chain "${ocx_entry}" "${expected_uid}"
+  require_managed_package_chain "${package_manifest}" "${expected_uid}"
+  jq -e --arg package_name "${PACKAGE_NAME}" '
+    .name == $package_name
+    and (.version | type == "string")
+    and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"))
+  ' "${package_manifest}" >/dev/null || die "OpenCodex package metadata is invalid"
+  package_version="$(jq -er '.version' "${package_manifest}")"
+  [[ -n "${package_version}" ]] || die "OpenCodex package version is unavailable"
+}
+
+validate_bundled_bun_binaries() {
+  local expected_uid="$1"
+  local require_real="${2:-false}"
+  local candidate
+  local real_count=0
+
+  for candidate in "${bun_binary}" "${bun_fallback_binary}"; do
+    if [[ ! -e "${candidate}" && ! -L "${candidate}" ]]; then
+      continue
+    fi
+    require_safe_runtime_file "${candidate}" "bundled Bun executable" executable
+    [[ "$(numeric_uid "${candidate}")" == "${expected_uid}" ]] || \
+      die "bundled Bun executable must be owned by uid ${expected_uid}"
+    require_managed_package_chain "${candidate}" "${expected_uid}"
+    if [[ "$(numeric_size "${candidate}")" -ge "${REAL_BUN_MIN_BYTES}" ]]; then
+      real_count=$((real_count + 1))
+    fi
+  done
+
+  if [[ "${require_real}" == "true" ]]; then
+    (( real_count > 0 )) || die "prepared bundled Bun executable is missing or incomplete"
+  fi
+}
+
+validate_preparable_bundled_bun() {
+  local expected_version="$1"
+  local service_uid
+  local package_version
+  local bun_dependency_version
+
+  [[ "${expected_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || \
+    die "expected OpenCodex version is invalid"
+  service_uid="$(id -u "${SERVICE_USER}")" || die "OpenCodex service user is unavailable"
+  validate_full_installation "${service_uid}"
+  package_version="$(jq -er '.version' "${package_manifest}")"
+  [[ "${package_version}" == "${expected_version}" ]] || \
+    die "installed OpenCodex version is ${package_version}, expected ${expected_version}"
+  jq -e '
+    .dependencies.bun
+    | type == "string"
+      and test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$")
+  ' "${package_manifest}" >/dev/null || \
+    die "OpenCodex must pin an exact bundled Bun dependency"
+  bun_dependency_version="$(jq -er '.dependencies.bun' "${package_manifest}")"
+
+  require_safe_runtime_file "${bun_manifest}" "bundled Bun package manifest" readable
+  require_safe_runtime_file "${bun_install}" "bundled Bun installer" readable
+  [[ "$(numeric_uid "${bun_manifest}")" == "${service_uid}" ]] || \
+    die "bundled Bun package manifest must be service-owned"
+  [[ "$(numeric_uid "${bun_install}")" == "${service_uid}" ]] || \
+    die "bundled Bun installer must be service-owned"
+  require_managed_package_chain "${bun_manifest}" "${service_uid}"
+  require_managed_package_chain "${bun_install}" "${service_uid}"
+  jq -e --arg version "${bun_dependency_version}" '
+    .name == "bun" and .version == $version
+  ' "${bun_manifest}" >/dev/null || \
+    die "installed bundled Bun package does not match the pinned dependency"
+  validate_bundled_bun_binaries "${service_uid}"
+}
+
+prepare_environment() {
+  local runtime_bin_dir
+  runtime_bin_dir="$(dirname -- "${node_bin}")"
+  export HOME="${home}"
+  export PATH="${runtime_bin_dir}:${SYSTEM_PATH}"
+  cd -- "${home}"
+}
+
+action="${1:-}"
+case "${action}" in
+  check)
+    [[ "$#" -eq 1 ]] || { usage; exit 2; }
+    load_contract
+    validate_full_installation
+    validate_bundled_bun_binaries "${REQUIRED_UID}" true
+    printf 'runtime_adapter=valid\n'
+    ;;
+  describe)
+    [[ "$#" -eq 2 && "${2:-}" == "--json" ]] || { usage; exit 2; }
+    load_contract
+    validate_full_installation
+    validate_bundled_bun_binaries "${REQUIRED_UID}" true
+    jq -cn \
+      --argjson schema_version 1 \
+      --arg runtime_kind node \
+      --arg home "${home}" \
+      --arg prefix "${prefix}" \
+      --arg node_bin "${node_bin}" \
+      --arg npm_cli "${npm_cli}" \
+      --arg ocx_entry "${ocx_entry}" \
+      --arg package_manifest "${package_manifest}" \
+      --arg package_version "$(jq -er '.version' "${package_manifest}")" \
+      '{
+        schema_version: $schema_version,
+        runtime_kind: $runtime_kind,
+        home: $home,
+        prefix: $prefix,
+        node_bin: $node_bin,
+        npm_cli: $npm_cli,
+        ocx_entry: $ocx_entry,
+        package_manifest: $package_manifest,
+        package_version: $package_version
+      }'
+    ;;
+  prepare-bundled-bun)
+    [[ "$#" -eq 2 ]] || { usage; exit 2; }
+    expected_version="$2"
+    load_contract prepare
+    validate_preparable_bundled_bun "${expected_version}"
+    prepare_environment
+    unset NODE_PATH OPENCODEX_BUN_PATH OCX_BUN_RUNTIME_PATH OCX_BUN_RUNTIME_SOURCE
+    version_output="$("${node_bin}" "${ocx_entry}" --version)" || \
+      die "bundled Bun preparation failed"
+    [[ "${version_output}" == "opencodex ${expected_version}" ]] || \
+      die "prepared launcher reported ${version_output:-no version}, expected opencodex ${expected_version}"
+    validate_bundled_bun_binaries "$(id -u "${SERVICE_USER}")" true
+    printf '%s\n' "${version_output}"
+    ;;
+  ocx)
+    shift
+    load_contract
+    validate_full_installation
+    validate_bundled_bun_binaries "${REQUIRED_UID}" true
+    prepare_environment
+    exec "${node_bin}" "${ocx_entry}" "$@"
+    ;;
+  npm)
+    shift
+    load_contract service
+    # A fresh host intentionally reaches this command before the package,
+    # ocx_entry, and package manifest exist.
+    prepare_environment
+    exec "${node_bin}" "${npm_cli}" "$@"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

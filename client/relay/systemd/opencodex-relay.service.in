@@ -1,0 +1,20 @@
+[Unit]
+Description=PW OpenCodex local compatibility relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="__RELAY_BIN__" --config "__RELAY_CONFIG__"
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths="__CATALOG_PARENT__" "%h/.config/opencodex-relay"
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=default.target

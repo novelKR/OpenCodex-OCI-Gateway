@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly COMPOSE_FILE="/etc/opencodex/compose.yaml"
+readonly ENV_FILE="/etc/opencodex/container.env"
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_runtime() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  command -v jq >/dev/null 2>&1 || die "jq is required"
+  [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || die "compose file is missing or a symlink"
+  [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || die "container environment file is missing or a symlink"
+  [[ "$(stat -c '%a' "$ENV_FILE")" == "600" ]] || die "container environment file must have mode 0600"
+}
+
+read_environment() {
+  local line key value
+  OPENCODEX_CONTAINER_IMAGE=""
+  OPENCODEX_UID=""
+  OPENCODEX_GID=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" =~ ^([A-Z_]+)=([^[:space:]]+)$ ]] || die "invalid container environment line"
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    case "$key" in
+      OPENCODEX_CONTAINER_IMAGE) OPENCODEX_CONTAINER_IMAGE="$value" ;;
+      OPENCODEX_UID) OPENCODEX_UID="$value" ;;
+      OPENCODEX_GID) OPENCODEX_GID="$value" ;;
+      *) die "unknown container environment key: $key" ;;
+    esac
+  done < "$ENV_FILE"
+  [[ "$OPENCODEX_CONTAINER_IMAGE" =~ ^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_.-]+@sha256:[0-9a-f]{64}$ ]] ||
+    die "container image must be a lowercase GHCR reference pinned by digest"
+  [[ "$OPENCODEX_UID" =~ ^[1-9][0-9]*$ && "$OPENCODEX_GID" =~ ^[1-9][0-9]*$ ]] ||
+    die "container uid and gid must be positive integers"
+  [[ "$OPENCODEX_UID" == "$(id -u opencodex)" ]] || die "container uid does not match host opencodex user"
+  [[ "$OPENCODEX_GID" == "$(id -g opencodex)" ]] || die "container gid does not match host opencodex group"
+  export OPENCODEX_CONTAINER_IMAGE OPENCODEX_UID OPENCODEX_GID
+}
+
+verify_compose() {
+  local document
+  document="$(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --format json)"
+  jq -e '
+    .services.opencodex as $s |
+    ($s.network_mode == "host") and
+    ($s.read_only == true) and
+    ($s.cap_drop == ["ALL"]) and
+    ($s.security_opt == ["no-new-privileges:true"]) and
+    ($s.pids_limit == 256) and
+    ($s.mem_limit == 838860800) and
+    ($s.volumes | length == 1) and
+    ($s.volumes[0].source == "/var/lib/opencodex") and
+    ($s.volumes[0].target == "/var/lib/opencodex") and
+    ($s.volumes[0].type == "bind") and
+    (($s | has("ports")) | not) and
+    all($s.volumes[]; (.source | contains("docker.sock") | not))
+  ' >/dev/null <<<"$document" || die "compose security contract validation failed"
+}
+
+verify_image() {
+  local configured actual
+  configured="${OPENCODEX_CONTAINER_IMAGE##*@}"
+  actual="$(docker image inspect "$OPENCODEX_CONTAINER_IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+  [[ "$actual" == *"@$configured" ]] || die "local image digest does not match the configured release digest"
+}
+
+verify() {
+  require_runtime
+  read_environment
+  verify_compose
+  verify_image
+}
+
+case "${1:-}" in
+  verify)
+    verify
+    ;;
+  up)
+    verify
+    exec docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up --detach --no-build --wait
+    ;;
+  down)
+    require_runtime
+    read_environment
+    exec docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down
+    ;;
+  *)
+    die "usage: opencodex-container verify|up|down"
+    ;;
+esac

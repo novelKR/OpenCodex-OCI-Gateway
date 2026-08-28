@@ -1,0 +1,6 @@
+[Unit]
+Description=Apply a relay-owned Remote Codex model catalog when idle
+
+[Service]
+Type=oneshot
+ExecStart=/home/ubuntu/.local/lib/opencodex-relay/manage-remote-codex-home.sh apply-relay-catalog

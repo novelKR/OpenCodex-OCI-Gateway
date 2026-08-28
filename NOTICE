@@ -1,0 +1,8 @@
+OpenCodex OCI Gateway
+Copyright 2026 novelKR
+
+This product includes software developed by OpenCodex contributors and the Bun
+project. Those components remain under their respective licenses. The
+experimental container downloads @bitkyc08/opencodex from npm and does not
+relicense or vendor its source. See containers/opencodex/UPSTREAM_NOTICES.md
+and client/relay/THIRD_PARTY_NOTICES.md.

@@ -1,0 +1,47 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Nested upstream checkout and regenerable dependencies
+/opencodex/
+/work/
+/outputs/
+/.generated/
+/client/relay/dist/
+/client/relay/release/
+
+# Machine-local inventory
+/local/
+
+# Credentials and private material
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+# Owner-only runtime credential files. Keep source packages named credentials.
+credentials.env
+credentials.env.*
+token*.json
+secrets/
+.oci/
+.ssh/
+
+# Runtime state and captures
+*.log
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+*.pid
+*.headers
+*.body
+*.capture
+
+# A live locally managed Tunnel file may contain infrastructure identifiers.
+pilot/cloudflared/config.yml

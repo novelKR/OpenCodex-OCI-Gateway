@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>ko</string>
+  <key>CFBundleDisplayName</key>
+  <string>PW OpenCodex Relay</string>
+  <key>CFBundleExecutable</key>
+  <string>OpenCodexRelay</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.novelkr.opencodex-relay</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>ko</string>
+	</array>
+	<key>CFBundleName</key>
+  <string>OpenCodexRelay</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>__SHORT_VERSION__</string>
+  <key>CFBundleVersion</key>
+  <string>__BUILD_VERSION__</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>26.0</string>
+  <key>LSUIElement</key>
+  <false/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>OpenCodexDistributionFlavor</key>
+  <string>production</string>
+  <key>OpenCodexRuntimeMode</key>
+  <string>managed</string>
+  <key>OpenCodexHomebrewGuardBackend</key>
+  <string>manual_admin</string>
+  <key>OpenCodexHomebrewGuardInstallerExecutable</key>
+  <string>OpenCodexRelayHelperInstaller</string>
+  <key>OpenCodexHomebrewGuardMachService</key>
+  <string>io.github.novelkr.opencodex-relay.homebrew-guard</string>
+  <key>OpenCodexHomebrewGuardHelperRequirement</key>
+  <string>__HELPER_REQUIREMENT__</string>
+  <key>OpenCodexHomebrewGuardHelperVersion</key>
+  <string>__SHORT_VERSION__</string>
+  <!--
+    Independently reviewed from the Apple-notarized OpenAI Codex Desktop build.
+    Empty, malformed, or changed values disable discovery and all Codex Desktop
+    lifecycle control.
+  -->
+  <key>OpenCodexTrustedCodexBundleIdentifier</key>
+  <string>com.openai.codex</string>
+  <key>OpenCodexTrustedCodexTeamIdentifier</key>
+  <string>2DC432GLL2</string>
+</dict>
+</plist>

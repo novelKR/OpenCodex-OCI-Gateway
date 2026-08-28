@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the managed Codex launcher for replacement
+
+[Path]
+PathChanged=/home/ubuntu/.local/bin/codex
+Unit=opencodex-remote-codex-wrapper-repair.service
+
+[Install]
+WantedBy=paths.target

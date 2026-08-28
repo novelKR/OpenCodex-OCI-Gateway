@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh the Remote Codex OpenCodex model catalog
+
+[Service]
+Type=oneshot
+ExecStart=/home/ubuntu/.local/lib/opencodex-relay/manage-remote-codex-home.sh refresh --restart

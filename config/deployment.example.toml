@@ -1,0 +1,19 @@
+# OpenCodex OCI Gateway deployment schema v1.
+#
+# This file is deliberately secret-free. Copy it outside the public checkout or
+# to a Git-ignored path before using it for a real deployment. Tokens, gateway
+# keys, OAuth state, credential files, and private keys are not valid fields.
+schema_version = 1
+deployment = "example"
+api_origin = "https://api.example.com"
+ssh_access_hostname = "ssh.example.com"
+opencodex_version = "2.33.0"
+remote_routing_mode = "relay"
+release_repository = "novelKR/OpenCodex-OCI-Gateway"
+release_public_key_fingerprint = "fbc6d38994e5cc6fc973ac045da532e02acd62f4871702cb87051c0f0124b6cb"
+profile = "native"
+
+[cloudflare]
+tunnel_id = "00000000-0000-4000-8000-000000000000"
+api_access_aud = "00000000000000000000000000000000"
+team_name = "example-team"

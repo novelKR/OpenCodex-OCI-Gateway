@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: client/relay/go.sum
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Shell syntax
+        run: bash -n pilot/scripts/*.sh pilot/libexec/* ops/oci/*.sh client/relay/scripts/*.sh tools/*.sh
+      - name: Deployment and pilot tests
+        run: python3 -m unittest discover -s pilot/tests -p 'test_*.py'
+      - name: Go test, race, and vet
+        working-directory: client/relay
+        run: |
+          go test ./...
+          go test -race ./...
+          go vet ./...
+      - name: Public hygiene
+        run: tools/check-public-checkout.sh HEAD
+      - name: Diff whitespace
+        run: git diff --check
+
+  macos:
+    if: github.event.repository.private == false
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift test and build
+        working-directory: client/relay/macos/OpenCodexRelay
+        run: |
+          swift test
+          swift build -c release

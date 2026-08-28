@@ -1,0 +1,15 @@
+{
+  "name": "opencodex-container-runtime",
+  "private": true,
+  "version": "0.3.0",
+  "dependencies": {
+    "@bitkyc08/opencodex": "2.33.0"
+  },
+  "trustedDependencies": ["bun"],
+  "overrides": {
+    "@hono/node-server": "2.1.0",
+    "fast-uri": "^3.1.5",
+    "hono": "4.13.1",
+    "ip-address": "^10.4.0"
+  }
+}

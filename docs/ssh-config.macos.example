@@ -1,0 +1,27 @@
+# Minimal macOS client example for the Cloudflare Access SSH path.
+# Verify both local paths before copying this block into ~/.ssh/config.
+
+Host ocx-ssh
+    HostName ssh.example.com
+    User ubuntu
+    IdentityFile ~/.ssh/REPLACE_WITH_SSH_KEY
+    IdentitiesOnly yes
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    ProxyCommand /opt/homebrew/bin/cloudflared access ssh --hostname %h
+    LocalForward 11010 127.0.0.1:10100
+    LocalForward 1455 127.0.0.1:1455
+
+# Keep the public-IP recovery alias separate. Do not reuse the Access hostname;
+# that hostname belongs to another Tunnel.
+Host ocx-direct
+    HostName REPLACE_WITH_INSTANCE_IP
+    User ubuntu
+    IdentityFile ~/.ssh/REPLACE_WITH_SSH_KEY
+    IdentitiesOnly yes
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    LocalForward 11010 127.0.0.1:10100
+    LocalForward 1455 127.0.0.1:1455

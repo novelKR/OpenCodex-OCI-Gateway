@@ -1,0 +1,49 @@
+[Unit]
+Description=OpenCodex API proxy
+Documentation=https://www.npmjs.com/package/@bitkyc08/opencodex
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=opencodex
+Group=opencodex
+Environment=NODE_ENV=production
+Environment=OCX_SERVICE=1
+ExecStartPre=/usr/local/libexec/opencodex-runtime check
+ExecStartPre=/usr/local/libexec/opencodex-runtime ocx config validate
+ExecStart=/usr/local/libexec/opencodex-runtime ocx start --port 10100
+Restart=always
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opencodex
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+MemoryHigh=650M
+MemoryMax=800M
+MemorySwapMax=2G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

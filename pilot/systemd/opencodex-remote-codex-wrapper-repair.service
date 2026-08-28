@@ -1,0 +1,6 @@
+[Unit]
+Description=Restore the Remote Codex launcher after a managed update
+
+[Service]
+Type=oneshot
+ExecStart=/home/ubuntu/.local/lib/opencodex-relay/manage-remote-codex-home.sh repair-wrapper

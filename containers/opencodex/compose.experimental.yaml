@@ -1,0 +1,29 @@
+name: opencodex-container
+services:
+  opencodex:
+    image: ${OPENCODEX_CONTAINER_IMAGE:?set an image pinned by digest}
+    network_mode: host
+    user: ${OPENCODEX_UID:?set the host opencodex uid}:${OPENCODEX_GID:?set the host opencodex gid}
+    environment:
+      HOME: /var/lib/opencodex
+      NODE_ENV: production
+      OCX_SERVICE: "1"
+    volumes:
+      - /var/lib/opencodex:/var/lib/opencodex
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 800m
+    memswap_limit: 2g
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:10100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

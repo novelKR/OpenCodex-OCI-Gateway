@@ -1,0 +1,27 @@
+# Cloudflare Access SSH 경로를 위한 최소 macOS 클라이언트 예제입니다.
+# 이 블록을 ~/.ssh/config에 복사하기 전에 두 로컬 경로를 모두 검증하십시오.
+
+Host ocx-ssh
+    HostName ssh.example.com
+    User ubuntu
+    IdentityFile ~/.ssh/REPLACE_WITH_SSH_KEY
+    IdentitiesOnly yes
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    ProxyCommand /opt/homebrew/bin/cloudflared access ssh --hostname %h
+    LocalForward 11010 127.0.0.1:10100
+    LocalForward 1455 127.0.0.1:1455
+
+# 공용 IP 복구 별칭은 별도로 유지하십시오. Access hostname을 재사용하지 마십시오.
+# 해당 hostname은 다른 Tunnel에 속합니다.
+Host ocx-direct
+    HostName REPLACE_WITH_INSTANCE_IP
+    User ubuntu
+    IdentityFile ~/.ssh/REPLACE_WITH_SSH_KEY
+    IdentitiesOnly yes
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    LocalForward 11010 127.0.0.1:10100
+    LocalForward 1455 127.0.0.1:1455

@@ -1,0 +1,21 @@
+# Local-managed Tunnel alternative only. Dashboard-managed Tunnel users should not install this.
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: REPLACE_WITH_API_HOSTNAME
+    service: http://127.0.0.1:18080
+    originRequest:
+      connectTimeout: 30s
+      httpHostHeader: 127.0.0.1:18080
+      # Defense in depth: validate the Access JWT again in cloudflared before origin proxying.
+      access:
+        required: true
+        teamName: REPLACE_WITH_ZERO_TRUST_TEAM_NAME
+        audTag:
+          - REPLACE_WITH_ACCESS_APPLICATION_AUD
+  # Create the exact-email + independent-TOTP SSH Access application before enabling this route.
+  # Its interactive policy and AUD are separate from the API origin-JWT settings above.
+  - hostname: REPLACE_WITH_SSH_ACCESS_HOSTNAME
+    service: ssh://127.0.0.1:22
+  - service: http_status:404
