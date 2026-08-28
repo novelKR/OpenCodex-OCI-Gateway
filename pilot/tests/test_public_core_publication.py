@@ -140,7 +140,8 @@ class PublicCorePublicationTests(unittest.TestCase):
         self.assertEqual(
             workflow.count("OPENCODEX_RELAY_RELEASE_SIGNING_KEY_B64_V2"), 1
         )
-        self.assertIn("immutable-releases", workflow)
+        self.assertNotIn('gh api "repos/${RELEASE_REPOSITORY}/immutable-releases"', workflow)
+        self.assertIn("authoritatively verifies isImmutable", workflow)
         self.assertIn("for required_check in linux macos analyze", workflow)
         self.assertIn("Relay release tag must be lightweight", workflow)
         self.assertIn("current public main commit", workflow)

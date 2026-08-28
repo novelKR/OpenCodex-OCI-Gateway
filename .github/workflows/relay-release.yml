@@ -80,10 +80,10 @@ jobs:
             }
           done
 
-          [[ "$(gh api "repos/${RELEASE_REPOSITORY}/immutable-releases" --jq .enabled)" == true ]] || {
-            printf 'ERROR: immutable GitHub Releases must be enabled before tagging\n' >&2
-            exit 1
-          }
+          # The repository GITHUB_TOKEN cannot read the administrative
+          # immutable-releases setting. The operator verifies it before the tag,
+          # and publish-github-release.sh authoritatively verifies isImmutable
+          # after publication and removes the new release on failure.
           release_error="$(mktemp)"
           trap 'rm -f -- "$release_error"' EXIT
           if gh api "repos/${RELEASE_REPOSITORY}/releases/tags/${version}" >/dev/null 2>"$release_error"; then

@@ -648,7 +648,10 @@ lightweight strict-SemVer tag without a `v` prefix starts the workflow only in
 the public `novelKR/OpenCodex-OCI-Gateway` repository. The preflight binds that
 tag to current public `main`, requires the successful `linux`, `macos`, and
 `analyze` checks for the exact commit, and refuses an existing release or a
-repository without immutable releases enabled.
+tag that is not current public `main`. Because the job token cannot read the
+repository's administrative immutable-release setting, the operator enables
+and verifies it before tagging; the publisher then verifies the released
+version's immutable state and deletes the new release on failure.
 
 The protected `relay-release` GitHub Environment holds the base64-encoded v2
 Ed25519 private key. The macOS job compares its derived public key with
