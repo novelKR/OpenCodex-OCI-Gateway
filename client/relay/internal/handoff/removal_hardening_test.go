@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -288,6 +289,9 @@ func TestVerifyRemovedRejectsAnyBoundLauncherResidual(t *testing.T) {
 }
 
 func TestBoundedRemovalProcessTerminatesDescendantHoldingStdout(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("process-group cleanup proof is a Darwin runtime contract")
+	}
 	const helperEnvironment = "OPENCODEX_REMOVAL_DESCENDANT_HELPER"
 	mode := os.Getenv(helperEnvironment)
 	marker := os.Getenv("OPENCODEX_REMOVAL_DESCENDANT_MARKER")
@@ -637,6 +641,9 @@ func TestExactRunnerExecutesVerifiedPrivateSnapshot(t *testing.T) {
 }
 
 func TestBoundedRemovalProcessTerminatesDescriptorClosingDescendant(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("process-group cleanup proof is a Darwin runtime contract")
+	}
 	const helperEnvironment = "OPENCODEX_REMOVAL_CLOSED_DESCENDANT_HELPER"
 	mode := os.Getenv(helperEnvironment)
 	marker := os.Getenv("OPENCODEX_REMOVAL_CLOSED_DESCENDANT_MARKER")

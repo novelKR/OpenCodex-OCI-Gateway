@@ -43,6 +43,20 @@ func TestTierADiscoversExactNPMInstallationFromAbsolutePATH(t *testing.T) {
 	}
 }
 
+func TestNormalizeDiscoveryOptionsDoesNotRequireDefaultHomebrewWhenDefaultsAreSkipped(t *testing.T) {
+	home := t.TempDir()
+	options, err := normalizeDiscoveryOptions(DiscoveryOptions{
+		Tier: DiscoveryTierA, HomeDir: home, GOOS: "darwin", GOARCH: "arm64",
+		SkipDefaultPrefixes: true, Getenv: func(string) string { return "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.HomebrewPrefix != "" {
+		t.Fatalf("Homebrew prefix = %q, want empty when default prefixes are skipped", options.HomebrewPrefix)
+	}
+}
+
 func TestDiscoveryDowngradesUserOwnedGroupWritableParent(t *testing.T) {
 	home := t.TempDir()
 	prefix := filepath.Join(home, "homebrew-like")
@@ -587,6 +601,9 @@ func TestTierBFindsNVMVersionsAndDeduplicatesLaunchers(t *testing.T) {
 }
 
 func TestTierCRequiresConsentAndSkipsSymlinkDirectories(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("broad discovery requires Darwin local-volume validation")
+	}
 	home := t.TempDir()
 	outside := t.TempDir()
 	outsidePrefix := filepath.Join(outside, "node")
@@ -623,6 +640,9 @@ func TestTierCRequiresConsentAndSkipsSymlinkDirectories(t *testing.T) {
 }
 
 func TestTierCBoundsEnumeration(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("broad discovery requires Darwin local-volume validation")
+	}
 	home := t.TempDir()
 	for _, name := range []string{"one", "two", "three", "four"} {
 		if err := os.MkdirAll(filepath.Join(home, name), 0o700); err != nil {

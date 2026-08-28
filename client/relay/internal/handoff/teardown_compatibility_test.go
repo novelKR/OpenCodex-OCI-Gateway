@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -29,9 +30,9 @@ func init() {
 	teardownAdapterProfiles = append(teardownAdapterProfiles, teardownAdapterProfile{
 		packageName:           OpenCodexPackageName,
 		version:               "2.22.0",
-		artifactVariant:       "fixture_darwin_arm64_v1",
-		goos:                  "darwin",
-		goarch:                "arm64",
+		artifactVariant:       "fixture_" + runtime.GOOS + "_" + runtime.GOARCH + "_v1",
+		goos:                  runtime.GOOS,
+		goarch:                runtime.GOARCH,
 		registryIntegrity:     "sha512-YQ==",
 		reviewedClosureSHA256: "6b4fb950c9f49ba0ade703fb6c9b1e6aabad1ced93096cf2c1987d3ef19fa613",
 		adapterID:             "test_preserve_v1",
@@ -308,9 +309,9 @@ func reviewedTestTeardownProfile(t *testing.T, root string, profile teardownAdap
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile.artifactVariant = profile.adapterID + "_darwin_arm64"
-	profile.goos = "darwin"
-	profile.goarch = "arm64"
+	profile.artifactVariant = profile.adapterID + "_" + runtime.GOOS + "_" + runtime.GOARCH
+	profile.goos = runtime.GOOS
+	profile.goarch = runtime.GOARCH
 	profile.registryIntegrity = "sha512-YQ=="
 	profile.reviewedClosureSHA256 = digest
 	return profile

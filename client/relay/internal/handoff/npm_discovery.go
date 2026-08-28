@@ -505,7 +505,7 @@ func normalizeDiscoveryOptions(options DiscoveryOptions) (DiscoveryOptions, erro
 	if options.GOARCH == "" {
 		options.GOARCH = runtime.GOARCH
 	}
-	if options.HomebrewPrefix == "" && options.GOOS == "darwin" && options.GOARCH == "arm64" {
+	if options.HomebrewPrefix == "" && !options.SkipDefaultPrefixes && options.GOOS == "darwin" && options.GOARCH == "arm64" {
 		options.HomebrewPrefix = "/opt/homebrew"
 	}
 	if options.HomebrewPrefix != "" {
