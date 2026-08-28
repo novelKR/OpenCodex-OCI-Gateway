@@ -703,6 +703,18 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("--draft=false", publisher)
         self.assertIn("isImmutable", publisher)
         self.assertIn('release_files=("$manifest" "$signature" "$notices")', publisher)
+        self.assertIn('--notes-file "$release_notes"', publisher)
+        self.assertNotIn('--notes "Manifest-signed', publisher)
+        for release_notes_heading in (
+            "## Choose your download",
+            "## Install or update",
+            "## Security and verification",
+            "## macOS first launch",
+            "## Source",
+        ):
+            self.assertIn(release_notes_heading, publisher)
+        self.assertIn("gh attestation verify FILE", publisher)
+        self.assertIn("Open Anyway", publisher)
         self.assertLess(publisher.index("verify_release_assets true"), publisher.index("--draft=false"))
         self.assertIn('verify_release_assets false', publisher)
         self.assertIn('"compatibility_revision":4', builder)
@@ -1041,7 +1053,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "  : > \"$FAKE_GH_STATE/assets\"\n"
                 "  while [[ $# -gt 0 ]]; do\n"
                 "    case $1 in\n"
-                "      --repo|--title|--notes) shift 2 ;;\n"
+                "      --repo|--title) shift 2 ;;\n"
+                "      --notes-file) cp \"$2\" \"$FAKE_GH_STATE/notes\"; shift 2 ;;\n"
                 "      --draft|--latest=false) shift ;;\n"
                 "      *) basename -- \"$1\" >> \"$FAKE_GH_STATE/assets\"; shift ;;\n"
                 "    esac\n"
@@ -1099,6 +1112,25 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 set((gh_state / "assets").read_text(encoding="utf-8").splitlines()),
                 expected_assets,
             )
+            release_notes = (gh_state / "notes").read_text(encoding="utf-8")
+            self.assertIn("# OpenCodex Relay 1.2.3", release_notes)
+            self.assertIn("## Choose your download", release_notes)
+            self.assertIn("`OpenCodexRelay.app.zip`", release_notes)
+            self.assertIn("## Install or update", release_notes)
+            self.assertIn("## Security and verification", release_notes)
+            self.assertIn(
+                "gh attestation verify FILE --repo owner/private-release",
+                release_notes,
+            )
+            self.assertIn("--source-ref refs/tags/1.2.3", release_notes)
+            self.assertIn("## macOS first launch", release_notes)
+            self.assertIn("Open Anyway", release_notes)
+            self.assertIn(
+                "https://github.com/owner/private-release/tree/1.2.3",
+                release_notes,
+            )
+            self.assertNotIn("__VERSION__", release_notes)
+            self.assertNotIn("__REPOSITORY__", release_notes)
             gh_calls = gh_log.read_text(encoding="utf-8")
             self.assertLess(gh_calls.index("release create"), gh_calls.index("release edit"))
 
