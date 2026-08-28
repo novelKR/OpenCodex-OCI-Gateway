@@ -113,13 +113,15 @@ manifest_integer() {
 }
 
 configured_upstream() {
-  sed -nE 's/^[[:space:]]*"upstream_base_url"[[:space:]]*:[[:space:]]*"([^"]+)"[,]?[[:space:]]*$/\1/p' "$1"
+  jq -er '.upstream_base_url | select(type == "string" and length > 0)' "$1"
 }
 
 configured_upstream_mode() {
-  local value
-  value="$(sed -nE 's/^[[:space:]]*"upstream_mode"[[:space:]]*:[[:space:]]*"([^"]+)"[,]?[[:space:]]*$/\1/p' "$1")"
-  printf '%s\n' "${value:-external_gateway}"
+  jq -er '
+    (.upstream_mode // "")
+    | select(type == "string")
+    | if . == "" then "external_gateway" else . end
+  ' "$1"
 }
 
 enable_macos_connection_probe() {

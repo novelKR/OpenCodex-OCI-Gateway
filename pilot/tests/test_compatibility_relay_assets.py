@@ -1562,7 +1562,10 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             custom_config["responses"] = {
                 "scheduler": {"interactive_listen_address": custom_listener}
             }
-            config_path.write_text(json.dumps(custom_config, indent=2) + "\n", encoding="utf-8")
+            config_path.write_text(
+                json.dumps(custom_config, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
             custom_general_health = root / "custom-general-health.json"
             custom_interactive_health = root / "custom-interactive-health.json"
             custom_general_health.write_text(
