@@ -1344,7 +1344,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "if [[ $(/usr/bin/uname -s) == Linux && ${1:-} == -fh ]]; then\n"
                 "  shift\n"
-                "  exec /bin/mv -f \"$@\"\n"
+                "  exec /bin/mv -fT \"$@\"\n"
                 "fi\n"
                 "exec /bin/mv \"$@\"\n",
                 encoding="utf-8",
