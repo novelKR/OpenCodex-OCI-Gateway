@@ -38,11 +38,31 @@ USAGE
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+plist_string() {
+  local plist="$1"
+  local key="$2"
+  if [[ -x /usr/libexec/PlistBuddy ]]; then
+    /usr/libexec/PlistBuddy -c "Print :${key}" "$plist"
+    return
+  fi
+  command -v python3 >/dev/null || return 1
+  python3 - "$plist" "$key" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    value = plistlib.load(stream).get(sys.argv[2])
+if not isinstance(value, str):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
 verify_reviewed_codex_identity() {
   local plist="$1"
-  [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexBundleIdentifier' "$plist" 2>/dev/null)" == "$TRUSTED_CODEX_BUNDLE_ID" ]] || \
+  [[ "$(plist_string "$plist" OpenCodexTrustedCodexBundleIdentifier 2>/dev/null)" == "$TRUSTED_CODEX_BUNDLE_ID" ]] || \
     die 'local development bundle has an unreviewed Codex Desktop bundle identifier'
-  [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexTeamIdentifier' "$plist" 2>/dev/null)" == "$TRUSTED_CODEX_TEAM_ID" ]] || \
+  [[ "$(plist_string "$plist" OpenCodexTrustedCodexTeamIdentifier 2>/dev/null)" == "$TRUSTED_CODEX_TEAM_ID" ]] || \
     die 'local development bundle has an unreviewed Codex Desktop Team ID'
 }
 

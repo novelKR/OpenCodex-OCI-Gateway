@@ -27,7 +27,10 @@ jobs:
       - name: Shell syntax
         run: bash -n pilot/scripts/*.sh pilot/libexec/* ops/oci/*.sh client/relay/scripts/*.sh tools/*.sh
       - name: Deployment and pilot tests
-        run: python3 -m unittest discover -s pilot/tests -p 'test_*.py'
+        run: |
+          test_tmp="$HOME/.opencodex-ci-tmp"
+          install -d -m 0700 "$test_tmp"
+          TMPDIR="$test_tmp" python3 -m unittest discover -s pilot/tests -p 'test_*.py'
       - name: Go test, race, and vet
         working-directory: client/relay
         run: |

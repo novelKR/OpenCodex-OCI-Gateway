@@ -1323,12 +1323,22 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (fake_bin / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (fake_bin / "uname").write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${1:-}\" in\n"
+                "  -s) printf 'Darwin\\n' ;;\n"
+                "  -m) printf 'arm64\\n' ;;\n"
+                "  *) printf 'Darwin\\n' ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
             for path in (
                 fake_bin / "curl",
                 fake_bin / "launchctl",
                 fake_bin / "lsof",
                 fake_bin / "ss",
                 fake_bin / "sleep",
+                fake_bin / "uname",
             ):
                 path.chmod(0o755)
 
