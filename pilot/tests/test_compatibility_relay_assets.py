@@ -1340,10 +1340,20 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "exec /usr/bin/stat \"$@\"\n",
                 encoding="utf-8",
             )
+            (fake_bin / "mv").write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ $(/usr/bin/uname -s) == Linux && ${1:-} == -fh ]]; then\n"
+                "  shift\n"
+                "  exec /bin/mv -f \"$@\"\n"
+                "fi\n"
+                "exec /bin/mv \"$@\"\n",
+                encoding="utf-8",
+            )
             for path in (
                 fake_bin / "curl",
                 fake_bin / "launchctl",
                 fake_bin / "lsof",
+                fake_bin / "mv",
                 fake_bin / "ss",
                 fake_bin / "sleep",
                 fake_bin / "stat",

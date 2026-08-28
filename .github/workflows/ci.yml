@@ -28,7 +28,7 @@ jobs:
         run: bash -n pilot/scripts/*.sh pilot/libexec/* ops/oci/*.sh client/relay/scripts/*.sh tools/*.sh
       - name: Deployment and pilot tests
         run: |
-          test_tmp="/opt/opencodex-ci-tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          test_tmp="/opencodex-ci-tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "$test_tmp"
           trap 'sudo rmdir -- "$test_tmp"' EXIT
           TMPDIR="$test_tmp" python3 -m unittest discover -s pilot/tests -p 'test_*.py'
