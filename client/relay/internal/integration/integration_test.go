@@ -313,7 +313,7 @@ func TestApplyRejectsConfigDirectorySymlinkWithoutWritingOutsideHome(t *testing.
 
 func integrationFixture(t *testing.T) (*Manager, *fakeRunner, func()) {
 	t.Helper()
-	root, err := os.MkdirTemp("/private/tmp", "opencodex-integration-test.")
+	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
