@@ -1332,12 +1332,21 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "esac\n",
                 encoding="utf-8",
             )
+            (fake_bin / "stat").write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ $(/usr/bin/uname -s) == Linux && ${1:-} == -f && ${2:-} == '%u:%Lp' ]]; then\n"
+                "  exec /usr/bin/stat -c '%u:%a' \"$3\"\n"
+                "fi\n"
+                "exec /usr/bin/stat \"$@\"\n",
+                encoding="utf-8",
+            )
             for path in (
                 fake_bin / "curl",
                 fake_bin / "launchctl",
                 fake_bin / "lsof",
                 fake_bin / "ss",
                 fake_bin / "sleep",
+                fake_bin / "stat",
                 fake_bin / "uname",
             ):
                 path.chmod(0o755)

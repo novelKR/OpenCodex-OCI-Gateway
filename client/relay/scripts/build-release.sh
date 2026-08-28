@@ -285,10 +285,10 @@ if grep -Eq '__[A-Z0-9_]+__' "${app_dir}/Contents/Info.plist"; then
 fi
 stage_app_localizations "${app_dir}/Contents/Resources" "$swift_bin_dir"
 verify_reviewed_codex_identity "${app_dir}/Contents/Info.plist"
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardHelperRequirement' "${app_dir}/Contents/Info.plist")" == "$helper_requirement" ]] ||
+[[ "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardHelperRequirement)" == "$helper_requirement" ]] ||
   die 'production helper code requirement is invalid'
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardBackend' "${app_dir}/Contents/Info.plist")" == manual_admin &&
-   "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardInstallerExecutable' "${app_dir}/Contents/Info.plist")" == "$MACOS_GUARD_INSTALLER_NAME" ]] ||
+[[ "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardBackend)" == manual_admin &&
+   "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardInstallerExecutable)" == "$MACOS_GUARD_INSTALLER_NAME" ]] ||
   die 'production Homebrew guard manual-installer metadata is invalid'
 
 codesign --force --sign - --options runtime \

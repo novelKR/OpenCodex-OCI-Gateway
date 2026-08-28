@@ -210,11 +210,11 @@ if grep -Eq '__[A-Z0-9_]+__' "${app_dir}/Contents/Info.plist"; then
 fi
 
 verify_reviewed_codex_identity "${app_dir}/Contents/Info.plist"
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardHelperRequirement' "${app_dir}/Contents/Info.plist")" == "$helper_requirement" ]] ||
+[[ "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardHelperRequirement)" == "$helper_requirement" ]] ||
   die 'local development helper code requirement is invalid'
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardBackend' "${app_dir}/Contents/Info.plist")" == "manual_admin" &&
-   "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardMachService' "${app_dir}/Contents/Info.plist")" == "$GUARD_MANUAL_SERVICE" &&
-   "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardInstallerExecutable' "${app_dir}/Contents/Info.plist")" == "$GUARD_INSTALLER_NAME" ]] ||
+[[ "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardBackend)" == "manual_admin" &&
+   "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardMachService)" == "$GUARD_MANUAL_SERVICE" &&
+   "$(plist_string "${app_dir}/Contents/Info.plist" OpenCodexHomebrewGuardInstallerExecutable)" == "$GUARD_INSTALLER_NAME" ]] ||
   die 'local development Homebrew guard backend metadata is invalid'
 localization_bundle="${swift_bin_dir}/${LOCALIZATION_BUNDLE}"
 [[ -d "$localization_bundle" && ! -L "$localization_bundle" ]] || die 'SwiftPM localization resource bundle is unavailable'
