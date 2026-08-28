@@ -192,9 +192,54 @@ verify_release_assets() {
     die 'GitHub release asset set is incomplete or unexpected'
 }
 
+release_notes_template="${tmp}/release-notes.template.md"
+release_notes="${tmp}/release-notes.md"
+cat > "$release_notes_template" <<'RELEASE_NOTES'
+# OpenCodex Relay __VERSION__
+
+OpenCodex Relay connects Codex CLI and Desktop clients to a self-hosted OpenCodex endpoint through a device-local compatibility relay. This release provides the reviewed macOS and Linux client artifacts for version `__VERSION__`.
+
+## Choose your download
+
+| Platform | Download |
+| --- | --- |
+| Apple Silicon, macOS 26+ | `OpenCodexRelay.app.zip` |
+| Linux amd64 | `opencodex-relay_linux_amd64` and `opencodex-relayctl_linux_amd64` |
+| Linux arm64 | `opencodex-relay_linux_arm64` and `opencodex-relayctl_linux_arm64` |
+
+Linux installations need both the relay daemon and the matching `relayctl` control tool.
+
+## Install or update
+
+- macOS users should expand the app archive, open the app, and follow the [Relay guide](https://github.com/__REPOSITORY__/blob/__VERSION__/client/relay/README.md).
+- Linux users should use the manifest-verifying installer described in the [Relay guide](https://github.com/__REPOSITORY__/blob/__VERSION__/client/relay/README.md).
+- Existing installations should follow the reviewed [update and rollback runbook](https://github.com/__REPOSITORY__/blob/__VERSION__/docs/updates.md).
+
+## Security and verification
+
+Public GitHub Actions built and independently verified all eight release assets before publication. The signed revision 4 manifest binds every downloadable runtime artifact and `THIRD_PARTY_NOTICES.md` to its SHA-256 digest. Verify the manifest with the tracked [v2 Ed25519 public key](https://github.com/__REPOSITORY__/blob/__VERSION__/config/trust/opencodex-relay-release-ed25519.pub).
+
+Each asset also has GitHub build provenance bound to this tag:
+
+```bash
+gh attestation verify FILE --repo __REPOSITORY__ \
+  --source-ref refs/tags/__VERSION__
+```
+
+## macOS first launch
+
+The macOS app is ad-hoc signed with the Hardened Runtime. It is not Developer ID signed or notarized. On first launch, open **System Settings → Privacy & Security**, choose **Open Anyway** for OpenCodexRelay, then confirm **Open**. Do not remove quarantine attributes or disable Gatekeeper.
+
+## Source
+
+This immutable release was built from the public [`__VERSION__` source tag](https://github.com/__REPOSITORY__/tree/__VERSION__).
+RELEASE_NOTES
+sed -e "s|__VERSION__|${version}|g" -e "s|__REPOSITORY__|${repo}|g" \
+  "$release_notes_template" > "$release_notes"
+
 GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release create "$version" "${release_files[@]}" \
   --repo "$repo" --draft --latest=false --title "OpenCodex Relay ${version}" \
-  --notes "Manifest-signed OpenCodex Relay artifacts and third-party notices for ${version}. The macOS app uses ad-hoc signing and requires manual Gatekeeper approval." >/dev/null || \
+  --notes-file "$release_notes" >/dev/null || \
   die 'unable to create draft GitHub release'
 verify_release_assets true
 GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release edit "$version" --repo "$repo" \
