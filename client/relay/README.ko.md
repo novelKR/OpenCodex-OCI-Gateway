@@ -398,11 +398,13 @@ Remote UI 연결을 증명하지 않습니다. 배포 완료는 정본 운영 �
 public 배포의 정본은 `.github/workflows/relay-release.yml`입니다. `v` 접두사가 없는
 lightweight strict-SemVer tag만 public `novelKR/OpenCodex-OCI-Gateway` 저장소에서 workflow를
 시작합니다. preflight는 tag가 현재 public `main`과 일치하는지, exact commit의 `linux`,
-`macos`, `analyze`가 성공했는지, immutable releases가 켜져 있는지와 같은 version release가
-없는지를 확인합니다. 보호된 `relay-release` Environment의 v2 Ed25519 private key는 macOS
-build step에서만 사용하며 tracked public key와 일치해야 합니다. CI는 정확히 8개 asset과
-GitHub build provenance를 만들고 검증한 뒤 `publish-github-release.sh`로 immutable release를
-게시합니다. 이 public CI 경로의 최초 version은 `0.3.6`입니다.
+`macos`, `analyze`가 성공했는지와 같은 version release가 없는지를 확인합니다. job token은
+저장소 관리용 immutable-release 설정을 읽을 수 없으므로 운영자가 tag 전에 이를 활성화하고
+확인합니다. publisher는 게시 직후 release의 immutable 상태를 검증하고 실패 시 새 release를
+삭제합니다. 보호된 `relay-release` Environment의 v2 Ed25519 private key는 macOS build
+step에서만 사용하며 tracked public key와 일치해야 합니다. CI는 정확히 8개 asset과 GitHub
+build provenance를 만들고 검증한 뒤 immutable release를 게시합니다. 이 public CI 경로의
+최초 version은 `0.3.6`입니다.
 
 소비 host에서는 `install-relay.sh --github-repo novelKR/OpenCodex-OCI-Gateway`와
 `config/trust/opencodex-relay-release-ed25519.pub`를 사용합니다. 익명 API rate limit이 부족할
