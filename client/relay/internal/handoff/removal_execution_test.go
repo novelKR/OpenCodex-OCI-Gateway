@@ -206,6 +206,13 @@ func TestV4PackageInFlightMigratesWithoutReplayAuthority(t *testing.T) {
 		!migrated.ActiveExecution.LegacyUnattestedBoot {
 		t.Fatalf("migrated=%#v", migrated)
 	}
+	var onDisk struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	diskPayload, err := os.ReadFile(RemovalCleanupPath(configPath))
+	if err != nil || json.Unmarshal(diskPayload, &onDisk) != nil || onDisk.SchemaVersion != legacyRemovalCleanupVersion {
+		t.Fatalf("read-only v4 migration changed disk schema: schema=%d err=%v", onDisk.SchemaVersion, err)
+	}
 	if err := RemovalExecutionAdmission(configPath); !errors.Is(err, ErrRemovalRoutingGate) {
 		t.Fatalf("migrated active admission=%v", err)
 	}
@@ -958,6 +965,7 @@ func TestPackageResumeUsesNarrowReconciledAdmission(t *testing.T) {
 	record := RemovalCleanupRecord{
 		SchemaVersion:                removalCleanupSchemaVersion,
 		Operation:                    "remove-open-codex",
+		Context:                      RemovalContextIntegrated,
 		Phase:                        RemovalCleanupPhasePackagePending,
 		InstallationID:               "0123456789abcdef01234567",
 		Fingerprint:                  strings.Repeat("a", 64),

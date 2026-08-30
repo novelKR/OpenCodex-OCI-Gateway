@@ -436,6 +436,150 @@ public struct ProcessOpenCodexRemovalClient: OpenCodexRemovalExecuting, Sendable
     }
 }
 
+public struct ProcessOpenCodexNativeRemovalClient: OpenCodexNativeRemovalExecuting, Sendable {
+    public let executableURL: URL
+    public let inspectionExecutionPolicy: RelayctlExecutionPolicy
+    public let removalExecutionPolicy: RelayctlExecutionPolicy
+
+    public init(
+        executableURL: URL,
+        inspectionExecutionPolicy: RelayctlExecutionPolicy = RelayctlExecutionPolicy(
+            timeout: 40,
+            terminationGracePeriod: 2,
+            maximumOutputBytes: 512 * 1024
+        ),
+        removalExecutionPolicy: RelayctlExecutionPolicy = RelayctlExecutionPolicy(
+            timeout: 210,
+            terminationGracePeriod: 2,
+            maximumOutputBytes: 256 * 1024
+        )
+    ) {
+        self.executableURL = executableURL
+        self.inspectionExecutionPolicy = inspectionExecutionPolicy
+        self.removalExecutionPolicy = removalExecutionPolicy
+    }
+
+    public func discover() async throws -> OpenCodexNativeDiscoveryResult {
+        let output = try await execute(
+            arguments: ["mode", "discover-open-codex-native", "--json"],
+            policy: inspectionExecutionPolicy
+        )
+        do {
+            return try JSONDecoder().decode(OpenCodexNativeDiscoveryResult.self, from: output).validated()
+        } catch let error as OpenCodexNativeRemovalContractError {
+            throw error
+        } catch {
+            throw OpenCodexNativeRemovalContractError.invalidDiscovery
+        }
+    }
+
+    public func acknowledgeTerminal(
+        receiptDigest: String
+    ) async throws -> OpenCodexNativeDiscoveryResult {
+        let arguments = try Self.terminalAcknowledgementArguments(receiptDigest: receiptDigest)
+        let output = try await execute(arguments: arguments, policy: inspectionExecutionPolicy)
+        do {
+            return try JSONDecoder().decode(OpenCodexNativeDiscoveryResult.self, from: output).validated()
+        } catch let error as OpenCodexNativeRemovalContractError {
+            throw error
+        } catch {
+            throw OpenCodexNativeRemovalContractError.invalidDiscovery
+        }
+    }
+
+    static func terminalAcknowledgementArguments(receiptDigest: String) throws -> [String] {
+        guard receiptDigest.utf8.count == 64,
+              receiptDigest.utf8.allSatisfy({
+                  ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+              }) else {
+            throw OpenCodexNativeRemovalContractError.invalidReceipt
+        }
+        return [
+            "mode", "discover-open-codex-native",
+            "--acknowledge-terminal-receipt-digest", receiptDigest,
+            "--json",
+        ]
+    }
+
+    public func inspect(
+        selection: OpenCodexNativeRemovalSelection
+    ) async throws -> OpenCodexNativeRemovalInspection {
+        let output = try await execute(
+            arguments: ["mode", "inspect-open-codex-native-removal"] +
+                selection.selectorArguments + ["--json"],
+            policy: inspectionExecutionPolicy
+        )
+        do {
+            return try JSONDecoder().decode(OpenCodexNativeRemovalInspection.self, from: output)
+                .validated(for: selection)
+        } catch let error as OpenCodexNativeRemovalContractError {
+            throw error
+        } catch {
+            throw OpenCodexNativeRemovalContractError.invalidInspection
+        }
+    }
+
+    public func inspectData(
+        selection: OpenCodexNativeRemovalSelection
+    ) async throws -> OpenCodexNativeDataInventoryReceipt {
+        let output = try await execute(
+            arguments: ["mode", "inspect-open-codex-native-data"] +
+                selection.selectorArguments + ["--json"],
+            policy: inspectionExecutionPolicy
+        )
+        do {
+            return try JSONDecoder().decode(OpenCodexNativeDataInventoryReceipt.self, from: output)
+                .validated(for: selection)
+        } catch let error as OpenCodexNativeRemovalContractError {
+            throw error
+        } catch {
+            throw OpenCodexNativeRemovalContractError.invalidInventory
+        }
+    }
+
+    public func remove(
+        _ request: OpenCodexNativeRemovalRequest
+    ) async throws -> OpenCodexNativeRemovalReceipt {
+        let output = try await execute(arguments: request.arguments, policy: removalExecutionPolicy)
+        do {
+            return try JSONDecoder().decode(OpenCodexNativeRemovalReceipt.self, from: output)
+                .validated(for: request)
+        } catch let error as OpenCodexNativeRemovalContractError {
+            throw error
+        } catch {
+            throw OpenCodexNativeRemovalContractError.invalidReceipt
+        }
+    }
+
+    private func execute(arguments: [String], policy: RelayctlExecutionPolicy) async throws -> Data {
+        guard executableURL.isFileURL,
+              FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw RelayctlError.helperUnavailable
+        }
+        let operation = RelayctlProcessOperation(
+            executableURL: executableURL,
+            arguments: arguments,
+            policy: policy
+        )
+        let result = try await withTaskCancellationHandler {
+            try await Task.detached(priority: .utility) {
+                try operation.run()
+            }.value
+        } onCancel: {
+            operation.cancel()
+        }
+        if Task.isCancelled { throw RelayctlError.cancelled }
+        if result.exitCode != 0 {
+            if let envelope = try? JSONDecoder().decode(RelayctlOperationErrorEnvelope.self, from: result.stdout),
+               let code = envelope.reportedCode() {
+                throw RelayctlError.reported(code)
+            }
+            throw RelayctlError.invocationFailed(exitCode: result.exitCode)
+        }
+        return result.stdout
+    }
+}
+
 struct RelayctlProcessResult {
     let stdout: Data
     let exitCode: Int32

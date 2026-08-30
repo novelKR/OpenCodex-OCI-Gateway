@@ -138,6 +138,13 @@ func BeginExecution(relayConfigPath string, kind RemovalExecutionKind) (RemovalC
 // child deliberately leaves ActiveExecution intact, so no later invocation can
 // replay it on the same boot.
 func FinishExecution(relayConfigPath string, kind RemovalExecutionKind, result RemovalExecutionResult) (RemovalCleanupRecord, error) {
+	// A standalone Native restore must publish its verified Native boundary in
+	// the same durable transition that clears the active execution witness.
+	// Clearing it here first would leave a crash window that cannot be safely
+	// distinguished from an unverified restore.
+	if kind == RemovalExecutionNativeRestore {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
 	record, exists, err := ReadRemovalCleanup(relayConfigPath)
 	if err != nil || !exists || record.ActiveExecution == nil ||
 		record.ActiveExecution.Kind != kind || record.ExecutionResolution != "" {
@@ -162,6 +169,73 @@ func FinishExecution(relayConfigPath string, kind RemovalExecutionKind, result R
 		}
 	}
 	if err := WriteRemovalCleanup(relayConfigPath, next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return next, nil
+}
+
+// CompleteStandaloneTeardown clears the teardown child witness and records
+// teardown completion plus the independently verified Native boundary in one
+// fsync-backed replacement. Splitting these writes would leave a crash window
+// where the owner adapter may already have restored Native Codex but the journal
+// still looks like a retryable pre-teardown intent.
+func CompleteStandaloneTeardown(
+	anchorPath string,
+	result RemovalExecutionResult,
+	verifiedRevision string,
+) (RemovalCleanupRecord, error) {
+	if !result.Started || !result.CleanupVerified || !isFingerprint(verifiedRevision) {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || record.Context != RemovalContextStandaloneNative ||
+		record.Phase != RemovalCleanupPhaseIntent || record.ActiveExecution == nil ||
+		record.ActiveExecution.Kind != RemovalExecutionTeardown || record.ExecutionResolution != "" ||
+		record.TeardownCompleted || record.NativeRecoveryRequired {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	next := record
+	next.ActiveExecution = nil
+	next.TeardownCompleted = true
+	next.NativeState = NativeStateNative
+	next.NativeVerifiedBoundaryRevision = verifiedRevision
+	if err := validateRemovalCleanupRecord(next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return next, nil
+}
+
+// CompleteStandaloneNativeRestore atomically clears the completed child
+// witness and records the independently verified Native boundary. The caller
+// must hold the shared user lifecycle lock and must already have proved both
+// the fixed Codex configuration and clientIntegrations.codex=false through the
+// immutable OpenCodex owner snapshot.
+func CompleteStandaloneNativeRestore(
+	anchorPath string,
+	result RemovalExecutionResult,
+	verifiedRevision string,
+) (RemovalCleanupRecord, error) {
+	if !result.Started || !result.CleanupVerified || !isFingerprint(verifiedRevision) {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || record.Context != RemovalContextStandaloneNative ||
+		record.Phase != RemovalCleanupPhaseIntent || record.ActiveExecution == nil ||
+		record.ActiveExecution.Kind != RemovalExecutionNativeRestore || record.ExecutionResolution != "" ||
+		!record.TeardownCompleted || record.NativeVerifiedBoundaryRevision != "" || record.NativeRecoveryRequired {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	next := record
+	next.ActiveExecution = nil
+	next.NativeState = NativeStateNative
+	next.NativeVerifiedBoundaryRevision = verifiedRevision
+	if err := validateRemovalCleanupRecord(next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), next); err != nil {
 		return RemovalCleanupRecord{}, err
 	}
 	return next, nil
@@ -427,8 +501,127 @@ func ReconcileActiveExecutionAfterBoot(relayConfigPath string, confirmed bool) (
 	}
 }
 
+// ReconcileStandaloneNativeRestoreAfterBoot clears an ambiguous native restore
+// only after a different attested boot and an independently verified Native
+// boundary revision. Same-boot PID or timeout evidence is never accepted.
+func ReconcileStandaloneNativeRestoreAfterBoot(anchorPath, verifiedRevision string, confirmed bool) (RemovalCleanupRecord, error) {
+	if !confirmed || !isFingerprint(verifiedRevision) {
+		return RemovalCleanupRecord{}, ErrRemovalConfirmationNeeded
+	}
+	currentBoot, currentAttested, err := removalBootSessionProvider()
+	if err != nil || !currentAttested || !isFingerprint(currentBoot) {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || record.Context != RemovalContextStandaloneNative ||
+		record.ActiveExecution == nil || record.ActiveExecution.Kind != RemovalExecutionNativeRestore ||
+		record.ExecutionResolution != "" || record.ActiveExecution.BootSession == currentBoot {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record.ActiveExecution = nil
+	record.NativeState = "native"
+	record.NativeVerifiedBoundaryRevision = verifiedRevision
+	record.NativeRecoveryRequired = false
+	if err := validateRemovalCleanupRecord(record); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), record); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return record, nil
+}
+
+// ReconcileStandaloneTeardownAfterBoot resolves only a teardown child from a
+// different attested boot after the caller independently proves the current
+// Native boundary. Teardown remains incomplete, so the adapter must run again
+// and return a valid complete receipt before data or package mutation.
+func ReconcileStandaloneTeardownAfterBoot(
+	anchorPath string,
+	expected RemovalCleanupRecord,
+	verifiedRevision string,
+	confirmed bool,
+) (RemovalCleanupRecord, error) {
+	if !confirmed || !isFingerprint(verifiedRevision) {
+		return RemovalCleanupRecord{}, ErrRemovalConfirmationNeeded
+	}
+	currentBoot, currentAttested, err := removalBootSessionProvider()
+	if err != nil || !currentAttested || !isFingerprint(currentBoot) {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || !sameRemovalCleanupRecord(record, expected) ||
+		record.Context != RemovalContextStandaloneNative || record.Phase != RemovalCleanupPhaseIntent ||
+		record.ActiveExecution == nil || record.ActiveExecution.Kind != RemovalExecutionTeardown ||
+		record.ExecutionResolution != "" || record.ActiveExecution.BootSession == currentBoot ||
+		record.TeardownCompleted || record.NativeVerifiedBoundaryRevision != "" {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	next := record
+	next.ActiveExecution = nil
+	next.NativeState = NativeStateNative
+	next.NativeVerifiedBoundaryRevision = verifiedRevision
+	next.NativeRecoveryRequired = false
+	next.OperationRetryPending = true
+	if err := validateRemovalCleanupRecord(next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return next, nil
+}
+
+// RecoverStandaloneTeardownNativeBoundary records an independently re-proved
+// Native boundary after a resolved teardown failure. It is exact-record bound
+// so a replacement journal cannot be accepted between proof and persistence.
+// Teardown remains incomplete and must be retried before later mutation.
+func RecoverStandaloneTeardownNativeBoundary(
+	anchorPath string,
+	expected RemovalCleanupRecord,
+	verifiedRevision string,
+) (RemovalCleanupRecord, error) {
+	if !isFingerprint(verifiedRevision) {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || !sameRemovalCleanupRecord(record, expected) ||
+		record.Context != RemovalContextStandaloneNative || record.Phase != RemovalCleanupPhaseIntent ||
+		record.ActiveExecution != nil || record.ExecutionResolution != "" || record.RecoveryPending ||
+		!record.NativeRecoveryRequired || record.TeardownCompleted || record.NativeVerifiedBoundaryRevision != "" {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	next := record
+	next.NativeState = NativeStateNative
+	next.NativeVerifiedBoundaryRevision = verifiedRevision
+	next.NativeRecoveryRequired = false
+	next.OperationRetryPending = true
+	if err := validateRemovalCleanupRecord(next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), next); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return next, nil
+}
+
+func ClearStandaloneNativeRecovery(anchorPath string) (RemovalCleanupRecord, error) {
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || record.Context != RemovalContextStandaloneNative || record.ActiveExecution != nil {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	record.NativeRecoveryRequired = false
+	if err := validateRemovalCleanupRecord(record); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), record); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return record, nil
+}
+
 func validRemovalExecutionKind(kind RemovalExecutionKind) bool {
-	return kind == RemovalExecutionTeardown || kind == RemovalExecutionTrash || kind == RemovalExecutionPackage
+	return kind == RemovalExecutionTeardown || kind == RemovalExecutionNativeRestore ||
+		kind == RemovalExecutionTrash || kind == RemovalExecutionPackage
 }
 
 func validateExecutionSource(record RemovalCleanupRecord, kind RemovalExecutionKind) error {
@@ -437,14 +630,23 @@ func validateExecutionSource(record RemovalCleanupRecord, kind RemovalExecutionK
 		if record.Phase != RemovalCleanupPhaseIntent || record.Mode != RemovalModePreserveData && record.Mode != RemovalModeTrashSelected {
 			return ErrRemovalCleanupUnsafe
 		}
+	case RemovalExecutionNativeRestore:
+		if record.Context != RemovalContextStandaloneNative || record.Phase != RemovalCleanupPhaseIntent ||
+			!record.TeardownCompleted || record.NativeVerifiedBoundaryRevision != "" || record.NativeRecoveryRequired {
+			return ErrRemovalCleanupUnsafe
+		}
 	case RemovalExecutionTrash:
 		if record.Phase != RemovalCleanupPhaseIntent || record.Mode != RemovalModeTrashSelected ||
-			record.SelectedDataItems == 0 || record.OperationRetryPending {
+			record.SelectedDataItems == 0 || record.OperationRetryPending ||
+			record.Context == RemovalContextStandaloneNative &&
+				(!record.TeardownCompleted || record.NativeVerifiedBoundaryRevision == "") {
 			return ErrRemovalCleanupUnsafe
 		}
 	case RemovalExecutionPackage:
 		if (record.Phase != RemovalCleanupPhasePackagePending && record.Phase != RemovalCleanupPhasePackageVerified) ||
-			record.PackageAttempt >= maxRemovalPackageAttempts || record.FinalizationActive {
+			record.PackageAttempt >= maxRemovalPackageAttempts || record.FinalizationActive ||
+			record.Context == RemovalContextStandaloneNative &&
+				(!record.TeardownCompleted || record.NativeVerifiedBoundaryRevision == "") {
 			return ErrRemovalCleanupUnsafe
 		}
 	default:

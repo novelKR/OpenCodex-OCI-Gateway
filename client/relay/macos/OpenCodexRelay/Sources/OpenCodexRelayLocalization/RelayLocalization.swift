@@ -260,8 +260,10 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case menuAddLocal = "menu.add_local"
     case menuAddLocalHint = "menu.add_local.hint"
     case menuDiscoverySearching = "menu.discovery.searching"
+    case menuDiscoveryNativeSearching = "menu.discovery.native_searching"
     case menuDiscoveryCandidates = "menu.discovery.candidates"
     case menuDiscoveryCandidate = "menu.discovery.candidate"
+    case menuDiscoveryNativeCandidate = "menu.discovery.native_candidate"
     case menuDiscoveryBroadDetail = "menu.discovery.broad_detail"
     case menuDiscoveryBroadAction = "menu.discovery.broad_action"
     case menuDiscoveryManual = "menu.discovery.manual"
@@ -289,6 +291,9 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case controlCenterLocalOpenCodexSetupRequiredDetail = "control_center.local_opencodex.setup_required.detail"
     case controlCenterLocalOpenCodexOpenSettings = "control_center.local_opencodex.open_settings"
     case controlCenterLocalOpenCodexOpenSettingsHint = "control_center.local_opencodex.open_settings.hint"
+    case controlCenterLocalOpenCodexNativeRemovalDetail = "control_center.local_opencodex.native_removal.detail"
+    case controlCenterLocalOpenCodexNativeRemovalAction = "control_center.local_opencodex.native_removal.action"
+    case controlCenterLocalOpenCodexNativeRemovalHint = "control_center.local_opencodex.native_removal.hint"
     case controlCenterMaintenance = "control_center.maintenance"
     case controlCenterActivityLog = "control_center.activity_log"
     case controlCenterSettings = "control_center.settings"
@@ -623,6 +628,7 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case messageOCXSelectionInvalid = "message.ocx_selection_invalid"
     case messageOpenCodexUninstallUnsafe = "message.ocx_uninstall_unsafe"
     case messageOpenCodexRemoved = "message.ocx_removed"
+    case messageOpenCodexNativeRemoved = "message.ocx_native_removed"
     case messageOpenCodexHandoffCompleted = "message.ocx_handoff_completed"
     case messageOpenCodexHandoffCandidateRefreshRequired = "message.ocx_handoff_candidate_refresh_required"
     case messageStatusRefreshed = "message.status_refreshed"
@@ -826,6 +832,7 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case removalCancel = "removal.cancel"
     case removalBack = "removal.back"
     case removalActionsDetail = "removal.actions.detail"
+    case removalNativeActionsDetail = "removal.native.actions.detail"
     case removalHandoffSection = "removal.handoff.section"
     case removalHandoffRemoveShimDetail = "removal.handoff.remove_shim.detail"
     case removalHandoffKeepShimDetail = "removal.handoff.keep_shim.detail"
@@ -849,6 +856,9 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case removalSafeSection = "removal.safe.section"
     case removalSafeDetail = "removal.safe.detail"
     case removalSafeAction = "removal.safe.action"
+    case removalNativeSafeSection = "removal.native.safe.section"
+    case removalNativeSafeDetail = "removal.native.safe.detail"
+    case removalNativeSafeAction = "removal.native.safe.action"
     case removalManualOnly = "removal.manual_only"
     case removalRouteUnsafe = "removal.route_unsafe"
     case removalCandidateSummary = "removal.candidate.summary"
@@ -882,6 +892,7 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case removalReviewMode = "removal.review.mode"
     case removalReviewSelected = "removal.review.selected"
     case removalReviewGeneration = "removal.review.generation"
+    case removalReviewNativeBoundary = "removal.review.native_boundary"
     case removalQuittingDesktop = "removal.progress.quitting_desktop"
     case removalQuittingDesktopDetail = "removal.progress.quitting_desktop.detail"
     case removalRunning = "removal.progress.running"
@@ -895,6 +906,12 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case removalRoutingRecoveryTitle = "removal.recovery.routing.title"
     case removalRoutingRecoveryDetail = "removal.recovery.routing.detail"
     case removalRoutingRecoveryAction = "removal.recovery.routing.action"
+    case removalNativeRecoveryTitle = "removal.recovery.native.title"
+    case removalNativeRecoveryDetail = "removal.recovery.native.detail"
+    case removalNativeRecoveryAction = "removal.recovery.native.action"
+    case removalNativeCleanupTitle = "removal.cleanup.native.title"
+    case removalNativeCleanupDetail = "removal.cleanup.native.detail"
+    case removalNativeCleanupAction = "removal.cleanup.native.action"
     case removalRecoveryNoPIDProof = "removal.recovery.no_pid_proof"
     case removalResultSuccess = "removal.result.success"
     case removalResultPartial = "removal.result.partial"
@@ -943,6 +960,15 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case removalStageRoutingFinalVerification = "removal.stage.routing_final_verification"
     case removalStageRoutingRecovery = "removal.stage.routing_recovery"
     case removalStageRelayCleanup = "removal.stage.relay_cleanup"
+    case removalStageNativeBoundaryPreTeardown = "removal.stage.native_boundary_pre_teardown"
+    case removalStageNativeRestore = "removal.stage.native_restore"
+    case removalStageNativeBoundaryVerification = "removal.stage.native_boundary_verification"
+    case removalStageNativeBoundaryPreTrash = "removal.stage.native_boundary_pre_trash"
+    case removalStageNativeBoundaryPostTrash = "removal.stage.native_boundary_post_trash"
+    case removalStageNativeBoundaryReverification = "removal.stage.native_boundary_reverification"
+    case removalStageNativeBoundaryFinalVerification = "removal.stage.native_boundary_final_verification"
+    case removalStageNativeRecovery = "removal.stage.native_recovery"
+    case removalStageCleanupJournalRetained = "removal.stage.cleanup_journal_retained"
     case removalStageStatusCompleted = "removal.stage_status.completed"
     case removalStageStatusSkipped = "removal.stage_status.skipped"
     case removalStageStatusRefused = "removal.stage_status.refused"
@@ -958,9 +984,14 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case messageRemovalCandidateChanged = "message.removal.candidate_changed"
     case messageRemovalGenerationChanged = "message.removal.generation_changed"
     case messageRemovalRunning = "message.removal.running"
+    case messageRemovalNativeRunning = "message.removal.native_running"
     case messageRemovalDataRefreshRequired = "message.removal.data_refresh_required"
     case messageRemovalRebootRequired = "message.removal.reboot_required"
     case messageRemovalRoutingRecoveryRequired = "message.removal.routing_recovery_required"
+    case messageRemovalNativeRecoveryRequired = "message.removal.native_recovery_required"
+    case messageRemovalNativeCleanupPending = "message.removal.native_cleanup_pending"
+    case messageRemovalNativeBoundaryChanged = "message.removal.native_boundary_changed"
+    case messageRemovalNativeUnavailable = "message.removal.native_unavailable"
     case messageRemovalPartial = "message.removal.partial"
     case messageRemovalFailed = "message.removal.failed"
     case messageRemovalLegacyDataRecoveryBlocked = "message.removal.legacy_data_recovery_blocked"
@@ -1299,6 +1330,29 @@ public extension AppLocalizer {
         case .routingFinalVerification: text(.removalStageRoutingFinalVerification)
         case .routingRecovery: text(.removalStageRoutingRecovery)
         case .relayCleanup: text(.removalStageRelayCleanup)
+        }
+    }
+
+    func displayName(_ value: OpenCodexNativeRemovalStageName) -> String {
+        switch value {
+        case .requestValidation: text(.removalStageRequestValidation)
+        case .candidateRevalidation: text(.removalStageCandidateRevalidation)
+        case .dataPolicy: text(.removalStageDataPolicy)
+        case .teardownPreflight: text(.removalStageTeardownPreflight)
+        case .cleanupJournal: text(.removalStageCleanupJournal)
+        case .nativeBoundaryPreTeardown: text(.removalStageNativeBoundaryPreTeardown)
+        case .teardown: text(.removalStageTeardown)
+        case .nativeRestore: text(.removalStageNativeRestore)
+        case .nativeBoundaryVerification: text(.removalStageNativeBoundaryVerification)
+        case .nativeBoundaryPreTrash: text(.removalStageNativeBoundaryPreTrash)
+        case .dataTrash: text(.removalStageDataTrash)
+        case .nativeBoundaryPostTrash: text(.removalStageNativeBoundaryPostTrash)
+        case .nativeBoundaryReverification: text(.removalStageNativeBoundaryReverification)
+        case .npmUninstall: text(.removalStageNPMUninstall)
+        case .packageVerification: text(.removalStagePackageVerification)
+        case .nativeBoundaryFinalVerification: text(.removalStageNativeBoundaryFinalVerification)
+        case .nativeRecovery: text(.removalStageNativeRecovery)
+        case .cleanupJournalRetained: text(.removalStageCleanupJournalRetained)
         }
     }
 

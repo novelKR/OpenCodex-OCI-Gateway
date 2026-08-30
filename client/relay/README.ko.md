@@ -212,11 +212,27 @@ malformed·legacy journal은 추정하지 않고 차단합니다. 원본 파일 
 
 exact executable/fingerprint를 사용하는 비파괴 handoff 두 개, 즉 proxy 유지 + integration/Shim
 해제와 proxy 유지 + integration만 해제는 계속 제공합니다. legacy handoff에서는 `ocx uninstall`을
-제거했습니다. 완전 제거는 opaque installation ID/fingerprint 전용 wizard입니다. schema 4
-제거는 `preserve_only`로 고정되어 data inventory나 Trash를 호출하지 않고 설정·자격 증명·로그를
-포함한 모든 OpenCodex data root를 보존합니다. 검토한 `UInt64` routing generation은 고정됩니다.
-caller path/glob/package name, implicit-all, `sudo`, 자동 elevation, permanent-delete fallback은
-없고 Codex 앱도 제거하지 않습니다.
+제거했습니다. 완전 제거는 opaque installation ID/fingerprint 전용 wizard입니다. integrated
+schema 4 제거는 `preserve_only`로 고정되어 data inventory나 Trash를 호출하지 않고 설정·자격
+증명·로그를 포함한 모든 OpenCodex data root를 보존합니다. caller path/glob/package name,
+implicit-all, 자동 elevation, permanent-delete fallback은 없고 Codex 앱도 제거하지 않습니다.
+
+제거 context는 둘로 명확히 구분합니다. 정상 routing binding이 있으면 기존 integrated 경로를
+사용하고 화면에서 검토한 nonzero `UInt64` routing generation을 고정합니다. binding이 정확히
+없는 경우에는 `standalone_native` 경로를 사용할 수 있습니다. 이 경로는 표준
+`~/.codex/config.toml`만 허용하고 package 제거 전에 Native Codex 설정과
+`clientIntegrations.codex=false`를 검증하며 server URL, Gateway 자격 증명, Relay config, LaunchAgent,
+Keychain 항목 또는 실행 중인 Relay service를 요구하지 않습니다. clean Native 또는 검증된
+OpenCodex 소유 설정만 허용하며 custom `CODEX_HOME`, local Relay, mixed, foreign, unmanaged 설정은
+manual-only입니다. 자동 경로는 canonical app-managed root로 한정하며 ambient `XDG_CONFIG_HOME` 또는
+`OPENCODEX_HOME` override는 거부합니다. unsafe·invalid binding, preview mode, 부분 Relay 자산, integration recovery,
+서로 충돌하는 제거 journal은 계속 fail-closed이고 standalone 경로는 앞의 Relay integration
+자산을 만들거나 수정하지 않습니다.
+
+integrated context는 계속 `preserve_only`입니다. standalone Native도 모든 data 보존이
+기본값이며, 적격 후보가 `selective_trash_v1`을 명시한 경우에만 검증된 inventory의 선택 항목을
+기존 두 번째 확인 뒤 Trash로 옮길 수 있습니다. 이 작업 전후에 Native 경계와 inventory revision을
+다시 검증하며 implicit-all selection이나 permanent-delete fallback은 없습니다.
 
 Relay가 버전별 teardown adapter를 소유하며, 검증된 Bun과 private immutable package snapshot으로
 실행합니다. shell, ambient `PATH`, caller가 전달한 path는 사용하지 않습니다. adapter는 관리된
@@ -227,23 +243,36 @@ npm 제거가 시작됩니다. 공식 OpenCodex package는 수정하지 않고 �
 실행 의존성으로 사용하지 않습니다.
 
 handoff 중에는 wizard를 닫지 않고 안전 사전 확인, Desktop 종료, 승인된 OpenCodex 작업,
-Desktop 재실행, Relay 상태 재확인을 단계별로 표시합니다. recovery·applying·status 없음·
-검증되지 않은 라우팅은 Desktop 종료와 OCX 호출 전에 차단합니다. Shim handoff 성공 뒤에는
-status와 후보를 모두 다시 조회하며, 동일 canonical package root와 executable의 후보가 정확히
-하나이고 새 fingerprint도 자동 제거 조건을 만족할 때만 제거를 다시 활성화합니다. 후보가
-없거나 중복·변경되면 제거를 잠그고 재탐색을 요구합니다.
-partial/unknown 결과 뒤에도 Desktop 재실행과 status 재확인을 시도해 확인된 복구 상태를
-보여주되 기존 fail-closed 제거 guard를 우회하지 않습니다.
+Desktop 재실행, context에 맞는 Native 또는 integrated 검증을 단계별로 표시합니다. integrated
+context는 recovery·applying·status 없음·검증되지 않은 라우팅을 Desktop 종료와 OCX 호출 전에
+계속 차단합니다. standalone context는 정확히 binding이 없는 경우만 허용하고 teardown과 package
+실행 전에 Native 경계를 독립적으로 다시 검증합니다. Shim handoff 성공 뒤에는 status와 후보를
+모두 다시 조회하며, 동일 canonical package root와 executable의 후보가 정확히 하나이고 새
+fingerprint도 자동 제거 조건을 만족할 때만 제거를 다시 활성화합니다. 후보가 없거나 중복·
+변경되면 제거를 잠그고 재탐색을 요구합니다. partial/unknown 결과 뒤에도 Desktop 재실행과
+bounded status 재확인을 시도해 확인된 복구 상태를 보여주되 기존 fail-closed 제거 guard를
+우회하지 않습니다.
 
-성공은 strict receipt가 package 부재, data 보존, 최종 routing 재검증, terminal relay cleanup을
-모두 증명한 뒤에만 표시합니다. process cleanup을 증명하지 못하면 platform-attested Mac 전체
-재시작이 필요하고 routing recovery가 남으면 admission도 fail-closed입니다. UI recovery session은
-versioned/path-free입니다. terminal cleanup은 exact selector, package 부재, 검토한 routing
-generation을 독립적으로 다시 확인한 뒤 recovery gate를 durable하게 해제하고 journal을 소비할
-때까지 별도의 terminal finalization witness로 admission을 계속 닫습니다. teardown·package
-child는 실행 직전에 각각 durable typed execution witness를 arm하며, witness가 남아 있는 동안
-replay·package resume·finalization을 모두 막습니다. 기존 data-inventory/Trash recovery record는
-preserve-only flow로 자동 변환하거나 재개하지 않고 검토된 수동 복구가 필요하도록 차단합니다.
+성공은 strict receipt가 package 부재, data 보존, 최종 integrated routing 또는 standalone Native
+경계를 모두 증명한 뒤에만 표시합니다. process cleanup을 증명하지 못하면 platform-attested Mac
+전체 재시작이 필요하고 context recovery가 남으면 계속 fail-closed입니다. UI recovery session은
+versioned/path-free입니다. terminal cleanup은 exact selector, package 부재, context별 routing
+generation 또는 Native fingerprint를 독립적으로 다시 확인한 뒤 recovery gate를 durable하게
+해제하고 재실행 가능한 terminal witness를 유지합니다. 앱은 이 receipt를 검증한 뒤 context가
+포함된 schema 3 `terminal_ack_pending` recovery record에 정확한 `terminal_receipt_digest`를 먼저
+저장하고 readback합니다. 그 다음
+`discover-open-codex-native --acknowledge-terminal-receipt-digest`로 그 digest를 전달합니다. bare
+discovery나 다른 digest는 journal을 소비할 수 없습니다. acknowledgement는 같은 경계와 package
+부재를 재검증한 뒤 정확한 journal만 제거하고 `ready/native`를 반환하며, 앱은 그 후에만 로컬
+checkpoint를 삭제하고 readback합니다. acknowledgement 전 중단은 terminal receipt를 다시
+발행하고, acknowledgement 후 로컬 삭제 전 중단은 이미 제거된 journal에 대해 같은 digest를
+idempotent하게 재시도합니다. 어느 창에서도 미해결 checkpoint나 journal 옆에 Relay 설정을 만들 수
+없습니다.
+teardown·package child는 실행 직전에 각각 durable typed execution witness를 arm하며, witness가 남아 있는 동안
+replay·package resume·finalization을 모두 막습니다. 기존 integrated data-inventory/Trash
+recovery record는 어느 context로도 자동 변환하거나 재개하지 않고 검토된 수동 복구가 필요하도록
+차단합니다. 새 standalone inventory와 Trash witness는 `standalone_native` journal 및 Native
+경계에 계속 고정됩니다.
 saved reboot recovery는 일반
 uninstall predicate를 완화하지 않는 별도 recovery-only predicate를 사용하며, relay가
 unreachable이어도 저장된 동일 durable generation에 한해서만 review할 수 있습니다. child
@@ -408,7 +437,7 @@ build provenance를 만들고 검증한 뒤 immutable release를 게시합니다
 draft 생성 이후 실패하면 publisher는 제한된 release 삭제를 시도합니다. 이미 immutable
 상태여서 GitHub가 삭제를 거부하면 CI가 해소되지 않은 공개 상태를 보고하며, 이를 수동으로
 해소할 때까지 client 등록을 중단해야 합니다.
-`0.3.8-rc.1`처럼 SemVer suffix가 있는 tag는 GitHub pre-release로 게시되고 그대로
+`0.3.8-rc.2`처럼 SemVer suffix가 있는 tag는 GitHub pre-release로 게시되고 그대로
 readback되어야 합니다. 새 tag마다 `client/relay/release-notes/VERSION.md`에 제한된 크기의
 version별 설명을 추가하며, CI는 검토된 조각을 공통 설치·검증 안내 앞에 포함합니다.
 
@@ -420,8 +449,15 @@ revision 4 bundle은 Linux helper 네 개, Hardened Runtime ad-hoc `OpenCodexRel
 `THIRD_PARTY_NOTICES.md`, manifest, signature의 총 8개 asset입니다. manifest는 component,
 macOS bundle ID, `signing_mode: "adhoc"`, final zip hash, notice URL/SHA-256를 함께
 서명합니다. installer는 Ed25519 signature, 모든 asset hash, nested ad-hoc signature,
-Relay Team ID 부재 및 Hardened Runtime을 검증합니다. 기존 revision 1/2 release도 rollback용으로 지원하지만
-parked routing controller가 없어 MenuBar-managed Desktop 전환에 사용하면 안 되며 legacy
+Relay Team ID 부재 및 Hardened Runtime을 검증합니다. macOS 설치·제거는 최초 영구 변경부터
+활성화, 검증된 rollback 또는 완전한 teardown까지 owner-only source lifecycle 예약을 유지하며,
+LaunchAgent helper의 변경 명령은 이 내부 예약 transaction 밖에서 직접 실행할 수 없습니다.
+기존 revision 1/2 release는 이미 설치된 lifecycle-capable helper가 transaction을 조정하는
+rollback target으로만 허용되며, 현행 스크립트를 이용한 신규 macOS 최초 설치에는 사용할 수
+없습니다. 예약 또는 recovery evidence가 남으면 marker를 삭제하거나 다른 writer를 재시도하지
+말고, 보고된 workspace와 고정 install root를 보존하여 service/routing snapshot을 검토·복원한
+뒤 검토된 최신 helper로 exact owner-only marker를 해제해야 합니다. 이 복구는 의도적으로
+fail-closed인 수동 절차입니다. revision 1/2에는 parked routing controller가 없어 MenuBar-managed Desktop 전환에 사용하면 안 되며 legacy
 compatibility path를 쓰기 전 Desktop을 종료해야 합니다. 앱에 포함된 generic
 `OpenCodexRelayHelperInstaller`의 `install|update|uninstall|recover|status`는 별도 관리자
 승인이 필요하며 app·installer·helper의 exact CDHash를 결합합니다. busy 또는

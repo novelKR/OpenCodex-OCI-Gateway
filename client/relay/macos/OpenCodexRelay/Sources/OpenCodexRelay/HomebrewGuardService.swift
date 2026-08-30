@@ -760,3 +760,26 @@ extension OpenCodexInstallationCandidate {
         ).validated(allowedRoot: "/opt/homebrew")
     }
 }
+
+extension OpenCodexNativeRemovalCandidate {
+    func homebrewGuardCandidate() throws -> HomebrewGuardCandidate {
+        guard homebrewGuardRequired,
+              removalCapability == .homebrewGuardedNPM,
+              manager == .homebrew,
+              let snapshot = homebrewGuard else {
+            throw HomebrewGuardErrorCode.candidateChanged
+        }
+        return try HomebrewGuardCandidate(
+            installationID: installationID,
+            installationFingerprint: installationFingerprint,
+            prefix: snapshot.prefix,
+            packageRoot: snapshot.packageRoot,
+            executable: snapshot.executable,
+            cliEntry: snapshot.cliEntry,
+            bunExecutable: snapshot.bunExecutable,
+            nodeExecutable: snapshot.nodeExecutable,
+            npmCLI: snapshot.npmCLI,
+            launchers: snapshot.launchers
+        ).validated(allowedRoot: "/opt/homebrew")
+    }
+}

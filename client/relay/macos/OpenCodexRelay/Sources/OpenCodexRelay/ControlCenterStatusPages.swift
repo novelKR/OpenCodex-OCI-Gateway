@@ -5,13 +5,18 @@ import OpenCodexRelayLocalization
 enum LocalOpenCodexPrimaryAction: Equatable {
     case find
     case openSettings
+    case blocked
 
     static func resolve(_ availability: RelayIntegrationAvailability) -> Self {
-        availability == .missing ? .openSettings : .find
+        switch availability {
+        case .ready: .find
+        case .missing: .openSettings
+        case .preview, .unsafe, .invalid, .helperUnavailable: .blocked
+        }
     }
 
     static func showsDiscoveryControls(_ availability: RelayIntegrationAvailability) -> Bool {
-        availability == .ready
+        availability == .ready || availability == .missing
     }
 }
 
@@ -290,6 +295,28 @@ struct LocalOpenCodexControlCenterPage: View {
                 )
             }
 
+            ControlCenterSupportingText(
+                localizer.text(.controlCenterLocalOpenCodexNativeRemovalDetail),
+                systemImage: "arrow.uturn.backward.circle"
+            )
+            ControlCenterActionFooter {
+                EmptyView()
+            } primary: {
+                Button {
+                    model.addLocalOpenCodexBackend()
+                } label: {
+                    Label(
+                        localizer.text(.controlCenterLocalOpenCodexNativeRemovalAction),
+                        systemImage: "arrow.uturn.backward.circle"
+                    )
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(!model.canDiscoverOpenCodex)
+                .accessibilityHint(
+                    localizer.text(.controlCenterLocalOpenCodexNativeRemovalHint)
+                )
+            }
+
         case .find:
             ControlCenterActionFooter {
                 EmptyView()
@@ -300,9 +327,11 @@ struct LocalOpenCodexControlCenterPage: View {
                     Label(localizer.text(.menuAddLocal), systemImage: "plus.circle")
                 }
                 .buttonStyle(.glassProminent)
-                .disabled(model.isBusy || !model.desktopTargetState.canControl || !model.canRequestRouting)
+                .disabled(!model.canDiscoverOpenCodex)
                 .accessibilityHint(localizer.text(.menuAddLocalHint))
             }
+        case .blocked:
+            EmptyView()
         }
     }
 }

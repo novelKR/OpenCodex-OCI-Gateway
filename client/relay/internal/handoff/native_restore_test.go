@@ -308,15 +308,66 @@ func TestNativeRestoreExecutorClassifiesAlreadyNativeAndRetryableNoMutation(t *t
 		t.Fatalf("result=%#v calls=%d err=%v", result, len(runner.calls), err)
 	}
 
-	runner = &nativeRestoreRunner{responses: []nativeRestoreResponse{{
+	runner = &nativeRestoreRunner{responses: append([]nativeRestoreResponse{{
 		payload: `{"success":false,"artifacts":{"config":{"state":"skipped","changed":false,"action":"owned-fields-stripped"}}}`,
 		nonZero: true,
-	}}}
+	}}, successfulOwnerProbe()...)}
 	result, err = (NativeRestoreExecutor{Platform: "darwin", Runner: runner, HomeDir: home}).ExecuteExpected(
 		context.Background(), candidate, configPath,
 	)
-	if err != nil || result.Outcome != NativeRestoreRetryableNoMutation || len(runner.calls) != 1 {
+	if err != nil || result.Outcome != NativeRestoreRetryableNoMutation || !result.NonRoutingWarning || len(runner.calls) != 3 {
 		t.Fatalf("result=%#v calls=%d err=%v", result, len(runner.calls), err)
+	}
+}
+
+func TestNativeRestoreRetryableNoMutationStillRequiresDisabledIntegration(t *testing.T) {
+	candidate, home, configPath := nativeRestoreFixture(t)
+	runner := &nativeRestoreRunner{responses: []nativeRestoreResponse{
+		{payload: `{"success":false,"artifacts":{"config":{"state":"skipped","changed":false,"action":"owned-fields-stripped"}}}`, nonZero: true},
+		{payload: `{"ok":true}`},
+		{payload: `{"clientIntegrations":{"codex":true}}`},
+	}}
+	_, err := (NativeRestoreExecutor{Platform: "darwin", Runner: runner, HomeDir: home}).ExecuteExpected(
+		context.Background(), candidate, configPath,
+	)
+	if !errors.Is(err, ErrNativeRestoreFailed) || len(runner.calls) != 3 {
+		t.Fatalf("calls=%d err=%v", len(runner.calls), err)
+	}
+}
+
+func TestOpenCodexOwnerConfigurationRevisionBindsExactSafeDefaultConfig(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	absent, err := OpenCodexOwnerConfigurationRevision(home)
+	if err != nil || !isFingerprint(absent) {
+		t.Fatalf("absent revision=%q err=%v", absent, err)
+	}
+	directory := filepath.Join(home, ".opencodex")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(path, []byte(`{"clientIntegrations":{"codex":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := OpenCodexOwnerConfigurationRevision(home)
+	if err != nil || !isFingerprint(first) || first == absent {
+		t.Fatalf("first revision=%q absent=%q err=%v", first, absent, err)
+	}
+	if err := os.WriteFile(path, []byte(`{"clientIntegrations":{"codex":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenCodexOwnerConfigurationRevision(home)
+	if err != nil || !isFingerprint(second) || second == first {
+		t.Fatalf("second revision=%q first=%q err=%v", second, first, err)
+	}
+	if err := os.Chmod(path, 0o622); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenCodexOwnerConfigurationRevision(home); !errors.Is(err, ErrNativeRestoreProofUnavailable) {
+		t.Fatalf("unsafe config error=%v", err)
 	}
 }
 

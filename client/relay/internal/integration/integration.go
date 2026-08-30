@@ -26,6 +26,8 @@ import (
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/codexconfig"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/lifecyclelock"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
 
@@ -192,6 +194,14 @@ func (m *Manager) Inspect(ctx context.Context) (Inspection, error) {
 }
 
 func (m *Manager) Apply(ctx context.Context, request Candidate, expectedDigest string) (Receipt, error) {
+	lifecycle, err := lifecyclelock.AcquireWriter(ctx, m.Paths.Home, "")
+	if err != nil {
+		return Receipt{}, ErrUnsafeState
+	}
+	defer lifecycle.Close()
+	if err := m.requireStandaloneRemovalInactive(); err != nil {
+		return Receipt{}, err
+	}
 	if len(expectedDigest) != 64 {
 		return Receipt{}, ErrStateChanged
 	}
@@ -297,6 +307,14 @@ func (m *Manager) Apply(ctx context.Context, request Candidate, expectedDigest s
 }
 
 func (m *Manager) Recover(ctx context.Context) (Receipt, error) {
+	lifecycle, err := lifecyclelock.AcquireWriter(ctx, m.Paths.Home, "")
+	if err != nil {
+		return Receipt{}, ErrUnsafeState
+	}
+	defer lifecycle.Close()
+	if err := m.requireStandaloneRemovalInactive(); err != nil {
+		return Receipt{}, err
+	}
 	if err := m.validate(ctx); err != nil {
 		return Receipt{}, err
 	}
@@ -308,6 +326,22 @@ func (m *Manager) Recover(ctx context.Context) (Receipt, error) {
 		return Receipt{}, ErrRecoveryRequired
 	}
 	return Receipt{SchemaVersion: schemaVersion, OK: true, State: "integration_required"}, nil
+}
+
+// A retained standalone-Native removal journal is consumed only by the
+// Native discovery acknowledgement path after it revalidates the fixed Codex
+// boundary and package absence. Relay setup must not create a binding or
+// integration journal beside that evidence, including when it is malformed.
+func (m *Manager) requireStandaloneRemovalInactive() error {
+	anchor, err := handoff.StandaloneRemovalAnchorPath(m.Paths.Home)
+	if err != nil {
+		return ErrUnsafeState
+	}
+	_, exists, err := handoff.ReadRemovalCleanup(anchor)
+	if err != nil || exists {
+		return ErrRecoveryRequired
+	}
+	return nil
 }
 
 func (m *Manager) candidateConfig(request Candidate) (config.Config, error) {

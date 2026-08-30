@@ -995,6 +995,63 @@ rollback_install_transaction() {
   [[ "$rollback_failed" == false ]]
 }
 
+source_install_lifecycle_capable() {
+  local helper="$1" capability
+  [[ -x "$helper" && -f "$helper" && ! -L "$helper" ]] || return 1
+  capability="$("$helper" lifecycle source-install-capability --json 2>/dev/null)" || return 1
+  jq -e '.schema_version == 2 and .state == "ready" and (keys | sort == ["schema_version", "state"])' \
+    <<<"$capability" >/dev/null
+}
+
+load_source_install_reservation_recovery() {
+  local expected_scope="$1" path="${source_install_reservation_recovery_path:-}" ownership
+  local recovered_token recovered_root_created
+  [[ -n "$path" && -f "$path" && ! -L "$path" ]] || return 1
+  case "$(uname -s)" in
+    Darwin) ownership="$(stat -f '%u:%Lp' "$path" 2>/dev/null)" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ "$ownership" == "$(id -u):600" ]] || return 1
+  jq -e --arg scope "$expected_scope" '
+    (keys | sort == ["root_created", "schema_version", "scope", "token"])
+    and .schema_version == 1 and .scope == $scope
+    and (.token | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.root_created | type == "boolean")
+  ' "$path" >/dev/null || return 1
+  recovered_token="$(jq -er '.token' "$path")" || return 1
+  recovered_root_created="$(jq -er 'if .root_created then "true" else "false" end' "$path")" || return 1
+  source_install_reservation_token="$recovered_token"
+  source_install_reservation_root_created="$recovered_root_created"
+}
+
+managed_production_current_relayctl() {
+  local current_link="${INSTALL_ROOT}/current" target helper root_mode
+  [[ -d "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" && -L "$current_link" ]] || return 1
+  root_mode="$(stat -f '%u:%Lp' "$INSTALL_ROOT" 2>/dev/null)" || return 1
+  [[ "$root_mode" == "$(id -u):700" ]] || return 1
+  target="$(readlink "$current_link")" || return 1
+  [[ -n "$target" && "$target" != /* && "$target" != *$'\n'* && "$target" != *$'\r'* ]] || return 1
+  case "/$target/" in
+    */../*|*/./*) return 1 ;;
+  esac
+  helper="${INSTALL_ROOT}/${target}/opencodex-relayctl"
+  [[ -x "$helper" && -f "$helper" && ! -L "$helper" ]] || return 1
+  printf '%s\n' "$helper"
+}
+
+select_source_install_lifecycle_helper() {
+  local preferred="$1" current="" candidate
+  current="$(managed_production_current_relayctl 2>/dev/null || true)"
+  for candidate in "$preferred" "$current"; do
+    [[ -n "$candidate" ]] || continue
+    if source_install_lifecycle_capable "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 remove_new_install_artifact() {
   local selected=""
   local expected_target="${version}/${goos}-${goarch}"
@@ -1022,6 +1079,7 @@ remove_new_install_artifact() {
 
 finish_install() {
   local status=$?
+  local rollback_failed=false retain_recovery_evidence=false
   trap - EXIT
   trap '' HUP INT QUIT TERM
   set +e
@@ -1042,16 +1100,111 @@ finish_install() {
       "${menu_bar_link:-}" "${transaction_dir}/menu-bar-link" \
       "${menu_bar_binding:-}" "${transaction_dir}/menu-bar-binding"; then
       status=70
+	  rollback_failed=true
+	  retain_recovery_evidence=true
     fi
   fi
-  if ((status != 0)) && [[ "${install_dir_created:-false}" == true ]]; then
+  if ((status != 0)) && [[ "$rollback_failed" == false && "${install_dir_created:-false}" == true ]]; then
     if ! remove_new_install_artifact; then
       printf 'CRITICAL: unable to remove the unselected release artifact created by the failed install.\n' >&2
       status=70
+	  retain_recovery_evidence=true
     fi
   fi
-  rm -rf -- "${tmp:-}" "${staging_dir:-}"
+  if [[ "$rollback_failed" == false && "$retain_recovery_evidence" == false && "${source_install_reservation_active:-false}" == true ]]; then
+    if [[ -z "${source_install_reservation_token:-}" ]] && ! load_source_install_reservation_recovery production; then
+      printf 'CRITICAL: unable to recover the Relay source-install lifecycle reservation token.\n' >&2
+      status=70
+      retain_recovery_evidence=true
+    fi
+  fi
+  if [[ "$rollback_failed" == false && "$retain_recovery_evidence" == false && "${source_install_reservation_active:-false}" == true ]]; then
+    release_args=(
+      lifecycle release-source-install --scope production
+      --token "$source_install_reservation_token" --json
+    )
+    if ((status != 0)) && [[ "${source_install_reservation_root_created:-false}" == true ]]; then
+      release_args+=(--remove-created-root)
+    fi
+    if ! "$source_install_reservation_relayctl" "${release_args[@]}" >/dev/null; then
+      printf 'CRITICAL: unable to release the Relay source-install lifecycle reservation.\n' >&2
+      status=70
+	  retain_recovery_evidence=true
+    else
+      source_install_reservation_active=false
+      unset OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION
+      rm -f -- "${source_install_reservation_recovery_path:-}"
+    fi
+  fi
+  if [[ "$retain_recovery_evidence" == true ]]; then
+    printf 'CRITICAL: source-install recovery evidence and lifecycle reservation were retained at %s.\n' \
+      "${transaction_dir:-${tmp:-unknown}}" >&2
+  else
+    rm -rf -- "${tmp:-}" "${staging_dir:-}"
+  fi
   exit "$status"
+}
+
+reserve_source_install_lifecycle() {
+  local preferred_helper="${1:-${relayctl_path:-}}" selected_helper reservation_json
+  [[ "$(uname -s)" == Darwin ]] || return 0
+  selected_helper="$(select_source_install_lifecycle_helper "$preferred_helper")" || \
+    die 'a lifecycle-capable installed or target relayctl is required for macOS source installation and removal'
+  source_install_reservation_relayctl="${tmp}/reservation-relayctl"
+  cp -p -- "$selected_helper" "$source_install_reservation_relayctl"
+  chmod 0700 "$source_install_reservation_relayctl"
+  source_install_reservation_recovery_path="${tmp}/source-install-reservation.json"
+  source_install_reservation_active=true
+  reservation_json="$("$source_install_reservation_relayctl" \
+    lifecycle reserve-source-install --scope production \
+    --recovery-file "$source_install_reservation_recovery_path" --json)" || \
+    die 'unable to reserve the Relay source-install lifecycle'
+  load_source_install_reservation_recovery production || \
+    die 'source-install durable recovery response is invalid'
+  jq -e --arg token "$source_install_reservation_token" \
+    --argjson root_created "$source_install_reservation_root_created" '
+    (keys | sort == ["root_created", "schema_version", "scope", "token"])
+    and .schema_version == 1 and .scope == "production"
+    and .token == $token and .root_created == $root_created
+  ' <<<"$reservation_json" >/dev/null || die 'source-install reservation response is invalid'
+  export OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION="$source_install_reservation_token"
+}
+
+finish_source_uninstall() {
+  local status=$?
+  local retain_recovery_evidence=false
+  trap - EXIT HUP INT QUIT TERM
+  set +e
+  if ((status != 0)) && [[ "${source_uninstall_destructive_active:-false}" == true ]]; then
+    retain_recovery_evidence=true
+    printf 'CRITICAL: source uninstall stopped after destructive teardown began; lifecycle reservation remains active.\n' >&2
+  elif [[ "${source_install_reservation_active:-false}" == true ]]; then
+    if ! release_source_install_lifecycle; then
+      printf 'CRITICAL: unable to release the Relay source-uninstall lifecycle reservation.\n' >&2
+      status=70
+      retain_recovery_evidence=true
+    fi
+  fi
+  if [[ "$retain_recovery_evidence" == false && -n "${tmp:-}" && -d "$tmp" && ! -L "$tmp" ]]; then
+    rm -rf -- "$tmp"
+  elif [[ "$retain_recovery_evidence" == true ]]; then
+    printf 'CRITICAL: source-uninstall lifecycle recovery helper was retained at %s.\n' "${tmp:-unknown}" >&2
+  fi
+  exit "$status"
+}
+
+release_source_install_lifecycle() {
+  [[ "${source_install_reservation_active:-false}" == true ]] || return 0
+  if [[ -z "${source_install_reservation_token:-}" ]] && ! load_source_install_reservation_recovery production; then
+    return 1
+  fi
+  if ! "$source_install_reservation_relayctl" lifecycle release-source-install \
+    --scope production --token "$source_install_reservation_token" --json >/dev/null; then
+    return 1
+  fi
+  source_install_reservation_active=false
+  unset OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION
+  rm -f -- "${source_install_reservation_recovery_path:-}"
 }
 
 require_version() {
@@ -1199,6 +1352,12 @@ routing_journal_path=""
 local_enrollment_path=""
 local_catalog_path=""
 local_catalog_pending_path=""
+source_install_reservation_active=false
+source_install_reservation_token=""
+source_install_reservation_root_created=false
+source_install_reservation_relayctl=""
+source_install_reservation_recovery_path=""
+source_uninstall_destructive_active=false
 
 case "$action" in
   install)
@@ -1299,6 +1458,10 @@ case "$action" in
     read -r goos goarch <<<"$(normalize_target)"
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/opencodex-relay.XXXXXX")"
     trap finish_install EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 131' QUIT
+    trap 'exit 143' TERM
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 131' QUIT
@@ -1419,11 +1582,7 @@ case "$action" in
     if [[ "$(uname -s)" == Darwin && "$macos_bundle_mode" != true && ( -e "$MACOS_MENU_BAR_LINK" || -L "$MACOS_MENU_BAR_LINK" || -e "$MACOS_MENU_BAR_BINDING" || -L "$MACOS_MENU_BAR_BINDING" ) ]]; then
       die 'legacy macOS downgrade requires a completed OpenCodexRelay uninstall first; the revision-4 MenuBar control surface is still registered'
     fi
-    if [[ ! -e "${INSTALL_ROOT}/${version}" && ! -L "${INSTALL_ROOT}/${version}" ]]; then
-      version_dir_created=true
-    fi
-    install -d -m 0700 "$INSTALL_ROOT" "${INSTALL_ROOT}/${version}"
-    staging_dir="$(mktemp -d "${INSTALL_ROOT}/.stage-${version}-${goos}-${goarch}.XXXXXX")"
+    staging_dir="$(mktemp -d "${tmp}/stage-${version}-${goos}-${goarch}.XXXXXX")"
     install_dir="${INSTALL_ROOT}/${version}/${goos}-${goarch}"
     notices_path="${staging_dir}/${THIRD_PARTY_NOTICES_FILE}"
     if [[ "$macos_bundle_mode" == true ]]; then
@@ -1465,6 +1624,15 @@ case "$action" in
         die 'THIRD_PARTY_NOTICES.md SHA-256 does not match manifest'
       chmod 0644 "$notices_path"
     fi
+    # The verified helper reserves the fixed install root under the shared
+    # lifecycle lock before this script creates any persistent Relay asset.
+    # The root itself remains a fail-closed sentinel for standalone removal
+    # throughout install and rollback.
+    reserve_source_install_lifecycle
+    if [[ ! -e "${INSTALL_ROOT}/${version}" && ! -L "${INSTALL_ROOT}/${version}" ]]; then
+      version_dir_created=true
+    fi
+    install -d -m 0700 "$INSTALL_ROOT" "${INSTALL_ROOT}/${version}"
     if [[ -e "$install_dir" || -L "$install_dir" ]]; then
       [[ -d "$install_dir" && ! -L "$install_dir" ]] || die "existing release target is unsafe: $install_dir"
       if [[ "$macos_bundle_mode" == true ]]; then
@@ -1674,8 +1842,20 @@ case "$action" in
       printf 'macos_app_installed=%s gatekeeper_approval=manual\n' "$menu_bar_link"
       printf 'gatekeeper_next_step=open_OpenCodexRelay.app_in_Finder_then_use_Privacy_&_Security_Open_Anyway_if_blocked\n'
     fi
+    # Make the final commit ordering signal-atomic: once rollback is disabled,
+    # the verified candidate is authoritative even if reservation release must
+    # be retried by the EXIT handler.
+    trap '' HUP INT QUIT TERM
     install_transaction_active=false
     install_dir_created=false
+    source_install_release_status=0
+    release_source_install_lifecycle || source_install_release_status=$?
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 131' QUIT
+    trap 'exit 143' TERM
+    ((source_install_release_status == 0)) || \
+      die 'unable to release the Relay source-install lifecycle reservation'
     if [[ "$compatibility_revision" != 4 ]]; then
       printf 'relay_installed=%s target=%s/%s codex_routing=legacy_compatibility\n' "$version" "$goos" "$goarch"
     elif [[ "$defer_codex_routing" == true ]]; then
@@ -1703,7 +1883,21 @@ case "$action" in
       preflight_menu_bar_binding "$MACOS_MENU_BAR_BINDING"
     fi
     current="${INSTALL_ROOT}/current/opencodex-relayctl"
-    [[ -x "$current" ]] || die 'current relayctl is unavailable; retain the service and use the MenuBar/CLI recovery flow after inspection'
+    if [[ "$(uname -s)" == Darwin ]]; then
+      current="$(managed_production_current_relayctl)" || \
+        die 'current relayctl is unavailable or unmanaged; retain the service and use the MenuBar/CLI recovery flow after inspection'
+    else
+      [[ -x "$current" ]] || die 'current relayctl is unavailable; retain the service and use the MenuBar/CLI recovery flow after inspection'
+    fi
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/opencodex-relay-uninstall.XXXXXX")" || \
+      die 'unable to create the source-uninstall lifecycle workspace'
+    chmod 0700 "$tmp" || die 'unable to protect the source-uninstall lifecycle workspace'
+    trap finish_source_uninstall EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 131' QUIT
+    trap 'exit 143' TERM
+    reserve_source_install_lifecycle "$current"
     relayctl_usage="$("$current" 2>&1 || true)"
     if grep -Fq 'opencodex-relayctl mode status' <<<"$relayctl_usage"; then
       "$current" mode request native --config "$config_path" --codex-config "$codex_config"
@@ -1742,6 +1936,7 @@ case "$action" in
     fi
     if [[ "$(uname -s)" == Darwin ]]; then
       require_manual_homebrew_guard_absent
+      source_uninstall_destructive_active=true
       current_target="$(readlink "${INSTALL_ROOT}/current")" || die 'unable to inspect selected macOS relay release before unregistering login item'
       if [[ "$current_target" == */"${MACOS_MENU_BAR_BUNDLE}"/Contents/Library/Helpers ]]; then
         menu_bar_login_helper="${INSTALL_ROOT}/${current_target%/Contents/Library/Helpers}/Contents/MacOS/OpenCodexRelay"
@@ -1751,6 +1946,8 @@ case "$action" in
         [[ "$login_registration" == login_registration=disabled ]] || \
           die 'macOS MenuBar login item did not confirm removal'
       fi
+    else
+      source_uninstall_destructive_active=true
     fi
     "${SCRIPT_DIR}/install-service.sh" uninstall || \
       die 'native routing is active but the relay service could not be uninstalled; service state was retained for inspection'
@@ -1766,7 +1963,18 @@ case "$action" in
       rm -f -- "$MACOS_MENU_BAR_BINDING"
       rmdir "$MACOS_MENU_BAR_BINDING_DIR" 2>/dev/null || true
     fi
-    trap - EXIT
+    trap '' HUP INT QUIT TERM
+    source_uninstall_destructive_active=false
+    source_install_release_status=0
+    release_source_install_lifecycle || source_install_release_status=$?
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 131' QUIT
+    trap 'exit 143' TERM
+    ((source_install_release_status == 0)) || \
+      die 'unable to release the Relay source-uninstall lifecycle reservation'
+    rm -rf -- "$tmp"
+    trap - EXIT HUP INT QUIT TERM
     printf 'relay_service=uninstalled config_retained=%s\n' "$config_path"
     ;;
   *) usage >&2; exit 2 ;;

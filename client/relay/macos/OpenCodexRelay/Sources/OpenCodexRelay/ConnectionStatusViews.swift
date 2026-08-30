@@ -409,23 +409,28 @@ struct OpenCodexDiscoveryControls: View {
                 Text(localizer.text(.menuDiscoverySearching, tier.rawValue.uppercased()))
                     .font(.body)
             }
+        case .nativeSearching:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(localizer.text(.menuDiscoveryNativeSearching))
+                    .font(.body)
+            }
         case let .candidates(result):
             VStack(alignment: .leading, spacing: 10) {
                 Text(localizer.text(.menuDiscoveryCandidates))
                     .font(.body.weight(.semibold))
                 ForEach(result.candidates) { candidate in
-                    Button(localizer.text(
-                        .menuDiscoveryCandidate,
-                        candidate.manager.rawValue,
-                        candidate.version,
-                        candidate.tier.rawValue.uppercased()
-                    )) {
+                    Button(candidateTitle(candidate, context: result.context)) {
                         if model.chooseDiscoveredOpenCodexCandidate(id: candidate.id) {
                             onRemovalFlowPresented()
                         }
                     }
-                    .disabled(model.isBusy)
-                    .help(candidate.packageRoot)
+                    .disabled(
+                        model.isBusy ||
+                        (result.context == .standaloneNative && !candidate.automaticRemovalEligible)
+                    )
+                    .help(candidate.help ?? "")
                 }
                 if result.truncated {
                     ControlCenterSupportingText(
@@ -434,12 +439,14 @@ struct OpenCodexDiscoveryControls: View {
                     )
                 }
                 AdaptiveActionRow {
-                    Button {
-                        model.selectOpenCodexExecutableManually()
-                    } label: {
-                        Label(localizer.text(.menuDiscoveryManual), systemImage: "doc.badge.plus")
+                    if result.context == .integrated {
+                        Button {
+                            model.selectOpenCodexExecutableManually()
+                        } label: {
+                            Label(localizer.text(.menuDiscoveryManual), systemImage: "doc.badge.plus")
+                        }
+                        .disabled(model.isBusy)
                     }
-                    .disabled(model.isBusy)
                     Button(role: .cancel) {
                         model.cancelOpenCodexDiscovery()
                     } label: {
@@ -486,10 +493,12 @@ struct OpenCodexDiscoveryControls: View {
                     )
                 }
                 AdaptiveActionRow {
-                    Button {
-                        model.selectOpenCodexExecutableManually()
-                    } label: {
-                        Label(localizer.text(.menuDiscoveryManual), systemImage: "doc.badge.plus")
+                    if result.context == .integrated {
+                        Button {
+                            model.selectOpenCodexExecutableManually()
+                        } label: {
+                            Label(localizer.text(.menuDiscoveryManual), systemImage: "doc.badge.plus")
+                        }
                     }
                     Button(role: .cancel) {
                         model.cancelOpenCodexDiscovery()
@@ -499,12 +508,35 @@ struct OpenCodexDiscoveryControls: View {
                 }
             }
         case .failed:
-            Button {
-                model.selectOpenCodexExecutableManually()
-            } label: {
-                Label(localizer.text(.menuDiscoveryManual), systemImage: "doc.badge.plus")
+            if model.integrationAvailability == .ready {
+                Button {
+                    model.selectOpenCodexExecutableManually()
+                } label: {
+                    Label(localizer.text(.menuDiscoveryManual), systemImage: "doc.badge.plus")
+                }
+                .disabled(model.isBusy)
             }
-            .disabled(model.isBusy)
+        }
+    }
+
+    private func candidateTitle(
+        _ candidate: OpenCodexDiscoveryCandidatePresentation,
+        context: OpenCodexRemovalContext
+    ) -> String {
+        switch context {
+        case .integrated:
+            return localizer.text(
+                .menuDiscoveryCandidate,
+                candidate.manager.rawValue,
+                candidate.version,
+                candidate.tier?.rawValue.uppercased() ?? "?"
+            )
+        case .standaloneNative:
+            return localizer.text(
+                .menuDiscoveryNativeCandidate,
+                candidate.manager.rawValue,
+                candidate.version
+            )
         }
     }
 }

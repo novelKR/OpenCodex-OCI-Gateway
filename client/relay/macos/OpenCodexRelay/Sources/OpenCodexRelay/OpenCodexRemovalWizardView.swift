@@ -107,6 +107,20 @@ struct OpenCodexRemovalWizardView: View {
                 actionTitle: localizer.text(.removalRoutingRecoveryAction),
                 action: model.checkOpenCodexRoutingRecovery
             )
+        case .nativeRecoveryRequired:
+            recoveryView(
+                title: localizer.text(.removalNativeRecoveryTitle),
+                detail: localizer.text(.removalNativeRecoveryDetail),
+                actionTitle: localizer.text(.removalNativeRecoveryAction),
+                action: model.checkOpenCodexNativeRecovery
+            )
+        case .nativeTerminalCleanupPending:
+            recoveryView(
+                title: localizer.text(.removalNativeCleanupTitle),
+                detail: localizer.text(.removalNativeCleanupDetail),
+                actionTitle: localizer.text(.removalNativeCleanupAction),
+                action: model.checkOpenCodexNativeTerminalCleanup
+            )
         case .result:
             resultView(flow)
         case .failed:
@@ -117,14 +131,18 @@ struct OpenCodexRemovalWizardView: View {
     private func actionsView(_ flow: OpenCodexRemovalFlow) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             candidateSummary(flow)
-            Text(localizer.text(.removalActionsDetail))
+            Text(localizer.text(
+                flow.context == .standaloneNative
+                    ? .removalNativeActionsDetail
+                    : .removalActionsDetail
+            ))
                 .foregroundStyle(.secondary)
 
             if flow.requiresHomebrewGuard || model.canRecoverHomebrewGuard {
                 HomebrewGuardStatusCard(model: model, localizer: localizer)
             }
 
-            if let progress = flow.handoffProgress {
+            if flow.context == .integrated, let progress = flow.handoffProgress {
                 OpenCodexHandoffProgressView(
                     progress: progress,
                     status: model.status,
@@ -133,7 +151,8 @@ struct OpenCodexRemovalWizardView: View {
                 )
             }
 
-            GroupBox(localizer.text(.removalHandoffSection)) {
+            if flow.context == .integrated {
+                GroupBox(localizer.text(.removalHandoffSection)) {
                 VStack(alignment: .leading, spacing: 10) {
                     Button(localizer.displayName(OpenCodexHandoffAction.retainProxyRemoveShim)) {
                         model.chooseOpenCodexHandoffAction(.retainProxyRemoveShim)
@@ -161,23 +180,33 @@ struct OpenCodexRemovalWizardView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 4)
+                }
             }
 
-            GroupBox(localizer.text(.removalSafeSection)) {
+            GroupBox(localizer.text(
+                flow.context == .standaloneNative
+                    ? .removalNativeSafeSection
+                    : .removalSafeSection
+            )) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(localizer.text(.removalSafeDetail))
+                    Text(localizer.text(
+                        flow.context == .standaloneNative
+                            ? .removalNativeSafeDetail
+                            : .removalSafeDetail
+                    ))
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button(localizer.text(.removalSafeAction), role: .destructive) {
+                    Button(localizer.text(
+                        flow.context == .standaloneNative
+                            ? .removalNativeSafeAction
+                            : .removalSafeAction
+                    ), role: .destructive) {
                         model.beginOpenCodexRemoval()
                     }
                     .disabled(
-                        !flow.automaticRemovalEligible ||
-                        model.status?.canUninstallOpenCodex != true ||
-                        model.isBusy
+                        !model.canBeginOpenCodexRemoval || model.isBusy
                     )
-                    if flow.automaticRemovalEligible,
-                       model.status?.canUninstallOpenCodex == true {
+                    if model.canBeginOpenCodexRemoval {
                         Label(
                             localizer.text(.removalHandoffResultRemovalAvailable),
                             systemImage: "checkmark.shield.fill"
@@ -188,11 +217,13 @@ struct OpenCodexRemovalWizardView: View {
                         Label(localizer.text(.removalManualOnly), systemImage: "lock.shield")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else if model.status?.phase == .recoveryRequired {
+                    } else if flow.context == .integrated,
+                              model.status?.phase == .recoveryRequired {
                         Label(localizer.text(.removalHandoffResultRecoveryRequired), systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
                             .font(.caption)
                             .foregroundStyle(.orange)
-                    } else if model.status?.canUninstallOpenCodex != true {
+                    } else if flow.context == .integrated,
+                              model.status?.canUninstallOpenCodex != true {
                         Label(localizer.text(.removalRouteUnsafe), systemImage: "arrow.trianglehead.branch")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -448,6 +479,67 @@ struct OpenCodexRemovalWizardView: View {
                         }
                     }
                 }
+            } else if let receipt = flow.nativeReceipt {
+                Label(
+                    receipt.isSuccessful
+                        ? localizer.text(.removalResultSuccess)
+                        : localizer.text(.removalResultPartial),
+                    systemImage: receipt.isSuccessful ? "checkmark.shield" : "exclamationmark.triangle"
+                )
+                .font(.headline)
+                if receipt.mode == .preserveData {
+                    Label(
+                        localizer.text(.removalPreservedDetail),
+                        systemImage: "externaldrive.badge.checkmark"
+                    )
+                    .foregroundStyle(.secondary)
+                } else {
+                    Label(
+                        localizer.text(
+                            .removalResultCounts,
+                            String(receipt.movedDataItems),
+                            String(receipt.selectedDataItems)
+                        ),
+                        systemImage: "trash"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+                Text(receipt.packageRemoved
+                    ? localizer.text(.removalPackageRemoved)
+                    : localizer.text(.removalPackageNotVerified))
+                GroupBox(localizer.text(.removalStagesTitle)) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(receipt.stages.enumerated()), id: \.offset) { _, stage in
+                                Text(localizer.text(
+                                    .removalStageRow,
+                                    localizer.displayName(stage.stage),
+                                    localizer.displayName(stage.status)
+                                ))
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 220)
+                }
+                Spacer()
+                HStack {
+                    if receipt.isSuccessful {
+                        Spacer()
+                        Button(localizer.text(.removalClose)) {
+                            model.dismissOpenCodexRemoval()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                    } else {
+                        Text(localizer.text(.removalResultRecoveryDetail))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(localizer.text(.removalRequireRebootAction)) {
+                            model.requireRebootForOpenCodexResultRecovery()
+                        }
+                    }
+                }
             } else {
                 Text(localizer.text(.removalResultInvalid))
             }
@@ -548,8 +640,12 @@ struct OpenCodexRemovalWizardView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(localizer.text(.removalReviewMode, localizer.displayName(flow.mode)))
                 Text(localizer.text(
-                    .removalReviewGeneration,
-                    flow.expectedRoutingGeneration.map(localizer.formattedNumber) ?? localizer.text(.genericUnknown)
+                    flow.context == .standaloneNative
+                        ? .removalReviewNativeBoundary
+                        : .removalReviewGeneration,
+                    flow.context == .standaloneNative
+                        ? String((flow.expectedBoundaryRevision ?? localizer.text(.genericUnknown)).prefix(12))
+                        : flow.expectedRoutingGeneration.map(localizer.formattedNumber) ?? localizer.text(.genericUnknown)
                 ))
             }
             .frame(maxWidth: .infinity, alignment: .leading)

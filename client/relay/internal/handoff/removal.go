@@ -63,6 +63,11 @@ type OpenCodexRemovalRequest struct {
 	ExpectedInventoryRevision string
 	ConfirmedRemoval          bool
 	ConfirmedTrash            bool
+	Context                   RemovalContext
+	ExpectedBoundaryRevision  string
+	ExpectedNativeState       string
+	NativeRestoreFingerprint  string
+	NativeInventoryRevision   string
 }
 
 type OpenCodexRemovalStage struct {
@@ -119,7 +124,14 @@ type RemovalCoordinator struct {
 	CheckAdmission           func(context.Context) error
 	CheckResumeAdmission     func(context.Context) error
 	VerifyRouting            func(context.Context) error
+	VerifyPostTeardown       func(context.Context) error
 	MarkRoutingRecovery      func() error
+	RestoreNative            func(context.Context, NPMInstallation) (NativeRestoreResult, error)
+	CompleteTeardown         func(context.Context, NPMInstallation, RemovalExecutionResult) error
+	CompleteNativeRestore    func(context.Context, NPMInstallation, NativeRestoreResult) error
+	TeardownAlreadyCompleted bool
+	NativeBoundaryVerified   bool
+	NativeAlreadyVerified    bool
 	PrepareOperation         func(context.Context, NPMInstallation, OpenCodexRemovalRequest) error
 	RecordDataOutcome        func(context.Context, NPMInstallation, OpenCodexRemovalRequest, int, string) error
 	MarkDataRefresh          func(context.Context) error
@@ -194,8 +206,11 @@ func (c RemovalCoordinator) Remove(ctx context.Context, request OpenCodexRemoval
 		receipt.Stages = append(receipt.Stages, removalStage("request_validation", RemovalStageRefused, removalErrorCode(err), ""))
 		return receipt
 	}
+	standaloneNative := request.Context == RemovalContextStandaloneNative
 	if c.Resolver == nil || c.Runner == nil || c.VerifyRouting == nil || c.PrepareOperation == nil || c.RecordDataOutcome == nil ||
-		c.PreparePackageRemoval == nil || !c.executionHooksReady() {
+		c.PreparePackageRemoval == nil || !c.executionHooksReady() ||
+		standaloneNative && (c.VerifyPostTeardown == nil || c.RestoreNative == nil ||
+			c.CompleteTeardown == nil || c.CompleteNativeRestore == nil) {
 		receipt.Stages = append(receipt.Stages, removalStage("request_validation", RemovalStageFailed, "coordinator_unavailable", ""))
 		return receipt
 	}
@@ -267,91 +282,178 @@ func (c RemovalCoordinator) Remove(ctx context.Context, request OpenCodexRemoval
 		return receipt
 	}
 	receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageCompleted, "cleanup_intent_persisted", candidate.ID))
-	if err := c.VerifyRouting(ctx); err != nil {
-		receipt.Stages = append(receipt.Stages, removalStage("routing_pre_teardown", RemovalStageFailed, "routing_ownership_unverified", ""))
-		c.requireRoutingRecovery(&receipt)
-		return receipt
-	}
-	receipt.Stages = append(receipt.Stages, removalStage("routing_pre_teardown", RemovalStageCompleted, "routing_ownership_verified", ""))
-
-	if err := c.beginExecution(ctx, RemovalExecutionTeardown); err != nil {
-		receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_execution_intent_unavailable", candidate.ID))
-		return receipt
-	}
-	teardownResult, runErr := c.Runner.Teardown(ctx, candidate)
-	var teardownRoutingErr error
-	if teardownResult.Started {
-		// Observe routing immediately after every started mutating child, even
-		// when the child reports an error or emits an invalid receipt.
-		teardownRoutingErr = c.VerifyRouting(ctx)
-	}
-	if removalExecutionPreStartRoutingChanged(teardownResult, runErr) {
-		receipt.Stages = append(receipt.Stages, removalStage(
-			"teardown", RemovalStageRefused, "routing_ownership_changed", candidate.ID,
-		))
-		c.resolveExecution(ctx, &receipt, RemovalExecutionTeardown, RemovalExecutionResolutionPreStartRoutingChanged, true)
-		return receipt
-	}
-	if runErr != nil || !teardownResult.Started || !teardownResult.CleanupVerified {
-		var finishErr error
-		if teardownResult.Started || !removalExecutionMayHaveMutated(teardownResult, runErr) {
-			finishErr = c.finishExecution(ctx, RemovalExecutionTeardown, teardownResult)
+	teardownCompleted := c.TeardownAlreadyCompleted
+	nativeBoundaryVerified := c.NativeBoundaryVerified
+	nativeAlreadyVerified := c.NativeAlreadyVerified
+	if nativeAlreadyVerified {
+		if !standaloneNative || !teardownCompleted || !nativeBoundaryVerified ||
+			c.RestoreNative == nil || c.CompleteNativeRestore == nil || c.CompleteTeardown == nil {
+			receipt.Stages = append(receipt.Stages, removalStage("request_validation", RemovalStageFailed, "coordinator_unavailable", ""))
+			return receipt
 		}
-		code := removalExecutionFailureCode(teardownResult, runErr, "teardown_not_started")
-		receipt.Stages = append(receipt.Stages, removalStage("teardown", removalExecutionStageStatus(teardownResult, runErr), code, candidate.ID))
-		if finishErr != nil {
-			receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_execution_result_unavailable", candidate.ID))
-		}
-		c.recordPostMutationRouting(&receipt, "routing_verification", teardownResult.Started, teardownRoutingErr)
-		if removalExecutionMayHaveMutated(teardownResult, runErr) {
-			c.requireRoutingRecovery(&receipt)
-		}
-		return receipt
-	}
-	teardown, err := parseRelayTeardownReceipt(
-		teardownResult,
-		"relay_preserving_teardown",
-		candidate.TeardownAdapterID,
-	)
-	if err != nil {
-		receipt.Status = RemovalStatusPartial
-		receipt.Stages = append(receipt.Stages, removalStage("teardown", RemovalStageFailed, removalErrorCode(err), candidate.ID))
-		if teardownRoutingErr != nil {
+		if err := c.VerifyRouting(ctx); err != nil {
+			receipt.Status = RemovalStatusPartial
 			receipt.Stages = append(receipt.Stages, removalStage("routing_verification", RemovalStageFailed, "routing_ownership_changed", ""))
+			c.requireRoutingRecovery(&receipt)
+			return receipt
+		}
+		receipt.Stages = append(receipt.Stages,
+			removalStage("teardown", RemovalStageSkipped, "teardown_already_completed", candidate.ID),
+			removalStage("native_restore", RemovalStageSkipped, "native_already_active", candidate.ID),
+			removalStage("routing_verification", RemovalStageCompleted, "routing_ownership_reverified", ""),
+		)
+	}
+	if !nativeAlreadyVerified {
+		if !teardownCompleted {
+			if err := c.VerifyRouting(ctx); err != nil {
+				receipt.Stages = append(receipt.Stages, removalStage("routing_pre_teardown", RemovalStageFailed, "routing_ownership_unverified", ""))
+				c.requireRoutingRecovery(&receipt)
+				return receipt
+			}
+			receipt.Stages = append(receipt.Stages, removalStage("routing_pre_teardown", RemovalStageCompleted, "routing_ownership_verified", ""))
+
+			if err := c.beginExecution(ctx, RemovalExecutionTeardown); err != nil {
+				receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_execution_intent_unavailable", candidate.ID))
+				return receipt
+			}
+			teardownResult, runErr := c.Runner.Teardown(ctx, candidate)
+			var teardownRoutingErr error
+			if teardownResult.Started {
+				// Observe routing immediately after every started mutating child, even
+				// when the child reports an error or emits an invalid receipt.
+				verify := c.VerifyRouting
+				if c.VerifyPostTeardown != nil {
+					verify = c.VerifyPostTeardown
+				}
+				teardownRoutingErr = verify(ctx)
+			}
+			if removalExecutionPreStartRoutingChanged(teardownResult, runErr) {
+				receipt.Stages = append(receipt.Stages, removalStage(
+					"teardown", RemovalStageRefused, "routing_ownership_changed", candidate.ID,
+				))
+				c.resolveExecution(ctx, &receipt, RemovalExecutionTeardown, RemovalExecutionResolutionPreStartRoutingChanged, true)
+				return receipt
+			}
+			if runErr != nil || !teardownResult.Started || !teardownResult.CleanupVerified {
+				var finishErr error
+				if teardownResult.Started || !removalExecutionMayHaveMutated(teardownResult, runErr) {
+					finishErr = c.finishExecution(ctx, RemovalExecutionTeardown, teardownResult)
+				}
+				code := removalExecutionFailureCode(teardownResult, runErr, "teardown_not_started")
+				receipt.Stages = append(receipt.Stages, removalStage("teardown", removalExecutionStageStatus(teardownResult, runErr), code, candidate.ID))
+				if finishErr != nil {
+					receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_execution_result_unavailable", candidate.ID))
+				}
+				c.recordPostMutationRouting(&receipt, "routing_verification", teardownResult.Started, teardownRoutingErr)
+				if removalExecutionMayHaveMutated(teardownResult, runErr) {
+					c.requireRoutingRecovery(&receipt)
+				}
+				return receipt
+			}
+			teardown, err := parseRelayTeardownReceipt(
+				teardownResult,
+				"relay_preserving_teardown",
+				candidate.TeardownAdapterID,
+			)
+			if err != nil {
+				receipt.Status = RemovalStatusPartial
+				receipt.Stages = append(receipt.Stages, removalStage("teardown", RemovalStageFailed, removalErrorCode(err), candidate.ID))
+				if teardownRoutingErr != nil {
+					receipt.Stages = append(receipt.Stages, removalStage("routing_verification", RemovalStageFailed, "routing_ownership_changed", ""))
+				} else {
+					receipt.Stages = append(receipt.Stages, removalStage("routing_verification", RemovalStageCompleted, "routing_ownership_reverified", ""))
+				}
+				c.resolveExecution(ctx, &receipt, RemovalExecutionTeardown, RemovalExecutionResolutionTeardownReceiptInvalid, true)
+				return receipt
+			}
+			if standaloneNative && teardown.Status == "completed" {
+				if err := c.CompleteTeardown(ctx, candidate, teardownResult); err != nil {
+					receipt.Status = RemovalStatusPartial
+					receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_completion_unavailable", candidate.ID))
+					c.requireRoutingRecovery(&receipt)
+					return receipt
+				}
+				teardownCompleted = true
+				nativeBoundaryVerified = true
+				nativeAlreadyVerified = true
+			} else if err := c.finishExecution(ctx, RemovalExecutionTeardown, teardownResult); err != nil {
+				receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_execution_result_unavailable", candidate.ID))
+				c.requireRoutingRecovery(&receipt)
+				return receipt
+			}
+			teardownStageStatus := RemovalStageFailed
+			switch teardown.Status {
+			case "completed":
+				teardownStageStatus = RemovalStageCompleted
+			case "partial":
+				teardownStageStatus = RemovalStageRefused
+			}
+			teardownCode := "teardown_" + teardown.Status
+			if teardown.Status != "completed" {
+				teardownCode = "teardown_refused"
+			}
+			receipt.Stages = append(receipt.Stages, removalStage("teardown", teardownStageStatus, teardownCode, candidate.ID))
+			if !c.recordPostMutationRouting(&receipt, "routing_verification", true, teardownRoutingErr) {
+				if teardown.Status == "completed" || teardown.Status == "partial" {
+					receipt.Status = RemovalStatusPartial
+				}
+				return receipt
+			}
+			if teardown.Status != "completed" {
+				if teardown.Status == "partial" {
+					receipt.Status = RemovalStatusPartial
+				}
+				if standaloneNative {
+					c.requireRoutingRecovery(&receipt)
+				}
+				return receipt
+			}
 		} else {
+			receipt.Stages = append(receipt.Stages, removalStage("teardown", RemovalStageSkipped, "teardown_already_completed", candidate.ID))
+		}
+		if standaloneNative && nativeBoundaryVerified {
+			if err := c.VerifyRouting(ctx); err != nil {
+				receipt.Status = RemovalStatusPartial
+				receipt.Stages = append(receipt.Stages, removalStage("routing_verification", RemovalStageFailed, "routing_ownership_changed", ""))
+				c.requireRoutingRecovery(&receipt)
+				return receipt
+			}
+			receipt.Stages = append(receipt.Stages,
+				removalStage("native_restore", RemovalStageSkipped, "native_already_active", candidate.ID),
+				removalStage("routing_verification", RemovalStageCompleted, "routing_ownership_reverified", ""),
+			)
+		} else if c.RestoreNative != nil {
+			if err := c.beginExecution(ctx, RemovalExecutionNativeRestore); err != nil {
+				receipt.Status = RemovalStatusPartial
+				receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "native_restore_execution_intent_unavailable", candidate.ID))
+				return receipt
+			}
+			restored, restoreErr := c.RestoreNative(ctx, candidate)
+			if restoreErr != nil {
+				receipt.Status = RemovalStatusPartial
+				receipt.Stages = append(receipt.Stages, removalStage("native_restore", RemovalStageFailed, "native_restore_unverified", candidate.ID))
+				c.requireRoutingRecovery(&receipt)
+				return receipt
+			}
+			if c.CompleteNativeRestore == nil || c.CompleteNativeRestore(ctx, candidate, restored) != nil {
+				receipt.Status = RemovalStatusPartial
+				receipt.Stages = append(receipt.Stages, removalStage("native_restore", RemovalStageFailed, "native_restore_unverified", candidate.ID))
+				c.requireRoutingRecovery(&receipt)
+				return receipt
+			}
+			code := "native_restore_applied"
+			if restored.Outcome == NativeRestoreAlreadyNative {
+				code = "native_already_active"
+			}
+			receipt.Stages = append(receipt.Stages, removalStage("native_restore", RemovalStageCompleted, code, candidate.ID))
+			if err := c.VerifyRouting(ctx); err != nil {
+				receipt.Status = RemovalStatusPartial
+				receipt.Stages = append(receipt.Stages, removalStage("routing_verification", RemovalStageFailed, "routing_ownership_changed", ""))
+				c.requireRoutingRecovery(&receipt)
+				return receipt
+			}
 			receipt.Stages = append(receipt.Stages, removalStage("routing_verification", RemovalStageCompleted, "routing_ownership_reverified", ""))
 		}
-		c.resolveExecution(ctx, &receipt, RemovalExecutionTeardown, RemovalExecutionResolutionTeardownReceiptInvalid, true)
-		return receipt
-	}
-	if err := c.finishExecution(ctx, RemovalExecutionTeardown, teardownResult); err != nil {
-		receipt.Stages = append(receipt.Stages, removalStage("cleanup_journal", RemovalStageFailed, "teardown_execution_result_unavailable", candidate.ID))
-		c.requireRoutingRecovery(&receipt)
-		return receipt
-	}
-	teardownStageStatus := RemovalStageFailed
-	switch teardown.Status {
-	case "completed":
-		teardownStageStatus = RemovalStageCompleted
-	case "partial":
-		teardownStageStatus = RemovalStageRefused
-	}
-	teardownCode := "teardown_" + teardown.Status
-	if teardown.Status != "completed" {
-		teardownCode = "teardown_refused"
-	}
-	receipt.Stages = append(receipt.Stages, removalStage("teardown", teardownStageStatus, teardownCode, candidate.ID))
-	if !c.recordPostMutationRouting(&receipt, "routing_verification", true, teardownRoutingErr) {
-		if teardown.Status == "completed" || teardown.Status == "partial" {
-			receipt.Status = RemovalStatusPartial
-		}
-		return receipt
-	}
-	if teardown.Status != "completed" {
-		if teardown.Status == "partial" {
-			receipt.Status = RemovalStatusPartial
-		}
-		return receipt
 	}
 
 	if request.Mode == RemovalModeTrashSelected {
@@ -996,6 +1098,8 @@ func InterruptedRemovalExecutionReceipt(record RemovalCleanupRecord, recoveryPer
 	switch record.ActiveExecution.Kind {
 	case RemovalExecutionTeardown:
 		stage = "teardown"
+	case RemovalExecutionNativeRestore:
+		stage = "native_restore"
 	case RemovalExecutionTrash:
 		stage = "data_trash"
 		receipt.DataMovementUnknown = true
@@ -1113,6 +1217,27 @@ func ValidateOpenCodexRemovalRequest(request OpenCodexRemovalRequest) error {
 
 func validateRemovalRequest(request OpenCodexRemovalRequest) error {
 	if !validRemovalSelection(request.Selection) {
+		return ErrInvalidRemovalRequest
+	}
+	context := request.Context
+	if context == "" {
+		context = RemovalContextIntegrated
+	}
+	switch context {
+	case RemovalContextIntegrated:
+		if request.ExpectedBoundaryRevision != "" || request.ExpectedNativeState != "" || request.NativeRestoreFingerprint != "" ||
+			request.NativeInventoryRevision != "" {
+			return ErrInvalidRemovalRequest
+		}
+	case RemovalContextStandaloneNative:
+		if !isFingerprint(request.ExpectedBoundaryRevision) ||
+			(request.ExpectedNativeState != "native" && request.ExpectedNativeState != "opencodex") ||
+			!isFingerprint(request.NativeRestoreFingerprint) ||
+			(request.Mode == RemovalModePreserveData && request.NativeInventoryRevision != "") ||
+			(request.Mode == RemovalModeTrashSelected && !isFingerprint(request.NativeInventoryRevision)) {
+			return ErrInvalidRemovalRequest
+		}
+	default:
 		return ErrInvalidRemovalRequest
 	}
 	if !request.ConfirmedRemoval {

@@ -62,6 +62,7 @@ type removalProcessRunner interface {
 // shell, PATH-resolved node/npm/ocx, sudo, or a caller-supplied package name.
 type ExactNPMRunner struct {
 	HomeDir                  string
+	CodexConfigPath          string
 	BeforeOCXMutation        func(context.Context) error
 	BeforeUninstallCandidate func(context.Context, NPMInstallation) error
 	BeforeUninstall          func(context.Context) error
@@ -194,7 +195,13 @@ func (r ExactNPMRunner) runRelayTeardownAdapter(
 		return RemovalExecutionResult{}, err
 	}
 	defer snapshot.Close()
-	environment, err := removalEnvironment(r.HomeDir)
+	codexConfigPath := r.CodexConfigPath
+	var environment []string
+	if codexConfigPath == "" {
+		environment, err = removalEnvironment(r.HomeDir)
+	} else {
+		environment, err = nativeRestoreEnvironment(r.HomeDir, filepath.Dir(codexConfigPath))
+	}
 	if err != nil {
 		return RemovalExecutionResult{}, ErrTeardownPreflightFailed
 	}

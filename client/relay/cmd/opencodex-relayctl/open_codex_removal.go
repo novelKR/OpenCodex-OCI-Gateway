@@ -14,6 +14,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/codexconfig"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/lifecyclelock"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
 
@@ -23,7 +24,7 @@ func modeInspectOpenCodexData(args []string) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		fatal(errorsNew("OpenCodex data inventory is supported only on macOS Apple Silicon"))
 	}
-	configPath, _ := defaultPaths()
+	configPath, codexPath := defaultPaths()
 	flags := newModeFlagSet("mode inspect-open-codex-data")
 	installationID := flags.String("installation-id", "", "opaque OpenCodex discovery candidate ID")
 	installationFingerprint := flags.String("installation-fingerprint", "", "opaque OpenCodex discovery candidate fingerprint")
@@ -34,7 +35,7 @@ func modeInspectOpenCodexData(args []string) {
 		fatal(handoff.ErrInvalidRemovalRequest)
 	}
 
-	resolver, runner, err := removalRuntime(configPath)
+	resolver, runner, err := removalRuntime(configPath, codexPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -117,12 +118,21 @@ func modeRemoveOpenCodex(args []string) {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, openCodexRemovalTimeout)
 	defer cancel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal(err)
+	}
+	lifecycle, err := lifecyclelock.AcquireWriter(ctx, home, "")
+	if err != nil {
+		fatal(err)
+	}
+	defer lifecycle.Close()
 	boundary, err := openRemovalBoundary(ctx, configPath, codexPath, *expectedGeneration)
 	if err != nil {
 		fatal(err)
 	}
 	defer boundary.lock.Close()
-	resolver, runner, err := removalRuntime(configPath)
+	resolver, runner, err := removalRuntime(configPath, codexPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -539,7 +549,7 @@ func openRemovalBoundary(ctx context.Context, configPath, codexPath string, expe
 	return &removalBoundary{lock: lock, state: state, cfg: cfg, owner: owner}, nil
 }
 
-func removalRuntime(configPath string) (handoff.DiscoveryRemovalResolver, handoff.ExactNPMRunner, error) {
+func removalRuntime(configPath, codexPath string) (handoff.DiscoveryRemovalResolver, handoff.ExactNPMRunner, error) {
 	options, err := handoff.ProductionDiscoveryOptions(configPath)
 	if err != nil {
 		return handoff.DiscoveryRemovalResolver{}, handoff.ExactNPMRunner{}, err
@@ -547,7 +557,9 @@ func removalRuntime(configPath string) (handoff.DiscoveryRemovalResolver, handof
 	options.GOOS = runtime.GOOS
 	options.GOARCH = runtime.GOARCH
 	options = handoff.SanitizedRemovalDiscoveryOptions(options)
-	return handoff.DiscoveryRemovalResolver{Options: options}, handoff.ExactNPMRunner{HomeDir: options.HomeDir}, nil
+	return handoff.DiscoveryRemovalResolver{Options: options}, handoff.ExactNPMRunner{
+		HomeDir: options.HomeDir, CodexConfigPath: codexPath,
+	}, nil
 }
 
 func persistRemovalRoutingRecovery(configPath string, lock *routing.Lock, state routing.State) error {

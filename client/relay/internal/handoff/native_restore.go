@@ -3,14 +3,20 @@ package handoff
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 )
 
-const maxNativeRestoreOutputBytes = 256 << 10
+const (
+	maxNativeRestoreOutputBytes = 256 << 10
+	maxNativeOwnerConfigBytes   = 1 << 20
+)
 
 var (
 	ErrNativeRestoreOutput             = errors.New("OpenCodex native restore returned an invalid bounded result")
@@ -242,27 +248,84 @@ func (s *NativeRestoreSession) Execute(ctx context.Context) (NativeRestoreResult
 	if err != nil {
 		return NativeRestoreResult{}, err
 	}
-	if outcome == NativeRestoreRetryableNoMutation {
-		return NativeRestoreResult{Outcome: outcome}, nil
-	}
-
-	inspection := s.Inspect(ctx)
-	switch inspection.Configuration {
-	case NativeOwnerConfigurationInvalid:
-		return NativeRestoreResult{}, ErrNativeOwnerConfigurationInvalid
-	case NativeOwnerConfigurationUnavailable:
-		return NativeRestoreResult{}, ErrNativeRestoreOutput
-	case NativeOwnerConfigurationValid:
-		if inspection.Integration != NativeOwnerIntegrationDisabled {
-			return NativeRestoreResult{}, ErrNativeRestoreFailed
-		}
-	default:
-		return NativeRestoreResult{}, ErrNativeRestoreOutput
+	if err := s.VerifyIntegrationDisabled(ctx); err != nil {
+		return NativeRestoreResult{}, err
 	}
 	return NativeRestoreResult{
 		Outcome:           outcome,
 		NonRoutingWarning: nonZero || !overallSuccess,
 	}, nil
+}
+
+// VerifyIntegrationDisabled reuses the immutable OpenCodex execution snapshot
+// to prove that the owner configuration remains valid and that the Codex
+// integration is still explicitly disabled. Callers keep the session open
+// across every post-restore destructive checkpoint so removing the source
+// package cannot remove the proof mechanism mid-operation.
+func (s *NativeRestoreSession) VerifyIntegrationDisabled(ctx context.Context) error {
+	inspection := s.Inspect(ctx)
+	switch inspection.Configuration {
+	case NativeOwnerConfigurationInvalid:
+		return ErrNativeOwnerConfigurationInvalid
+	case NativeOwnerConfigurationUnavailable:
+		return ErrNativeRestoreOutput
+	case NativeOwnerConfigurationValid:
+		if inspection.Integration != NativeOwnerIntegrationDisabled {
+			return ErrNativeRestoreFailed
+		}
+		return nil
+	default:
+		return ErrNativeRestoreOutput
+	}
+}
+
+// OpenCodexOwnerConfigurationRevision binds the standalone Native boundary to
+// the exact default OpenCodex owner configuration without exposing its path or
+// contents. The semantic clientIntegrations.codex=false proof still comes from
+// the verified OpenCodex closure; this witness makes any later direct rewrite
+// fail closed, including after the package itself has been removed.
+func OpenCodexOwnerConfigurationRevision(home string) (string, error) {
+	home = filepath.Clean(home)
+	if !filepath.IsAbs(home) {
+		return "", ErrNativeRestoreProofUnavailable
+	}
+	resolved, err := filepath.EvalSymlinks(home)
+	if err != nil || resolved != home {
+		return "", ErrNativeRestoreProofUnavailable
+	}
+	homeInfo, err := os.Lstat(home)
+	if err != nil || !homeInfo.IsDir() || homeInfo.Mode()&os.ModeSymlink != 0 ||
+		homeInfo.Mode().Perm()&0o022 != 0 || !ownedByEffectiveUser(homeInfo) {
+		return "", ErrNativeRestoreProofUnavailable
+	}
+	configDirectory := filepath.Join(home, ".opencodex")
+	configPath := filepath.Join(configDirectory, "config.json")
+	payload := []byte(nil)
+	state := "absent"
+	if _, err := os.Lstat(configPath); err == nil {
+		var info os.FileInfo
+		var relaxed bool
+		payload, info, relaxed, err = readDiscoveryRegularFile(configPath, maxNativeOwnerConfigBytes)
+		if err != nil || relaxed || !ownedByEffectiveUser(info) {
+			return "", ErrNativeRestoreProofUnavailable
+		}
+		state = "present"
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", ErrNativeRestoreProofUnavailable
+	} else if directoryInfo, directoryErr := os.Lstat(configDirectory); directoryErr == nil {
+		if !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 ||
+			directoryInfo.Mode().Perm()&0o022 != 0 || !ownedByEffectiveUser(directoryInfo) {
+			return "", ErrNativeRestoreProofUnavailable
+		}
+	} else if !errors.Is(directoryErr, os.ErrNotExist) {
+		return "", ErrNativeRestoreProofUnavailable
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("opencodex-owner-configuration-boundary-v1\x00"))
+	_, _ = hash.Write([]byte(state))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write(payload)
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // Indirections keep the platform/fingerprint checks shared with handoff.go

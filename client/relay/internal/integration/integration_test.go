@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
 
@@ -119,6 +120,44 @@ func TestApplyCreatesNativeParkedUserIntegrationAndNoCodexMutation(t *testing.T)
 	stopped, err := manager.Inspect(context.Background())
 	if err != nil || stopped.State != "integration_required" {
 		t.Fatalf("stopped service inspection = %#v err=%v", stopped, err)
+	}
+}
+
+func TestApplyAndRecoverRefuseStandaloneRemovalJournalBeforeMutation(t *testing.T) {
+	manager, runner, cleanup := integrationFixture(t)
+	defer cleanup()
+	inspection, err := manager.Inspect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := handoff.StandaloneRemovalAnchorPath(manager.Paths.Home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(handoff.RemovalCleanupPath(anchor)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(handoff.RemovalCleanupPath(anchor), []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	actionsBefore := len(runner.actions)
+	request := Candidate{
+		UpstreamBaseURL:       "https://gateway.example.test/v1",
+		AuthenticationProfile: config.RemoteAuthenticationNone,
+	}
+	if _, err := manager.Apply(context.Background(), request, inspection.StateDigest); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("apply error=%v", err)
+	}
+	if _, err := manager.Recover(context.Background()); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("recover error=%v", err)
+	}
+	for _, path := range []string{manager.Paths.Config, manager.Paths.ServicePlist, manager.Paths.Binding, manager.Paths.Journal} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("standalone journal admitted integration mutation at %s: %v", filepath.Base(path), err)
+		}
+	}
+	if len(runner.actions) != actionsBefore {
+		t.Fatalf("standalone journal invoked launchctl: before=%d after=%d", actionsBefore, len(runner.actions))
 	}
 }
 

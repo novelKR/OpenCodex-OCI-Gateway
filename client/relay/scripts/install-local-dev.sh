@@ -34,6 +34,7 @@ readonly BINDING_PATH="${BINDING_DIR}/routing-binding.json"
 readonly SERVICE_PLIST="${HOME}/Library/LaunchAgents/io.github.novelkr.opencodex-relay.dev.plist"
 readonly NOTICES_FILE="THIRD_PARTY_NOTICES.md"
 readonly KEY_PREFIX="opencodex-relay-local-dev-trust-"
+readonly SOURCE_INSTALL_RESERVATION_NAME=".source-install-reservation.json"
 
 usage() {
   cat <<'USAGE'
@@ -662,7 +663,8 @@ restore_previous_homebrew_guard_registration() {
 
 finish_local_dev_uninstall() {
   local status=$?
-  trap - EXIT
+  local retain_recovery_evidence=false
+  trap - EXIT HUP INT QUIT TERM
   set +e
   if ((status != 0)) && [[ "${uninstall_guard_transaction_active:-false}" == true ]]; then
     if ! restore_previous_homebrew_guard_registration; then
@@ -670,43 +672,247 @@ finish_local_dev_uninstall() {
       status=70
     fi
   fi
+  if ((status != 0)) && [[ "${source_uninstall_destructive_active:-false}" == true ]]; then
+    retain_recovery_evidence=true
+    printf 'CRITICAL: local-development uninstall stopped after destructive teardown began; lifecycle reservation remains active.\n' >&2
+  elif [[ "${source_install_reservation_active:-false}" == true ]]; then
+    if ! release_local_dev_source_install_lifecycle; then
+      printf 'CRITICAL: unable to release the local-development source-uninstall lifecycle reservation.\n' >&2
+      status=70
+      retain_recovery_evidence=true
+    fi
+  fi
+  if [[ "$retain_recovery_evidence" == false && -n "${tmp:-}" && -d "$tmp" && ! -L "$tmp" ]]; then
+    rm -rf -- "$tmp"
+  elif [[ "$retain_recovery_evidence" == true ]]; then
+    printf 'CRITICAL: local-development source-uninstall lifecycle recovery helper was retained at %s.\n' \
+      "${tmp:-unknown}" >&2
+  fi
   exit "$status"
 }
 cleanup_install_workspace() {
   local status="${1:-1}" workspace="${tmp:-}"
+  local retain_recovery_evidence=false
   trap - EXIT HUP INT QUIT TERM
-  if [[ -n "$workspace" && -d "$workspace" && ! -L "$workspace" ]]; then
-    rm -rf -- "$workspace"
-  fi
   rm -rf -- "${staging_dir:-}" "${transaction_dir:-}"
+  if [[ "${source_install_reservation_active:-false}" == true && -z "${source_install_reservation_token:-}" ]] && \
+     ! load_local_dev_source_install_reservation_recovery; then
+    printf 'CRITICAL: unable to recover the local-development source-install lifecycle reservation token.\n' >&2
+    status=70
+    retain_recovery_evidence=true
+  fi
+  if [[ "${source_install_reservation_active:-false}" == true && "$retain_recovery_evidence" == false ]]; then
+    release_args=(
+      lifecycle release-source-install --scope local_development
+      --token "$source_install_reservation_token" --json
+    )
+    if [[ "${source_install_reservation_root_created:-false}" == true && "${pending_candidate_active:-false}" != true ]]; then
+      release_args+=(--remove-created-root)
+    fi
+    if ! "$source_install_reservation_relayctl" "${release_args[@]}" >/dev/null; then
+      printf 'CRITICAL: unable to release the local-development source-install lifecycle reservation.\n' >&2
+      status=70
+      retain_recovery_evidence=true
+    else
+      source_install_reservation_active=false
+      unset OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION
+      rm -f -- "${source_install_reservation_recovery_path:-}"
+    fi
+  fi
+  if [[ "$retain_recovery_evidence" == false && -n "$workspace" && -d "$workspace" && ! -L "$workspace" ]]; then
+    rm -rf -- "$workspace"
+  elif [[ "$retain_recovery_evidence" == true ]]; then
+    printf 'CRITICAL: local-development source-install lifecycle recovery helper was retained at %s.\n' \
+      "${workspace:-unknown}" >&2
+  fi
   exit "$status"
 }
 
 rollback_install() {
   local status="$1"
+  local rollback_failed=false service_was_present
   [[ "${install_transaction_active:-false}" == true ]] || return "$status"
   trap - EXIT HUP INT QUIT TERM
   set +e
-  "$SERVICE_HELPER" stop >/dev/null 2>&1
-  restore_link "$APP_LINK" "${transaction_dir}/app-link" || true
+  if ! "$SERVICE_HELPER" stop >/dev/null 2>&1; then
+    printf 'CRITICAL: unable to stop the local-development candidate before rollback.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_link "$APP_LINK" "${transaction_dir}/app-link"; then
+    printf 'CRITICAL: unable to restore the local-development app link.\n' >&2
+    rollback_failed=true
+  fi
   if ! restore_previous_homebrew_guard_registration; then
     printf 'CRITICAL: unable to restore the prior Homebrew guard registration after rollback.\n' >&2
+    rollback_failed=true
   fi
-  restore_file "$BINDING_PATH" "${transaction_dir}/binding" || true
-  restore_link "${INSTALL_ROOT}/current" "${transaction_dir}/current" || true
-  restore_file "$config_path" "${transaction_dir}/config" || true
-  restore_file "${config_path}.routing-state.json" "${transaction_dir}/routing-state" || true
-  restore_file "${config_path}.routing-initialized" "${transaction_dir}/routing-initialized" || true
-  restore_file "${config_path}.routing-transaction.json" "${transaction_dir}/routing-journal" || true
-  restore_file "$SERVICE_PLIST" "${transaction_dir}/service" || true
-  if [[ "$(sed -nE 's/^present=(true|false)$/\1/p' "${transaction_dir}/service.state")" == true ]]; then
-    "$SERVICE_HELPER" install --relay-bin "${INSTALL_ROOT}/current/opencodex-relay" --config "$config_path" >/dev/null 2>&1 || true
+  for restore_spec in \
+    "$BINDING_PATH|${transaction_dir}/binding|binding" \
+    "$config_path|${transaction_dir}/config|configuration" \
+    "${config_path}.routing-state.json|${transaction_dir}/routing-state|routing state" \
+    "${config_path}.routing-initialized|${transaction_dir}/routing-initialized|routing initialization marker" \
+    "${config_path}.routing-transaction.json|${transaction_dir}/routing-journal|routing journal" \
+    "$SERVICE_PLIST|${transaction_dir}/service|service plist"; do
+    IFS='|' read -r restore_path restore_snapshot restore_label <<<"$restore_spec"
+    if ! restore_file "$restore_path" "$restore_snapshot"; then
+      printf 'CRITICAL: unable to restore the prior local-development %s.\n' "$restore_label" >&2
+      rollback_failed=true
+    fi
+  done
+  if ! restore_link "${INSTALL_ROOT}/current" "${transaction_dir}/current"; then
+    printf 'CRITICAL: unable to restore the prior local-development current target.\n' >&2
+    rollback_failed=true
   fi
-  if [[ "${install_dir_created:-false}" == true && -n "${install_dir:-}" ]]; then
-    rm -rf -- "${install_dir}"
+  service_was_present="$(sed -nE 's/^present=(true|false)$/\1/p' "${transaction_dir}/service.state")"
+  if [[ "$service_was_present" != true && "$service_was_present" != false ]]; then
+    printf 'CRITICAL: local-development service rollback evidence is invalid.\n' >&2
+    rollback_failed=true
+  elif [[ "$service_was_present" == true ]] && \
+       ! "$SERVICE_HELPER" install --relay-bin "${INSTALL_ROOT}/current/opencodex-relay" --config "$config_path" >/dev/null 2>&1; then
+    printf 'CRITICAL: unable to reactivate the prior local-development service.\n' >&2
+    rollback_failed=true
   fi
-  rm -rf -- "${tmp:-}" "${staging_dir:-}" "${transaction_dir:-}"
+  if [[ "$rollback_failed" == false && "${install_dir_created:-false}" == true && -n "${install_dir:-}" ]]; then
+    if ! rm -rf -- "${install_dir}"; then
+      printf 'CRITICAL: unable to remove the unselected local-development candidate after rollback.\n' >&2
+      rollback_failed=true
+    fi
+  fi
+  if [[ "$rollback_failed" == false && "${source_install_reservation_active:-false}" == true && \
+        -z "${source_install_reservation_token:-}" ]] && \
+     ! load_local_dev_source_install_reservation_recovery; then
+    printf 'CRITICAL: unable to recover the local-development source-install lifecycle reservation token.\n' >&2
+    status=70
+    rollback_failed=true
+  fi
+  if [[ "$rollback_failed" == false && "${source_install_reservation_active:-false}" == true ]]; then
+    release_args=(
+      lifecycle release-source-install --scope local_development
+      --token "$source_install_reservation_token" --json
+    )
+    if [[ "${source_install_reservation_root_created:-false}" == true && "${pending_candidate_active:-false}" != true ]]; then
+      release_args+=(--remove-created-root)
+    fi
+    if ! "$source_install_reservation_relayctl" "${release_args[@]}" >/dev/null; then
+      printf 'CRITICAL: unable to release the local-development source-install lifecycle reservation.\n' >&2
+      status=70
+      rollback_failed=true
+    else
+      source_install_reservation_active=false
+      unset OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION
+      rm -f -- "${source_install_reservation_recovery_path:-}"
+    fi
+  fi
+  if [[ "$rollback_failed" == false ]]; then
+    if ! rm -rf -- "${staging_dir:-}"; then
+      printf 'CRITICAL: unable to remove local-development rollback staging.\n' >&2
+      status=70
+    fi
+    if ! rm -rf -- "${transaction_dir:-}"; then
+      printf 'CRITICAL: unable to remove completed local-development rollback evidence.\n' >&2
+      status=70
+    fi
+  else
+    status=70
+    printf 'CRITICAL: rollback is incomplete; transaction evidence, candidate artifacts, and lifecycle reservation were retained at %s.\n' \
+      "$transaction_dir" >&2
+  fi
+  if [[ "$rollback_failed" == false ]]; then
+    rm -rf -- "${tmp:-}"
+  fi
   exit "$status"
+}
+
+local_dev_source_install_lifecycle_capable() {
+  local helper="$1" capability
+  [[ -x "$helper" && -f "$helper" && ! -L "$helper" ]] || return 1
+  capability="$("$helper" lifecycle source-install-capability --json 2>/dev/null)" || return 1
+  jq -e '.schema_version == 2 and .state == "ready" and (keys | sort == ["schema_version", "state"])' \
+    <<<"$capability" >/dev/null
+}
+
+load_local_dev_source_install_reservation_recovery() {
+  local path="${source_install_reservation_recovery_path:-}" ownership
+  local recovered_token recovered_root_created
+  [[ -n "$path" && -f "$path" && ! -L "$path" ]] || return 1
+  ownership="$(stat -f '%u:%Lp' "$path" 2>/dev/null)" || return 1
+  [[ "$ownership" == "$(id -u):600" ]] || return 1
+  jq -e '
+    (keys | sort == ["root_created", "schema_version", "scope", "token"])
+    and .schema_version == 1 and .scope == "local_development"
+    and (.token | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.root_created | type == "boolean")
+  ' "$path" >/dev/null || return 1
+  recovered_token="$(jq -er '.token' "$path")" || return 1
+  recovered_root_created="$(jq -er 'if .root_created then "true" else "false" end' "$path")" || return 1
+  source_install_reservation_token="$recovered_token"
+  source_install_reservation_root_created="$recovered_root_created"
+}
+
+select_local_dev_source_install_lifecycle_helper() {
+  local preferred="$1" candidate
+  for candidate in \
+    "$preferred" \
+    "${INSTALL_ROOT}/current/opencodex-relayctl" \
+    "${HOME}/.local/lib/opencodex-relay/relay/current/opencodex-relayctl"; do
+    [[ -n "$candidate" ]] || continue
+    if local_dev_source_install_lifecycle_capable "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+reserve_local_dev_source_install_lifecycle() {
+  local preferred_helper="${1:-${relayctl_bin:-}}" selected_helper reservation_json
+  selected_helper="$(select_local_dev_source_install_lifecycle_helper "$preferred_helper")" || \
+    die 'a lifecycle-capable installed or target relayctl is required for local-development installation and removal'
+  source_install_reservation_relayctl="${tmp}/reservation-relayctl"
+  cp -p -- "$selected_helper" "$source_install_reservation_relayctl"
+  chmod 0700 "$source_install_reservation_relayctl"
+  source_install_reservation_recovery_path="${tmp}/source-install-reservation.json"
+  source_install_reservation_active=true
+  reservation_json="$("$source_install_reservation_relayctl" \
+    lifecycle reserve-source-install --scope local_development \
+    --recovery-file "$source_install_reservation_recovery_path" --json)" || \
+    die 'unable to reserve the local-development source-install lifecycle'
+  load_local_dev_source_install_reservation_recovery || \
+    die 'source-install durable recovery response is invalid'
+  jq -e --arg token "$source_install_reservation_token" \
+    --argjson root_created "$source_install_reservation_root_created" '
+    (keys | sort == ["root_created", "schema_version", "scope", "token"])
+    and .schema_version == 1 and .scope == "local_development"
+    and .token == $token and .root_created == $root_created
+  ' <<<"$reservation_json" >/dev/null || die 'source-install reservation response is invalid'
+  export OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION="$source_install_reservation_token"
+}
+
+clear_local_dev_install_root_preserving_reservation() {
+  local entry
+  local -a entries=()
+  [[ -d "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]] || return 1
+  shopt -s dotglob nullglob
+  entries=("$INSTALL_ROOT"/*)
+  shopt -u dotglob nullglob
+  for entry in "${entries[@]}"; do
+    [[ "$(basename -- "$entry")" == "$SOURCE_INSTALL_RESERVATION_NAME" ]] && continue
+    rm -rf -- "$entry" || return 1
+  done
+}
+
+release_local_dev_source_install_lifecycle() {
+  [[ "${source_install_reservation_active:-false}" == true ]] || return 0
+  if [[ -z "${source_install_reservation_token:-}" ]] && ! load_local_dev_source_install_reservation_recovery; then
+    return 1
+  fi
+  if ! "$source_install_reservation_relayctl" lifecycle release-source-install \
+    --scope local_development --token "$source_install_reservation_token" --json >/dev/null; then
+    return 1
+  fi
+  source_install_reservation_active=false
+  unset OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION
+  rm -f -- "${source_install_reservation_recovery_path:-}"
 }
 
 install_local_dev() {
@@ -714,6 +920,10 @@ install_local_dev() {
   shift || true
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die 'VERSION must be explicit semver'
   local source_dir="" upstream="" keychain_service="" acknowledge_development_source=false acknowledge_source=false
+  local source_install_reservation_active=false source_install_reservation_token=""
+  local source_install_reservation_root_created=false source_install_reservation_relayctl=""
+  local source_install_reservation_recovery_path=""
+  local source_uninstall_destructive_active=false
   config_path="$DEFAULT_CONFIG"
   local codex_config="$DEFAULT_CODEX_CONFIG" catalog_path="" codex_executable=""
   while [[ $# -gt 0 ]]; do
@@ -766,7 +976,11 @@ install_local_dev() {
     umask "$original_umask"
     die 'unable to create local development source snapshot'
   }
-  trap 'cleanup_install_workspace $?' EXIT HUP INT QUIT TERM
+  trap 'cleanup_install_workspace $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
   umask "$original_umask"
   chmod 0700 "$tmp" || die 'unable to protect local development source snapshot'
 
@@ -805,15 +1019,19 @@ install_local_dev() {
   verify_bundle_shape "$bundle" "$(jq -er '.artifacts[0].sha256' "$manifest")" "$staging_dir" "$manifest_schema"
   local app="${staging_dir}/${APP_NAME}"
   local pending_candidate_active=false pending_candidate_dir=""
+  local helper_dir="${app}/Contents/Library/Helpers"
+  local relay_bin="${helper_dir}/opencodex-relay"
+  local relayctl_bin="${helper_dir}/opencodex-relayctl"
+
+  # Reserve the fixed dev root before pending-helper, config, runtime, binding,
+  # or LaunchAgent writes. The marker is interpreted under the same user
+  # lifecycle lock as integration and standalone removal.
+  reserve_local_dev_source_install_lifecycle
   if [[ "$manifest_schema" == 3 ]]; then
     ensure_local_dev_install_root
     prepare_manual_helper_candidate \
       "$version" "$app" "$(jq -er '.artifacts[0].sha256' "$manifest")"
   fi
-  local helper_dir="${app}/Contents/Library/Helpers"
-  local relay_bin="${helper_dir}/opencodex-relay"
-  local relayctl_bin="${helper_dir}/opencodex-relayctl"
-
   ensure_local_dev_config_parent "$config_path"
   require_local_dev_config_leaves_or_absent "$config_path"
   ensure_local_dev_install_root
@@ -830,7 +1048,7 @@ install_local_dev() {
   snapshot_link "${INSTALL_ROOT}/current" "${transaction_dir}/current"
   snapshot_link "$APP_LINK" "${transaction_dir}/app-link"
   install_transaction_active=true
-  trap 'rollback_install $?' EXIT HUP INT QUIT TERM
+  trap 'rollback_install $?' EXIT
 
   if [[ -f "$config_path" ]]; then
     jq -e --arg upstream "$upstream" --arg catalog "$catalog_path" '
@@ -911,7 +1129,19 @@ install_local_dev() {
   mv -fh "$app_candidate" "$APP_LINK"
   mv -f -- "$binding_candidate" "$BINDING_PATH"
 
+  # Disable rollback before releasing admission while catchable signals are
+  # ignored. A failed release is retried by the EXIT handler without reverting
+  # an already verified candidate through an unreserved service helper.
+  trap '' HUP INT QUIT TERM
   install_transaction_active=false
+  local source_install_release_status=0
+  release_local_dev_source_install_lifecycle || source_install_release_status=$?
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  ((source_install_release_status == 0)) || \
+    die 'unable to release the local-development source-install lifecycle reservation'
   trap - EXIT HUP INT QUIT TERM
   rm -rf -- "$tmp" "$staging_dir" "$transaction_dir"
   if [[ "$pending_candidate_active" == true ]]; then
@@ -959,6 +1189,9 @@ trust_command() {
 uninstall_local_dev() {
   config_path="$DEFAULT_CONFIG"
   local codex_config="$DEFAULT_CODEX_CONFIG" confirmed=false
+  local source_install_reservation_active=false source_install_reservation_token=""
+  local source_install_reservation_root_created=false source_install_reservation_relayctl=""
+  local source_install_reservation_recovery_path=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --config) config_path="${2:-}"; shift 2 ;;
@@ -987,6 +1220,22 @@ uninstall_local_dev() {
   local relayctl="${INSTALL_ROOT}/current/opencodex-relayctl"
   require_managed_local_dev_relayctl "$relayctl"
 
+  local original_umask
+  original_umask="$(umask)"
+  umask 077
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/opencodex-relay-local-dev-uninstall.XXXXXX")" || {
+    umask "$original_umask"
+    die 'unable to create the local-development source-uninstall lifecycle workspace'
+  }
+  umask "$original_umask"
+  chmod 0700 "$tmp" || die 'unable to protect the local-development source-uninstall lifecycle workspace'
+  trap finish_local_dev_uninstall EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  reserve_local_dev_source_install_lifecycle "$relayctl"
+
   local status applied
   status="$("$relayctl" mode status --config "$config_path" --codex-config "$codex_config" --json)" || \
     die 'inspect local development routing before uninstall'
@@ -1009,7 +1258,7 @@ uninstall_local_dev() {
     die 'local development config changed during verification; refusing uninstall'
   require_managed_local_dev_relayctl "$relayctl"
   uninstall_guard_transaction_active=true
-  trap finish_local_dev_uninstall EXIT
+  source_uninstall_destructive_active=true
   prepare_existing_homebrew_guard_for_replacement "$APP_LINK"
 
   local service_status service_was_active=false
@@ -1053,11 +1302,24 @@ uninstall_local_dev() {
   rm -f -- "$config_path" "${config_path}.routing-state.json" "${config_path}.routing-initialized" "${config_path}.routing-transaction.json"
   if [[ -e "$INSTALL_ROOT" || -L "$INSTALL_ROOT" ]]; then
     [[ -d "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]] || die 'local development install root is unsafe'
-    rm -rf -- "$INSTALL_ROOT"
+    clear_local_dev_install_root_preserving_reservation || \
+      die 'unable to clear the local development install root while retaining lifecycle admission'
   fi
   guard_restore_helper=""
   uninstall_guard_transaction_active=false
-  trap - EXIT
+  trap '' HUP INT QUIT TERM
+  source_uninstall_destructive_active=false
+  local source_install_release_status=0
+  release_local_dev_source_install_lifecycle || source_install_release_status=$?
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  ((source_install_release_status == 0)) || \
+    die 'unable to release the local-development source-uninstall lifecycle reservation'
+  rmdir "$INSTALL_ROOT" 2>/dev/null || true
+  rm -rf -- "$tmp"
+  trap - EXIT HUP INT QUIT TERM
   printf 'local_dev_uninstalled=true\n'
 }
 

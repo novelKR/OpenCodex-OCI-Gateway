@@ -901,6 +901,10 @@ final class OpenCodexRelayCoreTests: XCTestCase {
             ("native_owner_configuration_invalid", false, "manual_remediation"),
             ("native_owner_restore_failed", true, "refresh_status"),
             ("native_owner_result_invalid", false, "manual_remediation"),
+            ("native_removal_boundary_unsafe", false, "manual_remediation"),
+            ("native_removal_boundary_changed", true, "refresh_native_removal"),
+            ("native_recovery_required", true, "open_recovery"),
+            ("custom_codex_home_unsupported", false, "review_request"),
         ] {
             let data = Data("""
             {"schema_version":1,"ok":false,"error":{"code":"\(code)","message_key":"\(code)","retryable":\(retryable),"recommended_action":"\(action)"}}

@@ -997,6 +997,10 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
     case openCodexCandidateChanged = "opencodex_candidate_changed"
     case openCodexManualRemovalRequired = "opencodex_manual_removal_required"
     case openCodexCleanupJournalUnsafe = "opencodex_cleanup_journal_unsafe"
+    case nativeRemovalBoundaryUnsafe = "native_removal_boundary_unsafe"
+    case nativeRemovalBoundaryChanged = "native_removal_boundary_changed"
+    case nativeRecoveryRequired = "native_recovery_required"
+    case customCodexHomeUnsupported = "custom_codex_home_unsupported"
     case teardownUnsupported = "teardown_unsupported"
     case teardownCandidateChanged = "teardown_candidate_changed"
     case teardownPreflightFailed = "teardown_preflight_failed"
@@ -1025,6 +1029,7 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
         case .operationFailed, .routingRecoveryRequired, .routingGenerationChanged,
              .nativeRepairOwnerChanged, .nativeOwnerRepairFailed, .nativeOwnerBusy, .nativeOwnerRestoreFailed, .nativeStateRepairPending,
              .desktopExitConfirmationRequired, .operationTimedOut, .openCodexCandidateChanged,
+             .nativeRemovalBoundaryChanged, .nativeRecoveryRequired,
              .teardownCandidateChanged, .teardownPreflightFailed,
              .authenticationFailed, .gatewayUnreachable, .configChanged,
              .routingChanged, .transitionPending, .runtimeSwapFailed,
@@ -1034,6 +1039,7 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
         case .invalidRequest, .operationCancelled, .permissionRequired,
              .nativeRoutingUnverified, .nativeRepairUnavailable, .nativeOwnerConfigurationInvalid, .nativeOwnerResultInvalid,
              .openCodexManualRemovalRequired, .openCodexCleanupJournalUnsafe,
+             .nativeRemovalBoundaryUnsafe, .customCodexHomeUnsupported,
              .teardownUnsupported, .teardownRefused, .teardownResultInvalid,
              .teardownVerificationFailed, .invalidAddress, .credentialUnavailable,
              .catalogInvalid, .gatewayUnsupported, .integrationAppLocationInvalid,
@@ -1049,11 +1055,15 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
         case .nativeOwnerBusy: "retry_owner_repair"
         case .invalidRequest: "review_request"
         case .routingRecoveryRequired, .nativeStateRepairPending: "open_recovery"
+        case .nativeRecoveryRequired: "open_recovery"
+        case .nativeRemovalBoundaryChanged: "refresh_native_removal"
         case .desktopExitConfirmationRequired: "retry_after_desktop_exit"
         case .operationCancelled: "none"
         case .permissionRequired, .nativeRoutingUnverified, .nativeRepairUnavailable,
-             .nativeOwnerConfigurationInvalid, .nativeOwnerResultInvalid, .openCodexManualRemovalRequired, .openCodexCleanupJournalUnsafe:
+             .nativeOwnerConfigurationInvalid, .nativeOwnerResultInvalid, .openCodexManualRemovalRequired, .openCodexCleanupJournalUnsafe,
+             .nativeRemovalBoundaryUnsafe:
             "manual_remediation"
+        case .customCodexHomeUnsupported: "review_request"
         case .openCodexCandidateChanged: "rediscover_opencodex"
         case .teardownCandidateChanged: "rediscover_opencodex"
         case .teardownPreflightFailed: "refresh_status"
@@ -1237,6 +1247,14 @@ public enum RelayctlError: LocalizedError, Equatable, Sendable {
                 return "The selected OpenCodex installation changed. Discover it again before continuing."
             case .openCodexCleanupJournalUnsafe:
                 return "The OpenCodex cleanup journal cannot be verified safely. Manual recovery is required."
+            case .nativeRemovalBoundaryUnsafe:
+                return "The standalone Native Codex removal boundary could not be verified safely."
+            case .nativeRemovalBoundaryChanged:
+                return "The standalone Native Codex removal boundary changed. Refresh removal discovery before continuing."
+            case .nativeRecoveryRequired:
+                return "Recover the interrupted standalone Native Codex removal before continuing."
+            case .customCodexHomeUnsupported:
+                return "Standalone Native removal supports only the fixed ~/.codex configuration location."
             case .teardownUnsupported:
                 return "This OpenCodex installation does not have a verified Relay preserving teardown adapter."
             case .teardownCandidateChanged:

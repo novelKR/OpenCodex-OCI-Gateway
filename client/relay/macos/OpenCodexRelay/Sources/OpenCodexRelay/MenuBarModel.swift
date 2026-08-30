@@ -94,12 +94,68 @@ struct SafeStatusMessage: Equatable {
     }
 }
 
+struct OpenCodexDiscoveryCandidatePresentation: Equatable, Identifiable {
+    let id: String
+    let manager: OpenCodexPackageManager
+    let version: String
+    let tier: OpenCodexDiscoveryTier?
+    let help: String?
+    let automaticRemovalEligible: Bool
+}
+
+enum OpenCodexDiscoverySnapshot: Equatable {
+    case integrated(OpenCodexDiscoveryResult)
+    case standaloneNative(OpenCodexNativeDiscoveryResult)
+
+    var context: OpenCodexRemovalContext {
+        switch self {
+        case .integrated: .integrated
+        case .standaloneNative: .standaloneNative
+        }
+    }
+
+    var candidates: [OpenCodexDiscoveryCandidatePresentation] {
+        switch self {
+        case let .integrated(result):
+            return result.candidates.map {
+                OpenCodexDiscoveryCandidatePresentation(
+                    id: $0.id,
+                    manager: $0.manager,
+                    version: $0.version,
+                    tier: $0.tier,
+                    help: $0.packageRoot,
+                    automaticRemovalEligible: $0.isAutomaticRemovalEligible
+                )
+            }
+        case let .standaloneNative(result):
+            return result.candidates.map {
+                OpenCodexDiscoveryCandidatePresentation(
+                    id: $0.installationID,
+                    manager: $0.manager,
+                    version: $0.version,
+                    tier: nil,
+                    help: nil,
+                    automaticRemovalEligible: $0.automaticRemovalEligible
+                )
+            }
+        }
+    }
+
+    var truncated: Bool {
+        switch self {
+        case let .integrated(result): result.truncated
+        case let .standaloneNative(result): result.truncated
+        }
+    }
+}
+
 enum OpenCodexDiscoveryState: Equatable {
     case idle
     case searching(OpenCodexDiscoveryTier)
-    case candidates(OpenCodexDiscoveryResult)
-    case broadScanApprovalRequired(OpenCodexDiscoveryResult)
-    case notFound(OpenCodexDiscoveryResult)
+    case nativeSearching
+    case candidates(OpenCodexDiscoverySnapshot)
+    case broadScanApprovalRequired(OpenCodexDiscoverySnapshot)
+    case notFound(OpenCodexDiscoverySnapshot)
     case failed(String)
 }
 
@@ -185,6 +241,7 @@ final class MenuBarModel: ObservableObject {
     private let injectedClient: (any RelayctlExecuting)?
     private let injectedDiscoveryClient: (any OpenCodexDiscovering)?
     private let injectedRemovalClient: (any OpenCodexRemovalExecuting)?
+    private let injectedNativeRemovalClient: (any OpenCodexNativeRemovalExecuting)?
     private let injectedNativeRepairClient: (any NativeRepairExecuting)?
     private let removalRecoveryStore: any OpenCodexRemovalRecoverySessionStoring
     private let targetStore: any DesktopTargetStoring
@@ -210,6 +267,7 @@ final class MenuBarModel: ObservableObject {
         client: (any RelayctlExecuting)? = nil,
         discoveryClient: (any OpenCodexDiscovering)? = nil,
         removalClient: (any OpenCodexRemovalExecuting)? = nil,
+        nativeRemovalClient: (any OpenCodexNativeRemovalExecuting)? = nil,
         nativeRepairClient: (any NativeRepairExecuting)? = nil,
         removalRecoveryStore: (any OpenCodexRemovalRecoverySessionStoring)? = nil,
         targetStore: (any DesktopTargetStoring)? = nil,
@@ -233,6 +291,7 @@ final class MenuBarModel: ObservableObject {
         self.injectedClient = client
         self.injectedDiscoveryClient = discoveryClient
         self.injectedRemovalClient = removalClient
+        self.injectedNativeRemovalClient = nativeRemovalClient
         self.injectedNativeRepairClient = nativeRepairClient
         self.removalRecoveryStore = removalRecoveryStore ?? UserDefaultsOpenCodexRemovalRecoverySessionStore()
         self.targetStore = targetStore ?? UserDefaultsDesktopTargetStore()
@@ -263,6 +322,7 @@ final class MenuBarModel: ObservableObject {
                 self.hasPendingOpenCodexRemovalRecovery = true
             }
         } catch {
+            self.hasPendingOpenCodexRemovalRecovery = true
             self.message = SafeStatusMessage(
                 code: "opencodex_recovery_context_invalid",
                 key: .messageRemovalRecoveryUnavailable
@@ -360,7 +420,30 @@ final class MenuBarModel: ObservableObject {
     }
 
     var canBeginOpenCodexRemoval: Bool {
-        openCodexRemovalFlow?.automaticRemovalEligible == true
+        guard let flow = openCodexRemovalFlow,
+              flow.automaticRemovalEligible else { return false }
+        switch flow.context {
+        case .integrated:
+            return status?.canUninstallOpenCodex == true
+        case .standaloneNative:
+            return integrationAvailability == .missing &&
+                RelayIntegrationInspector.hasExecutableHelper(at: helperURL) &&
+                flow.nativeSelection != nil
+        }
+    }
+
+    var canDiscoverOpenCodex: Bool {
+        guard desktopTargetState.canControl,
+              !isBusy,
+              !hasPendingOpenCodexRemovalRecovery else { return false }
+        switch integrationAvailability {
+        case .ready:
+            return canRequestRouting
+        case .missing:
+            return runtimeMode == .managed && RelayIntegrationInspector.hasExecutableHelper(at: helperURL)
+        case .preview, .unsafe, .invalid, .helperUnavailable:
+            return false
+        }
     }
 
     var canRegisterHomebrewGuard: Bool {
@@ -520,7 +603,11 @@ final class MenuBarModel: ObservableObject {
     }
 
     func refreshHomebrewGuardAvailability() async {
-        await refreshHomebrewGuardAvailability(for: openCodexRemovalFlow?.candidate)
+        if let nativeCandidate = openCodexRemovalFlow?.nativeCandidate {
+            await refreshHomebrewGuardAvailability(forNative: nativeCandidate)
+        } else {
+            await refreshHomebrewGuardAvailability(for: openCodexRemovalFlow?.candidate)
+        }
     }
 
     func registerHomebrewGuard() {
@@ -723,6 +810,41 @@ final class MenuBarModel: ObservableObject {
         } else {
             guardCandidate = nil
         }
+        await refreshHomebrewGuardAvailability(with: guardCandidate)
+    }
+
+    private func refreshHomebrewGuardAvailability(
+        forNative candidate: OpenCodexNativeRemovalCandidate
+    ) async {
+        guard runtimeMode == .managed else {
+            homebrewGuardAvailability = .preview
+            return
+        }
+        guard candidate.homebrewGuardRequired else {
+            if homebrewGuardAvailability.registration != .recoveryRequired {
+                homebrewGuardAvailability = .notRequired
+            }
+            return
+        }
+        let guardCandidate: HomebrewGuardCandidate
+        do {
+            guardCandidate = try candidate.homebrewGuardCandidate()
+        } catch {
+            homebrewGuardAvailability = HomebrewGuardAvailability(
+                registration: .unavailable,
+                helperVersion: nil,
+                protocolVersion: homebrewGuardProtocolVersion,
+                errorCode: .candidateChanged,
+                operationID: nil
+            )
+            return
+        }
+        await refreshHomebrewGuardAvailability(with: guardCandidate)
+    }
+
+    private func refreshHomebrewGuardAvailability(
+        with guardCandidate: HomebrewGuardCandidate?
+    ) async {
         let previousRegistration = homebrewGuardAvailability.registration
         let refreshedAvailability = await homebrewGuard.availability(candidate: guardCandidate)
         homebrewGuardAvailability = refreshedAvailability
@@ -962,10 +1084,27 @@ final class MenuBarModel: ObservableObject {
     /// never searches PATH or invokes `ocx` directly: relayctl receives the
     /// fingerprinted absolute executable and carries out the selected action.
     func addLocalOpenCodexBackend() {
-        guard requireOpenCodexDiscoveryAccess() else { return }
+        guard !hasPendingOpenCodexRemovalRecovery else {
+            message = SafeStatusMessage(
+                code: "opencodex_recovery_context_pending",
+                key: .messageRemovalRecoveryUnavailable
+            )
+            return
+        }
+        guard let context = requireOpenCodexDiscoveryContext() else { return }
         guard resolveSelectedDesktopTarget(missingKey: .messageDesktopNotSelectedHandoff) != nil else { return }
-        guard let discoveryClient = configuredOpenCodexDiscoveryClient(), !isBusy else { return }
-        guard requireOpenCodexDiscoveryAccess() else { return }
+        guard !isBusy else { return }
+        switch context {
+        case .integrated:
+            startIntegratedOpenCodexDiscovery()
+        case .standaloneNative:
+            startStandaloneNativeOpenCodexDiscovery()
+        }
+    }
+
+    private func startIntegratedOpenCodexDiscovery() {
+        guard let discoveryClient = configuredOpenCodexDiscoveryClient(),
+              requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
         isBusy = true
         openCodexDiscoveryState = .searching(.a)
         Task { [weak self] in
@@ -973,22 +1112,58 @@ final class MenuBarModel: ObservableObject {
             defer { self.isBusy = false }
             do {
                 let tierA = try await discoveryClient.discover(tier: .a, broadScanApproved: false)
-                guard self.requireOpenCodexDiscoveryAccess() else { return }
+                guard self.requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
                 if !tierA.candidates.isEmpty {
-                    self.openCodexDiscoveryState = .candidates(tierA)
+                    self.openCodexDiscoveryState = .candidates(.integrated(tierA))
                     return
                 }
                 self.openCodexDiscoveryState = .searching(.b)
                 let tierB = try await discoveryClient.discover(tier: .b, broadScanApproved: false)
-                guard self.requireOpenCodexDiscoveryAccess() else { return }
+                guard self.requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
                 if !tierB.candidates.isEmpty {
-                    self.openCodexDiscoveryState = .candidates(tierB)
+                    self.openCodexDiscoveryState = .candidates(.integrated(tierB))
                 } else {
-                    self.openCodexDiscoveryState = .broadScanApprovalRequired(tierB)
+                    self.openCodexDiscoveryState = .broadScanApprovalRequired(.integrated(tierB))
                 }
             } catch {
-                guard self.requireOpenCodexDiscoveryAccess() else { return }
+                guard self.requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
                 let safe = self.safeMessage(for: error)
+                self.openCodexDiscoveryState = .failed(safe.code)
+                self.message = safe
+            }
+        }
+    }
+
+    private func startStandaloneNativeOpenCodexDiscovery() {
+        guard let client = configuredOpenCodexNativeRemovalClient(),
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative else { return }
+        isBusy = true
+        openCodexDiscoveryState = .nativeSearching
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            do {
+                let result = try await client.discover()
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative else {
+                    return
+                }
+                if result.nativeRecoveryRequired {
+                    self.openCodexDiscoveryState = .failed("native_recovery_required")
+                    self.message = SafeStatusMessage(
+                        code: "native_recovery_required",
+                        key: .messageRemovalNativeRecoveryRequired
+                    )
+                    return
+                }
+                let snapshot = OpenCodexDiscoverySnapshot.standaloneNative(result)
+                self.openCodexDiscoveryState = result.candidates.isEmpty
+                    ? .notFound(snapshot)
+                    : .candidates(snapshot)
+            } catch {
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative else {
+                    return
+                }
+                let safe = self.safeOpenCodexRemovalMessage(for: error)
                 self.openCodexDiscoveryState = .failed(safe.code)
                 self.message = safe
             }
@@ -997,9 +1172,9 @@ final class MenuBarModel: ObservableObject {
 
     func approveBroadOpenCodexDiscovery() {
         guard case .broadScanApprovalRequired = openCodexDiscoveryState,
-              requireOpenCodexDiscoveryAccess(),
+              requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated,
               let discoveryClient = configuredOpenCodexDiscoveryClient(),
-              requireOpenCodexDiscoveryAccess(),
+              requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated,
               !isBusy else { return }
         isBusy = true
         openCodexDiscoveryState = .searching(.c)
@@ -1008,10 +1183,13 @@ final class MenuBarModel: ObservableObject {
             defer { self.isBusy = false }
             do {
                 let result = try await discoveryClient.discover(tier: .c, broadScanApproved: true)
-                guard self.requireOpenCodexDiscoveryAccess() else { return }
-                self.openCodexDiscoveryState = result.candidates.isEmpty ? .notFound(result) : .candidates(result)
+                guard self.requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
+                let snapshot = OpenCodexDiscoverySnapshot.integrated(result)
+                self.openCodexDiscoveryState = result.candidates.isEmpty
+                    ? .notFound(snapshot)
+                    : .candidates(snapshot)
             } catch {
-                guard self.requireOpenCodexDiscoveryAccess() else { return }
+                guard self.requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
                 let safe = self.safeMessage(for: error)
                 self.openCodexDiscoveryState = .failed(safe.code)
                 self.message = safe
@@ -1026,6 +1204,20 @@ final class MenuBarModel: ObservableObject {
 
     var discoveredOpenCodexCandidates: [OpenCodexInstallationCandidate] {
         switch openCodexDiscoveryState {
+        case let .candidates(.integrated(result)): result.candidates
+        default: []
+        }
+    }
+
+    var discoveredNativeOpenCodexCandidates: [OpenCodexNativeRemovalCandidate] {
+        switch openCodexDiscoveryState {
+        case let .candidates(.standaloneNative(result)): result.candidates
+        default: []
+        }
+    }
+
+    var discoveredOpenCodexCandidatePresentations: [OpenCodexDiscoveryCandidatePresentation] {
+        switch openCodexDiscoveryState {
         case let .candidates(result): result.candidates
         default: []
         }
@@ -1033,20 +1225,51 @@ final class MenuBarModel: ObservableObject {
 
     @discardableResult
     func chooseDiscoveredOpenCodexCandidate(id: String) -> Bool {
-        guard requireOpenCodexDiscoveryAccess() else { return false }
-        guard let candidate = discoveredOpenCodexCandidates.first(where: { $0.id == id }) else {
-            message = SafeStatusMessage(code: "ocx_selection_invalid", key: .messageOCXSelectionInvalid)
+        guard !hasPendingOpenCodexRemovalRecovery else {
+            message = SafeStatusMessage(
+                code: "opencodex_recovery_context_pending",
+                key: .messageRemovalRecoveryUnavailable
+            )
             return false
         }
+        guard let context = requireOpenCodexDiscoveryContext() else { return false }
         do {
-            openCodexRemovalFlow = OpenCodexRemovalFlow(
-                candidate: candidate,
-                selection: try OpenCodexRemovalSelection(candidate: candidate)
-            )
-            openCodexDiscoveryState = .idle
-            Task { [weak self] in
-                await self?.refreshHomebrewGuardAvailability(for: candidate)
+            switch context {
+            case .integrated:
+                guard let candidate = discoveredOpenCodexCandidates.first(where: { $0.id == id }) else {
+                    throw OpenCodexRemovalContractError.invalidSelection
+                }
+                openCodexRemovalFlow = OpenCodexRemovalFlow(
+                    candidate: candidate,
+                    selection: try OpenCodexRemovalSelection(candidate: candidate)
+                )
+                Task { [weak self] in
+                    await self?.refreshHomebrewGuardAvailability(for: candidate)
+                }
+            case .standaloneNative:
+                guard case let .candidates(.standaloneNative(result)) = openCodexDiscoveryState,
+                      let candidate = result.candidates.first(where: { $0.installationID == id }),
+                      candidate.automaticRemovalEligible else {
+                    throw OpenCodexNativeRemovalContractError.invalidSelection
+                }
+                let nativeSelection = try OpenCodexNativeRemovalSelection(
+                    candidate: candidate,
+                    boundaryRevision: result.boundaryRevision
+                )
+                let selection = try OpenCodexRemovalSelection(
+                    installationID: candidate.installationID,
+                    installationFingerprint: candidate.installationFingerprint
+                )
+                openCodexRemovalFlow = OpenCodexRemovalFlow(
+                    nativeCandidate: candidate,
+                    nativeSelection: nativeSelection,
+                    selection: selection
+                )
+                Task { [weak self] in
+                    await self?.refreshHomebrewGuardAvailability(forNative: candidate)
+                }
             }
+            openCodexDiscoveryState = .idle
             return true
         } catch {
             message = SafeStatusMessage(code: "ocx_selection_invalid", key: .messageOCXSelectionInvalid)
@@ -1055,7 +1278,7 @@ final class MenuBarModel: ObservableObject {
     }
 
     func selectOpenCodexExecutableManually() {
-        guard requireOpenCodexDiscoveryAccess() else { return }
+        guard requireOpenCodexDiscoveryContext(expected: .integrated) == .integrated else { return }
         let panel = NSOpenPanel()
         panel.title = localizer.text(.panelOpenCodexTitle)
         panel.message = localizer.text(.panelOpenCodexMessage)
@@ -1280,7 +1503,7 @@ final class MenuBarModel: ObservableObject {
 
 
     var nativeRepairCandidates: [OpenCodexInstallationCandidate] {
-        guard case let .candidates(result) = nativeRepairDiscoveryState else { return [] }
+        guard case let .candidates(.integrated(result)) = nativeRepairDiscoveryState else { return [] }
         return result.candidates
     }
 
@@ -1633,12 +1856,15 @@ final class MenuBarModel: ObservableObject {
             nativeRepairDiscoveryState = .searching(.a)
             let tierA = try await client.discover(tier: .a, broadScanApproved: false)
             if !tierA.candidates.isEmpty {
-                nativeRepairDiscoveryState = .candidates(tierA)
+                nativeRepairDiscoveryState = .candidates(.integrated(tierA))
                 return
             }
             nativeRepairDiscoveryState = .searching(.b)
             let tierB = try await client.discover(tier: .b, broadScanApproved: false)
-            nativeRepairDiscoveryState = tierB.candidates.isEmpty ? .notFound(tierB) : .candidates(tierB)
+            let snapshot = OpenCodexDiscoverySnapshot.integrated(tierB)
+            nativeRepairDiscoveryState = tierB.candidates.isEmpty
+                ? .notFound(snapshot)
+                : .candidates(snapshot)
         } catch {
             let safe = safeMessage(for: error)
             nativeRepairDiscoveryState = .failed(safe.code)
@@ -2117,24 +2343,42 @@ final class MenuBarModel: ObservableObject {
         )
     }
 
-    /// Discovery is an integration-owned operation even when a test or local
-    /// development build injects its discovery transport. Re-read the binding
-    /// before every direct entry point and after every asynchronous result so a
-    /// removed or replaced binding cannot leave stale discovery controls live.
-    private func requireOpenCodexDiscoveryAccess() -> Bool {
+    /// Re-read the binding before every direct entry point and asynchronous
+    /// result. Exact absence selects the standalone Native boundary; any other
+    /// binding failure remains fail-closed.
+    private func requireOpenCodexDiscoveryContext(
+        expected: OpenCodexRemovalContext? = nil
+    ) -> OpenCodexRemovalContext? {
         let availability = refreshedIntegrationAvailability()
-        guard availability.permitsManagedOperations else {
+        let context: OpenCodexRemovalContext
+        switch availability {
+        case .ready:
+            context = .integrated
+        case .missing:
+            guard runtimeMode == .managed,
+                  RelayIntegrationInspector.hasExecutableHelper(at: helperURL) else {
+                openCodexDiscoveryState = .idle
+                message = SafeStatusMessage(code: "relayctl_unavailable", key: .relayctlUnavailable)
+                return nil
+            }
+            context = .standaloneNative
+        case .preview, .unsafe, .invalid, .helperUnavailable:
             openCodexDiscoveryState = .idle
             applyIntegrationFailure()
             reportBindingFailure()
-            return false
+            return nil
         }
-        guard canRequestRouting else {
+        guard expected == nil || expected == context else {
+            openCodexDiscoveryState = .idle
+            message = SafeStatusMessage(code: "routing_binding_changed", key: .messageRoutingBindingInvalid)
+            return nil
+        }
+        if context == .integrated, !canRequestRouting {
             openCodexDiscoveryState = .idle
             message = routingPreflightFailureMessage()
-            return false
+            return nil
         }
-        return true
+        return context
     }
 
     private func configuredOpenCodexRemovalClient() -> (any OpenCodexRemovalExecuting)? {
@@ -2155,6 +2399,20 @@ final class MenuBarModel: ObservableObject {
             relayConfig: binding.relayConfig,
             codexConfig: binding.codexConfig
         )
+    }
+
+    private func configuredOpenCodexNativeRemovalClient() -> (any OpenCodexNativeRemovalExecuting)? {
+        guard runtimeMode == .managed else {
+            integrationAvailability = .preview
+            applyIntegrationFailure()
+            return nil
+        }
+        guard RelayIntegrationInspector.hasExecutableHelper(at: helperURL) else {
+            message = SafeStatusMessage(code: "relayctl_unavailable", key: .relayctlUnavailable)
+            return nil
+        }
+        if let injectedNativeRemovalClient { return injectedNativeRemovalClient }
+        return ProcessOpenCodexNativeRemovalClient(executableURL: helperURL)
     }
 
     private func configuredBinding() -> RoutingBinding? {
@@ -2497,15 +2755,21 @@ final class MenuBarModel: ObservableObject {
         case let .searching(tier):
             code = "discovery_searching"
             fields["tier"] = tier.rawValue
+        case .nativeSearching:
+            code = "discovery_searching"
+            fields["context"] = OpenCodexRemovalContext.standaloneNative.rawValue
         case let .candidates(result):
             code = "discovery_candidates_found"
             fields["count"] = String(result.candidates.count)
+            fields["context"] = result.context.rawValue
         case let .broadScanApprovalRequired(result):
             code = "discovery_approval_required"
             fields["count"] = String(result.candidates.count)
+            fields["context"] = result.context.rawValue
         case let .notFound(result):
             code = "discovery_not_found"
             fields["count"] = String(result.candidates.count)
+            fields["context"] = result.context.rawValue
         case let .failed(failureCode):
             code = "discovery_failed"
             fields["failure_code"] = failureCode
@@ -2527,12 +2791,14 @@ final class MenuBarModel: ObservableObject {
         }
         let phase = removalPhaseCode(flow.phase)
         let handoffPhase = flow.handoffProgress.map { handoffProgressCode($0.phase) }
-        let signature = [phase, handoffPhase ?? "none", flow.mode.rawValue].joined(separator: ":")
+        let signature = [flow.context.rawValue, phase, handoffPhase ?? "none", flow.mode.rawValue]
+            .joined(separator: ":")
         guard signature != lastRemovalActivitySignature else { return }
         lastRemovalActivitySignature = signature
         var fields = [
             "phase": phase,
             "mode": flow.mode.rawValue,
+            "context": flow.context.rawValue,
             "automatic": String(flow.automaticRemovalEligible),
             "teardown_capability": String(flow.usesRelayPreservingTeardown),
             "data_preserved": String(flow.mode == .preserveData),
@@ -2559,6 +2825,8 @@ final class MenuBarModel: ObservableObject {
         case .dataRefreshRequired: "data_refresh_required"
         case .rebootRequired: "reboot_required"
         case .routingRecoveryRequired: "routing_recovery_required"
+        case .nativeRecoveryRequired: "native_recovery_required"
+        case .nativeTerminalCleanupPending: "native_terminal_cleanup_pending"
         case .result: "result"
         case .failed: "failed"
         }
@@ -2583,7 +2851,8 @@ extension MenuBarModel {
     var canDismissOpenCodexRemoval: Bool {
         guard let flow = openCodexRemovalFlow else { return true }
         switch flow.phase {
-        case .handoff, .loadingInventory, .quittingDesktop, .removing:
+        case .handoff, .loadingInventory, .quittingDesktop, .removing,
+             .nativeRecoveryRequired, .nativeTerminalCleanupPending:
             return false
         case .actions, .options, .confirmRemoval, .confirmTrash, .dataRefreshRequired,
              .rebootRequired, .routingRecoveryRequired, .result, .failed:
@@ -2610,6 +2879,7 @@ extension MenuBarModel {
             openCodexRemovalFlow = OpenCodexRemovalFlow(recoverySession: session)
             hasPendingOpenCodexRemovalRecovery = true
         } catch {
+            hasPendingOpenCodexRemovalRecovery = true
             message = SafeStatusMessage(
                 code: "opencodex_recovery_context_invalid",
                 key: .messageRemovalRecoveryUnavailable
@@ -2872,6 +3142,10 @@ extension MenuBarModel {
         guard var flow = openCodexRemovalFlow,
               flow.phase == .actions,
               !isBusy else { return }
+        if flow.context == .standaloneNative {
+            beginStandaloneNativeOpenCodexRemoval(flow)
+            return
+        }
         guard flow.automaticRemovalEligible else {
             setOpenCodexRemovalFailure(
                 SafeStatusMessage(
@@ -2940,11 +3214,88 @@ extension MenuBarModel {
         }
     }
 
+    private func beginStandaloneNativeOpenCodexRemoval(_ flow: OpenCodexRemovalFlow) {
+        guard flow.automaticRemovalEligible,
+              let selection = flow.nativeSelection,
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+              resolveSelectedDesktopTarget(missingKey: .messageDesktopNotSelectedHandoff) != nil,
+              let client = configuredOpenCodexNativeRemovalClient() else {
+            setOpenCodexRemovalFailure(
+                message ?? SafeStatusMessage(
+                    code: "opencodex_native_removal_unavailable",
+                    key: .messageRemovalNativeUnavailable
+                )
+            )
+            return
+        }
+        var pending = flow
+        pending.failure = nil
+        openCodexRemovalFlow = pending
+        isBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            do {
+                let inspection = try await client.inspect(selection: selection)
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+                      var current = self.openCodexRemovalFlow,
+                      current.context == .standaloneNative,
+                      current.selection == flow.selection else { return }
+                if inspection.nativeRecoveryRequired {
+                    current.phase = .nativeRecoveryRequired
+                    current.candidate = nil
+                    current.nativeCandidate = nil
+                    current.candidateRevalidationRequired = true
+                    current.recoveryKind = .nativeRecoveryRequired
+                    current.expectedBoundaryRevision = inspection.boundaryRevision
+                    self.openCodexRemovalFlow = current
+                    self.persistOpenCodexRecovery(
+                        current,
+                        kind: .nativeRecoveryRequired,
+                        lastCode: "native_recovery_required"
+                    )
+                    self.message = SafeStatusMessage(
+                        code: "native_recovery_required",
+                        key: .messageRemovalNativeRecoveryRequired
+                    )
+                    return
+                }
+                guard let candidate = inspection.candidate else {
+                    throw OpenCodexNativeRemovalContractError.invalidInspection
+                }
+                current.nativeCandidate = candidate
+                current.nativeSelection = selection
+                current.nativeInventory = nil
+                current.inventory = nil
+                current.mode = .preserveData
+                current.selectedDataItemIDs = []
+                current.expectedBoundaryRevision = inspection.boundaryRevision
+                current.phase = .options
+                current.failure = nil
+                self.openCodexRemovalFlow = current
+                self.activityLog.record(
+                    category: .removal,
+                    code: "removal_review_started",
+                    fields: [
+                        "context": OpenCodexRemovalContext.standaloneNative.rawValue,
+                        "data_preserved": "true",
+                    ]
+                )
+            } catch {
+                self.setOpenCodexRemovalFailure(self.safeOpenCodexRemovalMessage(for: error))
+            }
+        }
+    }
+
     func setOpenCodexRemovalMode(_ mode: OpenCodexRemovalMode) {
         guard var flow = openCodexRemovalFlow,
               flow.phase == .options,
               !isBusy else { return }
         if mode == .trashSelected {
+            if flow.context == .standaloneNative {
+                loadStandaloneNativeOpenCodexInventory(flow)
+                return
+            }
             guard flow.supportsSelectiveTrash,
                   let removalClient = configuredOpenCodexRemovalClient() else { return }
             flow.mode = .trashSelected
@@ -2983,6 +3334,51 @@ extension MenuBarModel {
         persistOpenCodexRecoveryDraftIfNeeded(flow)
     }
 
+    private func loadStandaloneNativeOpenCodexInventory(_ flow: OpenCodexRemovalFlow) {
+        guard flow.supportsSelectiveTrash,
+              let selection = flow.nativeSelection,
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+              let client = configuredOpenCodexNativeRemovalClient() else { return }
+        var loading = flow
+        loading.mode = .trashSelected
+        loading.nativeInventory = nil
+        loading.selectedDataItemIDs = []
+        loading.phase = .loadingInventory
+        openCodexRemovalFlow = loading
+        isBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            do {
+                let inventory = try await client.inspectData(selection: selection)
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+                      var current = self.openCodexRemovalFlow,
+                      current.context == .standaloneNative,
+                      current.selection == flow.selection,
+                      current.phase == .loadingInventory else { return }
+                if inventory.nativeRecoveryRequired {
+                    current.phase = .nativeRecoveryRequired
+                    current.recoveryKind = .nativeRecoveryRequired
+                    current.expectedBoundaryRevision = inventory.boundaryRevision
+                    self.openCodexRemovalFlow = current
+                    self.persistOpenCodexRecovery(
+                        current,
+                        kind: .nativeRecoveryRequired,
+                        lastCode: "native_recovery_required"
+                    )
+                    return
+                }
+                current.nativeInventory = inventory
+                current.recoveryInventoryRevision = nil
+                current.expectedBoundaryRevision = inventory.boundaryRevision
+                current.phase = .options
+                self.openCodexRemovalFlow = current
+            } catch {
+                self.setOpenCodexRemovalFailure(self.safeOpenCodexRemovalMessage(for: error))
+            }
+        }
+    }
+
     func toggleOpenCodexDataItem(id: String) {
         guard var flow = openCodexRemovalFlow,
               flow.phase == .options,
@@ -3004,8 +3400,12 @@ extension MenuBarModel {
         guard var flow = openCodexRemovalFlow,
               flow.phase == .options,
               flow.canContinueFromOptions,
-              !isBusy,
-              let routingClient = configuredRelayctlClient() else { return }
+              !isBusy else { return }
+        if flow.context == .standaloneNative {
+            reviewStandaloneNativeOpenCodexRemoval(flow)
+            return
+        }
+        guard let routingClient = configuredRelayctlClient() else { return }
         isBusy = true
         flow.failure = nil
         openCodexRemovalFlow = flow
@@ -3036,6 +3436,52 @@ extension MenuBarModel {
                     }
                 }
                 current.expectedRoutingGeneration = nextStatus.generation
+                current.phase = .confirmRemoval
+                self.openCodexRemovalFlow = current
+            } catch {
+                self.setOpenCodexRemovalFailure(self.safeOpenCodexRemovalMessage(for: error))
+            }
+        }
+    }
+
+    private func reviewStandaloneNativeOpenCodexRemoval(_ flow: OpenCodexRemovalFlow) {
+        guard let selection = flow.nativeSelection,
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+              let client = configuredOpenCodexNativeRemovalClient() else { return }
+        var reviewing = flow
+        reviewing.failure = nil
+        openCodexRemovalFlow = reviewing
+        isBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            do {
+                let inspection = try await client.inspect(selection: selection)
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+                      var current = self.openCodexRemovalFlow,
+                      current.context == .standaloneNative,
+                      current.selection == flow.selection,
+                      current.phase == .options else { return }
+                if inspection.nativeRecoveryRequired {
+                    current.phase = .nativeRecoveryRequired
+                    current.recoveryKind = .nativeRecoveryRequired
+                    current.expectedBoundaryRevision = inspection.boundaryRevision
+                    self.openCodexRemovalFlow = current
+                    self.persistOpenCodexRecovery(
+                        current,
+                        kind: .nativeRecoveryRequired,
+                        lastCode: "native_recovery_required"
+                    )
+                    return
+                }
+                guard let candidate = inspection.candidate,
+                      candidate.installationFingerprint == selection.installationFingerprint,
+                      current.mode != .trashSelected ||
+                        current.nativeInventory?.boundaryRevision == inspection.boundaryRevision else {
+                    throw OpenCodexNativeRemovalContractError.invalidInspection
+                }
+                current.nativeCandidate = candidate
+                current.expectedBoundaryRevision = inspection.boundaryRevision
                 current.phase = .confirmRemoval
                 self.openCodexRemovalFlow = current
             } catch {
@@ -3087,7 +3533,12 @@ extension MenuBarModel {
     func refreshInterruptedOpenCodexInventory() {
         guard let flow = openCodexRemovalFlow,
               flow.phase == .dataRefreshRequired,
-              !isBusy,
+              !isBusy else { return }
+        if flow.context == .standaloneNative {
+            refreshInterruptedStandaloneNativeOpenCodexInventory(flow)
+            return
+        }
+        guard
               let routingClient = configuredRelayctlClient(),
               let discoveryClient = configuredOpenCodexDiscoveryClient(),
               let removalClient = configuredOpenCodexRemovalClient() else { return }
@@ -3132,8 +3583,95 @@ extension MenuBarModel {
         }
     }
 
+    private func refreshInterruptedStandaloneNativeOpenCodexInventory(
+        _ flow: OpenCodexRemovalFlow
+    ) {
+        guard let selection = flow.nativeSelection,
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+              let client = configuredOpenCodexNativeRemovalClient() else { return }
+        isBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            do {
+                let inventory = try await client.inspectData(selection: selection)
+                guard var current = self.openCodexRemovalFlow,
+                      current.context == .standaloneNative,
+                      current.selection == flow.selection,
+                      current.phase == .dataRefreshRequired else {
+                    return
+                }
+                if inventory.nativeRecoveryRequired {
+                    current.phase = .nativeRecoveryRequired
+                    current.nativeCandidate = nil
+                    current.candidateRevalidationRequired = true
+                    current.recoveryKind = .nativeRecoveryRequired
+                    current.expectedBoundaryRevision = inventory.boundaryRevision
+                    self.openCodexRemovalFlow = current
+                    self.persistOpenCodexRecovery(
+                        current,
+                        kind: .nativeRecoveryRequired,
+                        lastCode: "native_recovery_required"
+                    )
+                    self.message = SafeStatusMessage(
+                        code: "native_recovery_required",
+                        key: .messageRemovalNativeRecoveryRequired
+                    )
+                    return
+                }
+                current.nativeInventory = inventory
+                current.recoveryInventoryRevision = nil
+                current.mode = .trashSelected
+                current.selectedDataItemIDs = []
+                current.expectedBoundaryRevision = inventory.boundaryRevision
+                current.phase = .options
+                current.failure = nil
+                self.openCodexRemovalFlow = current
+            } catch {
+                self.setOpenCodexRemovalFailure(self.safeOpenCodexRemovalMessage(for: error))
+            }
+        }
+    }
+
     func prepareRebootedOpenCodexRecovery() {
+        if let flow = openCodexRemovalFlow, flow.context == .standaloneNative {
+            prepareStandaloneNativeOpenCodexRecovery(flow)
+            return
+        }
         prepareOpenCodexRecoveryConfirmation(requiredPhase: .rebootRequired, rebootConfirmation: true)
+    }
+
+    func checkOpenCodexNativeRecovery() {
+        guard let flow = openCodexRemovalFlow,
+              flow.context == .standaloneNative,
+              flow.phase == .nativeRecoveryRequired else { return }
+        prepareStandaloneNativeOpenCodexRecovery(flow)
+    }
+
+    func checkOpenCodexNativeTerminalCleanup() {
+        guard let flow = openCodexRemovalFlow,
+              flow.context == .standaloneNative,
+              flow.phase == .nativeTerminalCleanupPending,
+              flow.recoveryKind == .terminalAckPending,
+              flow.terminalReceiptDigest != nil,
+              hasPendingOpenCodexRemovalRecovery,
+              !isBusy,
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+              let desktopURL = resolveSelectedDesktopTarget(
+                  missingKey: .messageDesktopNotSelectedHandoff
+              ),
+              let client = configuredOpenCodexNativeRemovalClient() else {
+            return
+        }
+        isBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            await self.finishStandaloneNativeTerminalCleanup(
+                using: client,
+                desktopURL: desktopURL
+            )
+        }
     }
 
     func checkOpenCodexRoutingRecovery() {
@@ -3300,12 +3838,84 @@ extension MenuBarModel {
         guard var flow = openCodexRemovalFlow,
               flow.phase == .result,
               flow.receipt?.isSuccessful != true,
+              flow.nativeReceipt?.isSuccessful != true,
               !isBusy else { return }
         flow.phase = .rebootRequired
         flow.confirmsRebootedProcessRecovery = true
         flow.expectedRoutingGeneration = nil
         openCodexRemovalFlow = flow
         persistOpenCodexRecovery(flow, kind: .rebootRequired, lastCode: "reboot_required")
+    }
+
+    private func prepareStandaloneNativeOpenCodexRecovery(_ flow: OpenCodexRemovalFlow) {
+        guard flow.phase == .rebootRequired || flow.phase == .nativeRecoveryRequired,
+              let selection = flow.nativeSelection,
+              requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+              let desktopURL = resolveSelectedDesktopTarget(missingKey: .messageDesktopNotSelectedHandoff),
+              let client = configuredOpenCodexNativeRemovalClient(),
+              !isBusy else { return }
+        guard !canRecoverHomebrewGuard else {
+            message = SafeStatusMessage(
+                code: "homebrew_guard_recovery_required",
+                key: .messageHomebrewGuardRecoveryRequired
+            )
+            return
+        }
+        isBusy = true
+        var recovering = flow
+        recovering.failure = nil
+        openCodexRemovalFlow = recovering
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            do {
+                self.message = SafeStatusMessage(
+                    code: "desktop_quit_requested",
+                    key: .messageDesktopQuitRequested,
+                    arguments: [.literal(desktopURL.deletingPathExtension().lastPathComponent)]
+                )
+                guard await self.ensureVerifiedDesktopExited(at: desktopURL) != nil else {
+                    throw OpenCodexNativeRemovalContractError.invalidRequest
+                }
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+                      let current = self.openCodexRemovalFlow,
+                      current.context == .standaloneNative,
+                      current.selection == flow.selection,
+                      current.phase == flow.phase,
+                      current.nativeSelection == selection else {
+                    throw OpenCodexNativeRemovalContractError.invalidRequest
+                }
+                let request = try OpenCodexNativeRemovalRequest(
+                    selection: selection,
+                    mode: flow.mode,
+                    dataItemIDs: flow.selectedDataItemIDs,
+                    expectedInventoryRevision: flow.mode == .trashSelected
+                        ? flow.recoveryInventoryRevision ?? flow.nativeInventory?.inventoryRevision
+                        : nil,
+                    confirmsRemoval: true,
+                    confirmsTrash: flow.mode == .trashSelected,
+                    confirmsInterruptedDataRefresh: flow.confirmsInterruptedDataRefresh,
+                    confirmsRebootedProcessRecovery: flow.phase == .rebootRequired,
+                    confirmsDesktopExited: true
+                )
+                try self.saveOpenCodexRecovery(
+                    flow,
+                    kind: .inFlight,
+                    lastCode: "native_recovery_started"
+                )
+                let receipt = try await client.remove(request)
+                await self.consumeStandaloneNativeOpenCodexRemovalReceipt(
+                    receipt,
+                    request: request,
+                    client: client,
+                    desktopURL: desktopURL
+                )
+            } catch {
+                let failure = self.safeOpenCodexRemovalMessage(for: error)
+                self.message = failure
+                self.setOpenCodexRemovalFailure(failure)
+            }
+        }
     }
 
     private func prepareOpenCodexRecoveryConfirmation(
@@ -3375,6 +3985,10 @@ extension MenuBarModel {
     }
 
     private func executeConfirmedOpenCodexRemoval(_ confirmedFlow: OpenCodexRemovalFlow) {
+        if confirmedFlow.context == .standaloneNative {
+            executeConfirmedStandaloneNativeOpenCodexRemoval(confirmedFlow)
+            return
+        }
         guard !isBusy,
               removalReviewIsCurrent(confirmedFlow),
               let generation = confirmedFlow.expectedRoutingGeneration,
@@ -3608,6 +4222,201 @@ extension MenuBarModel {
                         interrupted,
                         kind: .rebootRequired,
                         lastCode: "process_outcome_unverified"
+                    )
+                    self.message = SafeStatusMessage(
+                        code: "opencodex_process_outcome_unverified",
+                        key: .messageRemovalRebootRequired
+                    )
+                } else {
+                    self.setOpenCodexRemovalFailure(failure)
+                }
+            }
+        }
+    }
+
+    private func executeConfirmedStandaloneNativeOpenCodexRemoval(
+        _ confirmedFlow: OpenCodexRemovalFlow
+    ) {
+        guard !isBusy,
+              removalReviewIsCurrent(confirmedFlow),
+              let selection = confirmedFlow.nativeSelection,
+              let desktopURL = resolveSelectedDesktopTarget(missingKey: .messageDesktopNotSelectedHandoff),
+              let client = configuredOpenCodexNativeRemovalClient(),
+              confirmedFlow.usesRelayPreservingTeardown,
+              confirmedFlow.automaticRemovalEligible else { return }
+
+        let guardCandidate: HomebrewGuardCandidate?
+        if confirmedFlow.requiresHomebrewGuard {
+            guard canBeginOpenCodexRemoval,
+                  let candidate = confirmedFlow.nativeCandidate else {
+                message = homebrewGuardMessage(
+                    for: homebrewGuardAvailability.errorCode ?? .homebrewGuardNotRegistered
+                )
+                return
+            }
+            do {
+                guardCandidate = try candidate.homebrewGuardCandidate()
+            } catch {
+                message = homebrewGuardMessage(for: .candidateChanged)
+                return
+            }
+        } else {
+            guardCandidate = nil
+        }
+
+        var progress = confirmedFlow
+        progress.phase = .quittingDesktop
+        progress.failure = nil
+        progress.removalProgress = OpenCodexRemovalExecutionProgress(
+            phase: .preflight,
+            failedPhase: nil,
+            result: nil,
+            usesHomebrewGuard: guardCandidate != nil
+        )
+        openCodexRemovalFlow = progress
+        isBusy = true
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBusy = false }
+            var desktopExited = false
+            var guardOperationID: String?
+            var guardPrepared = false
+            var guardCommitted = false
+            var removalStarted = false
+            var removalOutcomeKnown = false
+
+            do {
+                self.updateOpenCodexRemovalProgress(.preflight)
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative else {
+                    throw OpenCodexNativeRemovalContractError.invalidRequest
+                }
+                if let guardCandidate {
+                    let availability = await self.homebrewGuard.availability(candidate: guardCandidate)
+                    self.homebrewGuardAvailability = availability
+                    guard availability.canPrepare else {
+                        throw availability.errorCode ?? HomebrewGuardErrorCode.protectionFailed
+                    }
+                }
+
+                self.updateOpenCodexRemovalProgress(.desktopExit)
+                self.message = SafeStatusMessage(
+                    code: "desktop_quit_requested",
+                    key: .messageDesktopQuitRequested,
+                    arguments: [.literal(desktopURL.deletingPathExtension().lastPathComponent)]
+                )
+                guard await self.ensureVerifiedDesktopExited(at: desktopURL) != nil else {
+                    throw OpenCodexNativeRemovalContractError.invalidRequest
+                }
+                desktopExited = true
+
+                if let guardCandidate {
+                    let operationID = UUID().uuidString.lowercased()
+                    guardOperationID = operationID
+                    self.updateOpenCodexRemovalProgress(.homebrewProtection)
+                    try await self.homebrewGuard.prepare(candidate: guardCandidate, operationID: operationID)
+                    guardPrepared = true
+                    let reinspection = try await client.inspect(selection: selection)
+                    guard !reinspection.nativeRecoveryRequired,
+                          reinspection.candidate == confirmedFlow.nativeCandidate,
+                          self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative else {
+                        throw HomebrewGuardErrorCode.candidateChanged
+                    }
+                    try await self.homebrewGuard.commit(operationID: operationID)
+                    guardCommitted = true
+                    self.homebrewGuardAvailability = HomebrewGuardAvailability(
+                        registration: .busy,
+                        helperVersion: self.homebrewGuardAvailability.helperVersion,
+                        protocolVersion: homebrewGuardProtocolVersion,
+                        errorCode: nil,
+                        operationID: operationID
+                    )
+                }
+
+                guard self.requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+                      var current = self.openCodexRemovalFlow,
+                      current.context == .standaloneNative,
+                      current.selection == confirmedFlow.selection else {
+                    throw OpenCodexNativeRemovalContractError.invalidSelection
+                }
+                current.phase = .removing
+                self.openCodexRemovalFlow = current
+                self.updateOpenCodexRemovalProgress(.teardown)
+                self.message = SafeStatusMessage(
+                    code: "opencodex_native_removal_running",
+                    key: .messageRemovalNativeRunning
+                )
+                let request = try OpenCodexNativeRemovalRequest(
+                    selection: selection,
+                    mode: confirmedFlow.mode,
+                    dataItemIDs: confirmedFlow.selectedDataItemIDs,
+                    expectedInventoryRevision: confirmedFlow.mode == .trashSelected
+                        ? confirmedFlow.nativeInventory?.inventoryRevision ?? confirmedFlow.recoveryInventoryRevision
+                        : nil,
+                    confirmsRemoval: true,
+                    confirmsTrash: confirmedFlow.mode == .trashSelected,
+                    confirmsInterruptedDataRefresh: confirmedFlow.confirmsInterruptedDataRefresh,
+                    confirmsRebootedProcessRecovery: confirmedFlow.confirmsRebootedProcessRecovery,
+                    confirmsDesktopExited: true
+                )
+                try self.saveOpenCodexRecovery(
+                    confirmedFlow,
+                    kind: .inFlight,
+                    lastCode: "native_removal_started"
+                )
+                removalStarted = true
+                let receipt = try await client.remove(request)
+                removalOutcomeKnown = true
+                self.updateOpenCodexRemovalProgress(.packageRemoval)
+                self.updateOpenCodexRemovalProgress(.resultVerification)
+
+                if let operationID = guardOperationID {
+                    self.updateOpenCodexRemovalProgress(.permissionRestore)
+                    try await self.homebrewGuard.release(operationID: operationID)
+                    guardPrepared = false
+                    guardCommitted = false
+                    await self.refreshHomebrewGuardAvailability()
+                }
+                await self.consumeStandaloneNativeOpenCodexRemovalReceipt(
+                    receipt,
+                    request: request,
+                    client: client,
+                    desktopURL: desktopURL
+                )
+            } catch {
+                let failedAt = self.openCodexRemovalFlow?.removalProgress?.phase ?? .preflight
+                var cleanupFailure: HomebrewGuardErrorCode?
+                if guardPrepared, !guardCommitted, let operationID = guardOperationID {
+                    do {
+                        self.updateOpenCodexRemovalProgress(.permissionRestore)
+                        try await self.homebrewGuard.release(operationID: operationID)
+                        await self.refreshHomebrewGuardAvailability()
+                    } catch let code as HomebrewGuardErrorCode {
+                        cleanupFailure = code
+                    } catch {
+                        cleanupFailure = .restoreFailed
+                    }
+                } else if guardCommitted {
+                    await self.refreshHomebrewGuardAvailability()
+                }
+                let failure = cleanupFailure.map(self.homebrewGuardMessage(for:)) ??
+                    self.safeOpenCodexRemovalMessage(for: error)
+                self.finishOpenCodexRemovalProgress(failedAt: failedAt, result: failure)
+                if desktopExited, !guardCommitted, !removalStarted {
+                    self.updateOpenCodexRemovalProgress(.desktopRelaunch)
+                    _ = await self.relaunchDesktopAfterOpenCodexRemoval(at: desktopURL)
+                }
+                if removalStarted, !removalOutcomeKnown {
+                    var interrupted = self.openCodexRemovalFlow ?? confirmedFlow
+                    interrupted.phase = .rebootRequired
+                    interrupted.failure = failure
+                    interrupted.confirmsRebootedProcessRecovery = true
+                    interrupted.recoveryKind = .rebootRequired
+                    self.openCodexRemovalFlow = interrupted
+                    self.persistOpenCodexRecovery(
+                        interrupted,
+                        kind: .rebootRequired,
+                        lastCode: "native_process_outcome_unverified"
                     )
                     self.message = SafeStatusMessage(
                         code: "opencodex_process_outcome_unverified",
@@ -3878,6 +4687,206 @@ extension MenuBarModel {
         }
     }
 
+    private func consumeStandaloneNativeOpenCodexRemovalReceipt(
+        _ receipt: OpenCodexNativeRemovalReceipt,
+        request: OpenCodexNativeRemovalRequest,
+        client: any OpenCodexNativeRemovalExecuting,
+        desktopURL: URL
+    ) async {
+        guard var flow = openCodexRemovalFlow,
+              flow.context == .standaloneNative,
+              flow.selection.installationID == request.selection.installationID else { return }
+        flow.nativeReceipt = receipt
+        flow.failure = nil
+        flow.expectedBoundaryRevision = receipt.boundaryRevision
+        flow.nativeSelection = try? OpenCodexNativeRemovalSelection(
+            installationID: request.selection.installationID,
+            installationFingerprint: request.selection.installationFingerprint,
+            nativeRestoreFingerprint: request.selection.nativeRestoreFingerprint,
+            boundaryRevision: receipt.boundaryRevision
+        )
+
+        if receipt.requiresWholeMacReboot {
+            flow.confirmsInterruptedDataRefresh = false
+            flow.phase = .rebootRequired
+            flow.confirmsRebootedProcessRecovery = true
+            flow.recoveryKind = .rebootRequired
+            openCodexRemovalFlow = flow
+            persistOpenCodexRecovery(
+                flow,
+                kind: .rebootRequired,
+                lastCode: "process_cleanup_unverified"
+            )
+            message = SafeStatusMessage(
+                code: "process_cleanup_unverified",
+                key: .messageRemovalRebootRequired
+            )
+            return
+        }
+
+        if receipt.nativeRecoveryRequired {
+            flow.phase = .nativeRecoveryRequired
+            flow.candidate = nil
+            flow.nativeCandidate = nil
+            flow.candidateRevalidationRequired = true
+            flow.recoveryKind = .nativeRecoveryRequired
+            openCodexRemovalFlow = flow
+            persistOpenCodexRecovery(
+                flow,
+                kind: .nativeRecoveryRequired,
+                lastCode: receipt.stages.last?.code ?? "native_recovery_required"
+            )
+            message = SafeStatusMessage(
+                code: "native_recovery_required",
+                key: .messageRemovalNativeRecoveryRequired
+            )
+            return
+        }
+
+        if receipt.requiresDataSelectionRefresh {
+            flow.retiredDataItemIDs.formUnion(request.dataItemIDs)
+            flow.selectedDataItemIDs = []
+            flow.nativeInventory = nil
+            flow.mode = .trashSelected
+            flow.confirmsInterruptedDataRefresh = true
+            flow.confirmsRebootedProcessRecovery = false
+            flow.phase = .dataRefreshRequired
+            flow.recoveryKind = .dataSelectionRefreshRequired
+            openCodexRemovalFlow = flow
+            persistOpenCodexRecovery(
+                flow,
+                kind: .dataSelectionRefreshRequired,
+                lastCode: "data_selection_refresh_required"
+            )
+            message = SafeStatusMessage(
+                code: "data_selection_refresh_required",
+                key: .messageRemovalDataRefreshRequired
+            )
+            return
+        }
+
+        if receipt.isSuccessful {
+            guard let terminalReceiptDigest = receipt.terminalReceiptDigest else {
+                let failure = SafeStatusMessage(
+                    code: "opencodex_native_receipt_invalid",
+                    key: .messageRemovalReceiptInvalid
+                )
+                flow.phase = .failed
+                flow.failure = failure
+                openCodexRemovalFlow = flow
+                message = failure
+                finishOpenCodexRemovalProgress(failedAt: .resultVerification, result: failure)
+                return
+            }
+            flow.terminalReceiptDigest = terminalReceiptDigest
+            flow.recoveryKind = .terminalAckPending
+            flow.phase = .nativeTerminalCleanupPending
+            flow.failure = nil
+            openCodexRemovalFlow = flow
+            do {
+                try saveOpenCodexRecovery(
+                    flow,
+                    kind: .terminalAckPending,
+                    lastCode: "terminal_ack_pending"
+                )
+            } catch {
+                let failure = SafeStatusMessage(
+                    code: "opencodex_recovery_context_invalid",
+                    key: .messageRemovalRecoveryUnavailable
+                )
+                flow.phase = .failed
+                flow.failure = failure
+                openCodexRemovalFlow = flow
+                hasPendingOpenCodexRemovalRecovery = true
+                message = failure
+                finishOpenCodexRemovalProgress(failedAt: .resultVerification, result: failure)
+                return
+            }
+            await finishStandaloneNativeTerminalCleanup(
+                using: client,
+                desktopURL: desktopURL
+            )
+        } else {
+            flow.phase = .result
+            openCodexRemovalFlow = flow
+            persistOpenCodexRecovery(
+                flow,
+                kind: .inFlight,
+                lastCode: receipt.stages.last?.code ?? "operation_failed"
+            )
+            let partial = SafeStatusMessage(
+                code: "opencodex_native_removal_partial",
+                key: .messageRemovalNativeRecoveryRequired
+            )
+            message = partial
+            finishOpenCodexRemovalProgress(failedAt: .resultVerification, result: partial)
+        }
+    }
+
+    private func finishStandaloneNativeTerminalCleanup(
+        using client: any OpenCodexNativeRemovalExecuting,
+        desktopURL: URL
+    ) async {
+        updateOpenCodexRemovalProgress(.statusRefresh)
+        do {
+            guard let receiptDigest = openCodexRemovalFlow?.terminalReceiptDigest else {
+                throw OpenCodexNativeRemovalContractError.invalidReceipt
+            }
+            let discovery = try await client.acknowledgeTerminal(receiptDigest: receiptDigest)
+            guard discovery.status == .ready,
+                  discovery.nativeState == .native,
+                  !discovery.nativeRecoveryRequired,
+                  requireOpenCodexDiscoveryContext(expected: .standaloneNative) == .standaloneNative,
+                  var flow = openCodexRemovalFlow,
+                  flow.context == .standaloneNative,
+                  flow.phase == .nativeTerminalCleanupPending,
+                  flow.recoveryKind == .terminalAckPending,
+                  flow.terminalReceiptDigest == receiptDigest,
+                  hasPendingOpenCodexRemovalRecovery else {
+                throw OpenCodexNativeRemovalContractError.invalidDiscovery
+            }
+
+            try removalRecoveryStore.clearAndVerify()
+            hasPendingOpenCodexRemovalRecovery = false
+            flow.phase = .result
+            flow.failure = nil
+            flow.recoveryKind = nil
+            flow.terminalReceiptDigest = nil
+            openCodexRemovalFlow = flow
+            updateOpenCodexRemovalProgress(.desktopRelaunch)
+            guard await relaunchDesktopAfterOpenCodexRemoval(at: desktopURL) else {
+                let failure = SafeStatusMessage(
+                    code: "desktop_relaunch_failed",
+                    key: .messageDesktopRelaunchFailed
+                )
+                finishOpenCodexRemovalProgress(failedAt: .desktopRelaunch, result: failure)
+                return
+            }
+            let completed = SafeStatusMessage(
+                code: "opencodex_native_removed",
+                key: .messageOpenCodexNativeRemoved
+            )
+            message = completed
+            finishOpenCodexRemovalProgress(result: completed)
+        } catch {
+            guard var flow = openCodexRemovalFlow,
+                  flow.context == .standaloneNative,
+                  flow.phase == .nativeTerminalCleanupPending,
+                  flow.recoveryKind == .terminalAckPending,
+                  flow.terminalReceiptDigest != nil else {
+                return
+            }
+            let pending = SafeStatusMessage(
+                code: "native_terminal_cleanup_pending",
+                key: .messageRemovalNativeCleanupPending
+            )
+            flow.failure = pending
+            openCodexRemovalFlow = flow
+            message = pending
+            finishOpenCodexRemovalProgress(failedAt: .statusRefresh, result: pending)
+        }
+    }
+
     private func refreshRoutingAfterRemoval(using client: any RelayctlExecuting) async {
         do {
             consume(try await client.execute(.status))
@@ -3954,6 +4963,15 @@ extension MenuBarModel {
     }
 
     private func removalReviewIsCurrent(_ flow: OpenCodexRemovalFlow) -> Bool {
+        if flow.context == .standaloneNative {
+            guard refreshedIntegrationAvailability() == .missing,
+                  RelayIntegrationInspector.hasExecutableHelper(at: helperURL),
+                  let selection = flow.nativeSelection,
+                  let boundary = flow.expectedBoundaryRevision else {
+                return false
+            }
+            return selection.boundaryRevision == boundary
+        }
         guard let generation = flow.expectedRoutingGeneration,
               let status,
               status.generation == generation else {
@@ -3966,6 +4984,16 @@ extension MenuBarModel {
 
     private func invalidateOpenCodexRemovalReview() {
         guard var flow = openCodexRemovalFlow else { return }
+        if flow.context == .standaloneNative {
+            flow.phase = flow.isSavedNativeRecovery ? .nativeRecoveryRequired : .options
+            flow.expectedBoundaryRevision = flow.nativeSelection?.boundaryRevision
+            openCodexRemovalFlow = flow
+            message = SafeStatusMessage(
+                code: "native_boundary_changed",
+                key: .messageRemovalNativeBoundaryChanged
+            )
+            return
+        }
         if flow.candidate != nil {
             flow.phase = .options
         } else if flow.confirmsRebootedProcessRecovery {
@@ -3994,6 +5022,16 @@ extension MenuBarModel {
     }
 
     private func safeOpenCodexRemovalMessage(for error: Error) -> SafeStatusMessage {
+        if let contract = error as? OpenCodexNativeRemovalContractError {
+            switch contract {
+            case .invalidDiscovery, .invalidSelection, .invalidInspection, .invalidRequest:
+                return SafeStatusMessage(code: contract.safeCode, key: .messageRemovalRequestInvalid)
+            case .invalidInventory:
+                return SafeStatusMessage(code: contract.safeCode, key: .messageRemovalInventoryInvalid)
+            case .invalidReceipt:
+                return SafeStatusMessage(code: contract.safeCode, key: .messageRemovalReceiptInvalid)
+            }
+        }
         if let contract = error as? OpenCodexRemovalContractError {
             switch contract {
             case .invalidSelection, .invalidRequest:
@@ -4013,6 +5051,12 @@ extension MenuBarModel {
                     return SafeStatusMessage(code: relay.safeCode, key: .messageRemovalManualOnly)
                 case .openCodexCleanupJournalUnsafe:
                     return SafeStatusMessage(code: relay.safeCode, key: .messageRemovalRecoveryUnavailable)
+                case .nativeRemovalBoundaryUnsafe, .customCodexHomeUnsupported:
+                    return SafeStatusMessage(code: relay.safeCode, key: .messageRemovalNativeUnavailable)
+                case .nativeRemovalBoundaryChanged:
+                    return SafeStatusMessage(code: relay.safeCode, key: .messageRemovalNativeBoundaryChanged)
+                case .nativeRecoveryRequired:
+                    return SafeStatusMessage(code: relay.safeCode, key: .messageRemovalNativeRecoveryRequired)
                 case .teardownUnsupported:
                     return SafeStatusMessage(code: relay.safeCode, key: .messageRemovalTeardownUnsupported)
                 case .teardownCandidateChanged:
@@ -4068,6 +5112,7 @@ extension MenuBarModel {
         additional: [String: String]
     ) -> [String: String] {
         var fields = additional
+        fields["context"] = flow.context.rawValue
         fields["teardown_capability"] = String(flow.usesRelayPreservingTeardown)
         fields["data_preserved"] = String(flow.mode == .preserveData)
         if let adapterID = flow.teardownAdapterID {
@@ -4077,7 +5122,8 @@ extension MenuBarModel {
     }
 
     private func persistOpenCodexRecoveryDraftIfNeeded(_ flow: OpenCodexRemovalFlow) {
-        guard flow.confirmsInterruptedDataRefresh || flow.confirmsRebootedProcessRecovery || flow.candidate == nil else {
+        guard flow.confirmsInterruptedDataRefresh || flow.confirmsRebootedProcessRecovery ||
+                (flow.candidate == nil && flow.nativeCandidate == nil) else {
             return
         }
         let kind: OpenCodexRemovalRecoveryKind
@@ -4086,7 +5132,9 @@ extension MenuBarModel {
         } else if flow.confirmsRebootedProcessRecovery {
             kind = .rebootRequired
         } else {
-            kind = .routingRecoveryRequired
+            kind = flow.context == .standaloneNative
+                ? .nativeRecoveryRequired
+                : .routingRecoveryRequired
         }
         persistOpenCodexRecovery(flow, kind: kind, lastCode: kind.rawValue)
     }
@@ -4111,18 +5159,37 @@ extension MenuBarModel {
         kind: OpenCodexRemovalRecoveryKind,
         lastCode: String
     ) throws {
+        let inventoryRevision: String?
+        if flow.mode == .trashSelected {
+            switch flow.context {
+            case .integrated:
+                inventoryRevision = flow.inventory?.inventoryRevision ?? flow.recoveryInventoryRevision
+            case .standaloneNative:
+                inventoryRevision = flow.nativeInventory?.inventoryRevision ?? flow.recoveryInventoryRevision
+            }
+        } else {
+            inventoryRevision = nil
+        }
         let session = try OpenCodexRemovalRecoverySession(
+            context: flow.context,
             selection: flow.selection,
             mode: flow.mode,
             orderedDataItemIDs: flow.selectedDataItemIDs,
             retiredDataItemIDs: flow.retiredDataItemIDs.sorted(),
             recoveryKind: kind,
             lastCode: lastCode,
-            inventoryRevision: flow.mode == .trashSelected
-                ? flow.inventory?.inventoryRevision ?? flow.recoveryInventoryRevision
-                : nil,
+            inventoryRevision: inventoryRevision,
             expectedRoutingGeneration: kind == .routingRecoveryRequired
                 ? flow.expectedRoutingGeneration
+                : nil,
+            expectedBoundaryRevision: flow.context == .standaloneNative
+                ? flow.expectedBoundaryRevision ?? flow.nativeSelection?.boundaryRevision
+                : nil,
+            nativeRestoreFingerprint: flow.context == .standaloneNative
+                ? flow.nativeSelection?.nativeRestoreFingerprint
+                : nil,
+            terminalReceiptDigest: kind == .terminalAckPending
+                ? flow.terminalReceiptDigest
                 : nil
         )
         try removalRecoveryStore.save(session)

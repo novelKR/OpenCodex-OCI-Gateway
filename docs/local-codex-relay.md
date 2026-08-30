@@ -720,16 +720,57 @@ removal is authorized only after exactly one fresh candidate matches the same
 canonical package root and executable with a newly bound eligible fingerprint;
 missing, duplicate, or changed candidates require discovery again. A partial or
 unknown helper result still triggers Desktop relaunch and status verification
-so the confirmed recovery state is shown, but removal remains disabled until a
-stable External or Native route is proven.
+so the confirmed recovery state is shown without bypassing the context-specific
+recovery gate.
+
+#### Removal contexts
+
+Automatic removal chooses one context before discovery and never changes it
+during the operation:
+
+- **Integrated** applies only when the owner-only routing binding is ready. It
+  retains the existing requirement for a healthy resident Relay and a stable,
+  verified External or Native route.
+- **Standalone Native** applies only when `routing-binding.json` is exactly
+  absent and there are no partial Relay assets or integration recovery. It uses
+  only the standard `~/.codex/config.toml`, accepts clean Native or verified
+  OpenCodex-owned configuration, and verifies restored Native Codex
+  configuration plus `clientIntegrations.codex=false` before any package command
+  can start. It does not connect to a remote Gateway and requires no server URL,
+  Gateway credentials, Relay configuration, LaunchAgent, Keychain items, or
+  running Relay service. Those Relay integration assets remain unchanged before
+  and after the operation.
+
+Unsafe or invalid bindings, preview mode, integration recovery, conflicting or
+damaged journals, custom `CODEX_HOME`, and local-Relay, mixed, foreign, or
+unmanaged Codex configurations remain fail-closed. The automatic path is
+limited to canonical app-managed roots; ambient
+`XDG_CONFIG_HOME` or `OPENCODEX_HOME` overrides are rejected.
+
+A shared owner-only lifecycle lock excludes Relay preparation, integration, and either removal
+context. Recovery records bind their original context; an older integrated
+record is never moved or reinterpreted as standalone removal.
+
+The app owns the native-only relayctl operations
+`discover-open-codex-native`, `inspect-open-codex-native-removal`,
+`inspect-open-codex-native-data`, and `remove-open-codex-native`. Their strict
+schema-1 responses bind `standalone_native`, `boundary_revision`, `native_state`,
+`native_recovery_required`, and the opaque candidate identity. They do not
+accept a Gateway input or caller-selected filesystem path and are not a manual
+fallback for a rejected configuration.
 
 #### Safe npm removal
 
 Safe removal requires a selected Codex Desktop that passed the reviewed
-identity policy, a healthy resident relay, and a stable verified **External or
-Native** route rather than active Local OpenCodex. Any changed evidence requires
-a fresh review. The current path never calls data inventory or Trash: settings,
-credentials, logs, and every other OpenCodex data root are preserved.
+identity policy. Integrated removal additionally requires a healthy resident
+Relay and a stable verified **External or Native** route rather than active
+Local OpenCodex. Standalone removal instead requires the exact Native boundary
+described above and never consults remote Gateway or Relay health. Any changed
+evidence requires a fresh review. Integrated removal remains `preserve_only`.
+Standalone removal also preserves every OpenCodex data root by default; an
+eligible `selective_trash_v1` candidate may expose a verified inventory for
+explicit item selection and the existing second Trash confirmation. There is no
+implicit-all selection or permanent-delete fallback.
 
 The privileged helper can be prepared in advance from **App Information** or
 **Maintenance & Recovery** in the Control Center. When approval is pending, the
@@ -739,18 +780,26 @@ installer command and opens Terminal without receiving the administrator
 password. These assistance paths do not change Homebrew modes or remove the
 OpenCodex package.
 
-1. Discovery must return schema 4 with one exact `relay_preserve_v1` identity
-   profile and `preserve_only`. Schema 2/3, unsupported versions, modified
+1. Integrated discovery must return schema 4 with one exact
+   `relay_preserve_v1` identity profile and `preserve_only`. Standalone discovery
+   must return its strict schema-1 `standalone_native` contract with a matching
+   `boundary_revision`, bounded `native_state`, `native_recovery_required=false`,
+   and one exact eligible candidate. Schema 2/3, unsupported versions, modified
    modules or transitive closure entries, and ambiguous registry entries remain
    visible but manual-only.
 2. The review shows separately what is preserved (all OpenCodex data) and what
    will be removed (the exact npm package and verified managed integrations).
-   It freezes the displayed nonzero `UInt64` routing generation and accepts one
-   explicit package-removal confirmation. There is no data selector, inventory,
-   Trash confirmation, path/glob, or implicit-all.
-3. Immediately before execution, the app rechecks route safety and, for
-   `homebrew_guarded_npm`, privileged-helper readiness. Missing registration or
-   approval blocks before the exact trusted Desktop is asked to quit.
+   Integrated review freezes the displayed nonzero `UInt64` routing generation;
+   standalone review freezes its Native boundary fingerprint. Both accept one
+   explicit package-removal confirmation. Integrated review has no data
+   selector. Standalone review defaults to preserve; if the candidate advertises
+   `selective_trash_v1`, selected verified inventory items require a second
+   confirmation and the exact inventory revision. Neither context accepts a
+   caller path/glob or implicit-all selection.
+3. Immediately before execution, the app rechecks integrated route safety or
+   the standalone Native boundary and, for `homebrew_guarded_npm`,
+   privileged-helper readiness. Missing registration or approval blocks before
+   the exact trusted Desktop is asked to quit.
 4. The root helper performs `prepare` to temporarily remove Homebrew
    group-write, the app re-discovers the unchanged candidate, and the helper
    performs `commit`. It validates allowed paths with
@@ -777,15 +826,28 @@ OpenCodex package.
    every required component postcondition. A refused, malformed, partial, or
    unverifiable receipt prevents npm from starting. A potentially mutating
    unknown result is not automatically retried and enters recovery.
-7. Only after teardown and routing postconditions pass does the existing private
-   npm snapshot runner remove the package. Package absence and routing ownership
-   are then reverified. Finally `release` restores Homebrew modes in reverse
-   order before Desktop relaunch and status refresh.
+7. Only after teardown and the context-specific integrated routing or standalone
+   Native postconditions pass may standalone selective Trash move the reviewed
+   items, with Native-boundary checks immediately before and after. The existing
+   private npm snapshot runner then removes the package. Package absence and the
+   same boundary are reverified. Finally `release` restores Homebrew modes in
+   reverse order before Desktop relaunch and status refresh.
 
 Neither exit zero nor path absence means success. A strict receipt must prove
-`completed`, `package_absent`, `data_preserved`, no routing recovery, final
-routing-ownership revalidation, and `relay_cleanup_completed`. Only then may
-the app clear recovery and relaunch the exact trusted Desktop. A pre-commit
+`completed`, `package_absent`, `data_preserved`, no context recovery, final
+integrated-routing or standalone-Native revalidation, and a replayable retained
+terminal journal. The app first persists and reads back a schema-3
+`terminal_ack_pending` recovery checkpoint containing the exact
+`terminal_receipt_digest`. It then calls
+`discover-open-codex-native --acknowledge-terminal-receipt-digest <digest>`.
+A bare discovery or a different digest leaves the journal intact. The matching
+acknowledgement revalidates the same boundary and package absence, consumes only
+that exact terminal journal, and must return `ready/native`; only then does the
+app clear and read back its local checkpoint before relaunching the exact
+trusted Desktop. If the app exits after backend acknowledgement but before
+local cleanup, the durable checkpoint retries the acknowledgement idempotently.
+Relay Apply and Recover refuse any retained or malformed standalone journal, so an
+interrupted acknowledgement cannot create split-brain integration state. A pre-commit
 Homebrew guard crash is restored automatically; an ambiguous post-commit state
 stays protected and requires explicit recovery. Production and development
 share one system lock. The official OpenCodex package and its data are never
@@ -803,9 +865,10 @@ patched by this flow, and the separate `opencodex/` checkout is not used.
   an operation retry, package retry, or data-refresh phase. A crash at either
   boundary resumes from that marker. `routing_recovery_persisted` is emitted
   only after both the routing park and journal phase transition succeed.
-- A legacy data-inventory/Trash journal is not converted to schema 4 and is not
-  resumed. It remains fail-closed and requires reviewed manual recovery. The
-  new preserve-only flow does not create data selections or Trash witnesses.
+- A legacy integrated data-inventory/Trash journal is not converted to schema 4
+  or reinterpreted as standalone removal. It remains fail-closed and requires
+  reviewed manual recovery. New standalone inventory and Trash witnesses stay
+  bound to their schema-6 `standalone_native` journal and Native boundary.
 - A validated failure before cleanup intent is not durable removal recovery.
   Only the exact allowlisted request, candidate, data-policy, or teardown-
   preflight sequence—with no cleanup journal, child-start, package/data/routing

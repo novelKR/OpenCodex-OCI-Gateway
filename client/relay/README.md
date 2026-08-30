@@ -177,6 +177,19 @@ creates `~/.config/opencodex-relay/relay.json` only when absent,
 preserves that non-secret configuration on later installs, writes no credential
 to a service definition, and starts a user launchd/systemd service.
 
+On macOS, install and uninstall hold an owner-only source lifecycle reservation
+from the first persistent mutation through activation, verified rollback, or
+complete teardown. The LaunchAgent helper's mutating commands are internal to
+those reserved transactions; invoking them directly is rejected. A legacy
+artifact without the lifecycle capability can be selected only when an already
+installed lifecycle-capable helper coordinates the rollback. For a fresh macOS
+install, install the current release first rather than using a legacy artifact.
+If a process reports retained lifecycle recovery evidence or is killed while a
+reservation exists, do not delete the marker or retry another writer. Preserve
+the reported workspace and fixed install root, inspect and restore the captured
+service/routing state, then have a reviewed current helper release the exact
+owner-only marker. This deliberately fail-closed recovery is manual.
+
 For a macOS release workstation, create a dedicated generic-password signing
 item with `scripts/bootstrap-keychain-signing-key.sh`. The builder reads it
 through the native Security API as raw PEM data; do not use the legacy
@@ -340,12 +353,35 @@ errors, or child output.
 The two exact-executable/fingerprint retain handoffs remain available: keep the
 proxy while releasing integration and Shim, or keep the proxy while releasing
 integration only. Legacy handoff no longer exposes `ocx uninstall`. Full
-removal is a separate opaque installation-ID/fingerprint wizard. Schema-4
-removal is strictly `preserve_only`: it does not call data inventory or Trash,
-and it preserves settings, credentials, logs, and every other OpenCodex data
-root. Review freezes the displayed `UInt64` routing generation. There is no
-caller path/glob/package-name authority, implicit-all, `sudo`, automatic
-elevation, or permanent-delete fallback, and the Codex app is never removed.
+removal is a separate opaque installation-ID/fingerprint wizard. Integrated
+schema-4 removal is strictly `preserve_only`: it does not call data inventory
+or Trash, and it preserves settings, credentials, logs, and every other
+OpenCodex data root. There is no caller path/glob/package-name authority,
+implicit-all, automatic elevation, or permanent-delete fallback, and the Codex
+app is never removed.
+
+Removal has two explicit contexts. A ready routing binding uses the existing
+integrated path and freezes the displayed nonzero `UInt64` routing generation.
+When the binding is exactly missing, the app may instead use the
+`standalone_native` path: it accepts only the standard
+`~/.codex/config.toml`, restores and verifies Native Codex configuration plus
+`clientIntegrations.codex=false` before package removal, and requires no
+server URL, Gateway credential, Relay configuration, LaunchAgent, Keychain
+item, or running Relay service. Clean Native or verified OpenCodex-owned
+configuration is eligible; custom `CODEX_HOME`, local-Relay, mixed, foreign,
+and unmanaged configuration is manual-only. The automatic path is limited to
+canonical app-managed roots; ambient `XDG_CONFIG_HOME` or `OPENCODEX_HOME`
+overrides are rejected. Unsafe or invalid bindings,
+preview mode, partial Relay assets, integration recovery, and conflicting
+removal journals remain fail-closed. The standalone path does not create or
+modify the listed Relay integration assets.
+
+The integrated context remains `preserve_only`. Standalone Native also defaults
+to preserving all data; when an eligible candidate explicitly advertises
+`selective_trash_v1`, only items returned by its verified inventory can be
+selected and moved to Trash after the existing second confirmation. The Native
+boundary and inventory revision are rechecked around that operation. There is
+no implicit-all selection or permanent-delete fallback.
 
 Relay owns the versioned teardown adapter and runs it with verified Bun from a
 private immutable package snapshot, without a shell, ambient `PATH`, or a path
@@ -358,33 +394,49 @@ OpenCodex package is not patched and the separate `opencodex/` checkout is not
 an execution dependency.
 
 The wizard remains visible during handoff and shows safety preflight, Desktop
-exit, the approved OpenCodex action, Desktop relaunch, and Relay status
-verification as distinct steps. Recovery, applying, unavailable, or unverified
-routing is blocked before Desktop exit and before any OCX invocation. After a
-successful Shim handoff, both status and discovery are refreshed; automatic
-removal is re-enabled only when exactly one candidate with the same canonical
-package root and executable produces a fresh eligible fingerprint. A missing,
-duplicate, or changed candidate remains locked and requires discovery again. After a partial
-or unknown result it still attempts Desktop relaunch and status verification,
-displays the confirmed recovery state, and never bypasses the existing
-fail-closed removal guard.
+exit, the approved OpenCodex action, Desktop relaunch, and context-appropriate
+Native or integrated verification as distinct steps. The integrated context
+continues to block recovery, applying, unavailable, or unverified routing
+before Desktop exit and before any OCX invocation. The standalone context
+permits only an exactly missing binding and independently revalidates its Native
+boundary before teardown and package execution. After a successful Shim
+handoff, status and candidates are refreshed; automatic removal is re-enabled
+only when exactly one candidate with the same canonical package root and
+executable produces a fresh eligible fingerprint. A missing, duplicate, or
+changed candidate remains locked and requires discovery again. After a partial
+or unknown result the app still attempts Desktop relaunch and bounded status
+verification, displays the confirmed recovery state, and never bypasses the
+existing fail-closed removal guard.
 
-Success is receipt-first: package absence, preserved-data proof, final routing
-revalidation, and terminal relay cleanup must all be proven before recovery is
-cleared or the exact trusted Desktop is relaunched. Unverified process cleanup
-requires a platform-attested whole-Mac reboot; unresolved routing recovery
-keeps admission fail-closed. Terminal cleanup independently rechecks the exact
-selector, package absence, reviewed routing generation, and then durably
-releases the recovery gate while retaining a terminal finalization witness
-until the journal is consumed. Teardown and package children each arm a durable
-typed execution witness before launch. While either witness is active, replay,
-package resume, and finalization are blocked. After an attested changed boot,
+Success is receipt-first: package absence, preserved-data proof, and the final
+integrated routing or standalone Native boundary must all be proven before
+recovery is cleared or the exact trusted Desktop is relaunched. Unverified
+process cleanup requires a platform-attested whole-Mac reboot; unresolved
+context recovery remains fail-closed. Terminal cleanup independently rechecks
+the exact selector, package absence, and its context-bound routing generation or
+Native fingerprint, then durably releases the recovery gate while retaining a
+replayable terminal witness. After the app validates that receipt, it stores and
+reads back a schema-3, context-bearing `terminal_ack_pending`
+checkpoint with the exact `terminal_receipt_digest`. It then sends that digest
+to `discover-open-codex-native --acknowledge-terminal-receipt-digest`; a bare
+discovery or a different digest cannot consume the journal. The acknowledgement
+revalidates the same boundary and package absence before retiring that exact
+journal and returning `ready/native`. Only then does the app clear and read back
+its local checkpoint. A crash before acknowledgement replays the terminal
+receipt; a crash after acknowledgement but before local cleanup retries the
+idempotent acknowledgement. Neither window opens Relay setup beside an
+unresolved checkpoint or journal. Teardown and
+package children each arm a durable typed execution witness before launch.
+While either witness is active, replay, package resume, and finalization are
+blocked. After an attested changed boot,
 teardown returns to the durable operation intent without replaying that child,
-and package follows its absence/residual branch. Legacy data-inventory/Trash
-recovery records are not translated or resumed by the preserve-only flow; they
-remain blocked for reviewed manual recovery. Saved
-reboot/in-flight recovery may also review the same durable generation while the
-relay is unreachable, but only through its narrow saved-session predicate; it
+and package follows its absence/residual branch. Legacy integrated
+data-inventory/Trash recovery records are not translated or resumed by either
+context; they remain blocked for reviewed manual recovery. New standalone
+inventory and Trash witnesses stay bound to their `standalone_native` journal
+and Native boundary. Saved reboot/in-flight recovery may also review the same
+durable generation while the relay is unreachable, but only through its narrow
+saved-session predicate; it
 never relaxes the ordinary uninstall predicate. A known pre-start routing
 refusal or cleanup-verified malformed receipt is first marked durably, then
 routing is parked when required, and only then is the active witness cleared
@@ -658,7 +710,7 @@ and verifies it before tagging; the publisher then verifies the released
 version's immutable state. Any failure after draft creation triggers a bounded
 deletion attempt; if GitHub has already made that release immutable and rejects
 cleanup, CI reports the unresolved public state and client enrollment must stop.
-Tags with a SemVer suffix, such as `0.3.8-rc.1`, are additionally required to
+Tags with a SemVer suffix, such as `0.3.8-rc.2`, are additionally required to
 publish and read back as GitHub pre-releases. Every new tag must add a bounded
 version-specific note at `client/relay/release-notes/VERSION.md`; CI embeds that
 reviewed fragment ahead of the common installation and verification guidance.
@@ -677,8 +729,10 @@ directory, credentials, or live request logs. Manifest compatibility revision 4 
 the macOS bundle ID, `signing_mode: "adhoc"`, the final app zip hash, and the
 notice URL/SHA-256. The installer verifies the Ed25519 signature, every asset
 hash, the nested ad-hoc signatures, the absence of a Relay Team ID, and the
-Hardened Runtime before selecting the bundle. Revision 1 and 2
-releases remain installable for rollback, but predate the parked routing
+Hardened Runtime before selecting the bundle. Revision 1 and 2 releases remain
+eligible rollback targets only when an already installed lifecycle-capable
+helper coordinates the macOS transaction; they are not supported as a fresh
+macOS install through the current script. They predate the parked routing
 controller and must not be used for a MenuBar-managed Desktop switch; close
 Desktop before using their legacy compatibility path. The app includes
 `OpenCodexRelayHelperInstaller`; its `install|update|uninstall|recover|status`

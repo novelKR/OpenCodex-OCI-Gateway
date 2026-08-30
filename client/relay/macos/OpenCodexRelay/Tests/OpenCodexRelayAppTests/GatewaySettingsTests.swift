@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Security
 import XCTest
@@ -311,6 +312,32 @@ final class GatewaySettingsTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return inspectedKindSetsStorage
+        }
+    }
+
+    private final class FailingReplaceCredentialStore: GatewayCredentialStoring, @unchecked Sendable {
+        private let replacementError: GatewayCredentialStoreError
+        private let metadata = Dictionary(uniqueKeysWithValues: GatewayCredentialKind.allCases.map {
+            ($0, GatewayCredentialMetadata(
+                configured: true,
+                modifiedAt: Date(timeIntervalSince1970: 10)
+            ))
+        })
+
+        init(replacementError: GatewayCredentialStoreError) {
+            self.replacementError = replacementError
+        }
+
+        func inspect(account: String) throws -> [GatewayCredentialKind: GatewayCredentialMetadata] {
+            metadata
+        }
+
+        func replace(
+            _ kind: GatewayCredentialKind,
+            account: String,
+            value: String
+        ) throws -> GatewayCredentialMetadata {
+            throw replacementError
         }
     }
 
@@ -704,6 +731,40 @@ final class GatewaySettingsTests: XCTestCase {
         }
     }
 
+    func testCredentialReplacementMapsLifecycleAdmissionFailuresWithoutLoggingSecret() async {
+        let cases: [(GatewayCredentialStoreError, GatewaySettingsState, RelayctlReportedErrorCode)] = [
+            (.lifecycleConflict, .recoveryRequired, .integrationRecoveryRequired),
+            (.lifecycleUnsafe, .bindingUnsafe, .integrationStateUnsafe),
+        ]
+
+        for (error, expectedState, expectedCode) in cases {
+            let activityLog = RelayActivityLogStore(
+                subsystem: "test.gateway.lifecycle.\(expectedCode.rawValue)"
+            )
+            let controller = GatewaySettingsController(
+                client: nil,
+                unavailability: .bindingMissing,
+                integrationClient: IntegrationClient(),
+                credentialStore: FailingReplaceCredentialStore(replacementError: error),
+                receiptStore: ReceiptStore(),
+                activityLog: activityLog,
+                onRoutingRefreshRequested: {}
+            )
+            await controller.refresh()
+
+            let secret = "must-never-appear-\(expectedCode.rawValue)"
+            let saved = await controller.replaceCredential(.gatewayAPIKey, value: secret)
+
+            XCTAssertFalse(saved)
+            XCTAssertEqual(controller.state, expectedState)
+            XCTAssertEqual(controller.lastErrorCode, expectedCode.rawValue)
+            XCTAssertEqual(controller.credentialMetadataState, .failed)
+            let logs = activityLog.jsonLines()
+            XCTAssertFalse(logs.contains(secret))
+            XCTAssertTrue(logs.contains(expectedCode.rawValue))
+        }
+    }
+
     func testCredentialReplacementValidatesCurrentAddressButKeepsEditedDraftPending() async {
         let inspection = decodeGatewayInspection()
         let client = GatewayClient(inspection: inspection)
@@ -989,6 +1050,162 @@ final class GatewaySettingsTests: XCTestCase {
         )
         XCTAssertNil(receipts.snapshot())
         XCTAssertEqual(refreshes, 1)
+    }
+
+    func testCredentialLifecycleGateCreatesExactTemporaryHomeBoundary() throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let gate = GatewayCredentialLifecycleGate(homeDirectory: home.path)
+        var entered = false
+
+        try gate.withWriteAdmission {
+            entered = true
+        }
+
+        XCTAssertTrue(entered)
+        let lifecycleDirectory = home
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("OpenCodexRelayLifecycle", isDirectory: true)
+        let lifecycleInfo = try lstatInfo(at: lifecycleDirectory)
+        XCTAssertEqual(lifecycleInfo.st_mode & S_IFMT, S_IFDIR)
+        XCTAssertEqual(lifecycleInfo.st_uid, geteuid())
+        XCTAssertEqual(lifecycleInfo.st_mode & mode_t(0o777), mode_t(0o700))
+
+        let lock = lifecycleDirectory.appendingPathComponent("lifecycle.lock", isDirectory: false)
+        let lockInfo = try lstatInfo(at: lock)
+        XCTAssertEqual(lockInfo.st_mode & S_IFMT, S_IFREG)
+        XCTAssertEqual(lockInfo.st_uid, geteuid())
+        XCTAssertEqual(lockInfo.st_mode & mode_t(0o777), mode_t(0o600))
+    }
+
+    func testCredentialLifecycleGateRejectsStandaloneAndSourceInstallReservations() throws {
+        let conflictPaths = [
+            "Library/Application Support/OpenCodexRelayLifecycle/standalone-native",
+            "Library/Application Support/OpenCodexRelayLifecycle/standalone-native.open-codex-removal.json",
+            ".local/lib/opencodex-relay/relay/.source-install-reservation.json",
+            ".local/lib/opencodex-relay/relay-dev/.source-install-reservation.json",
+        ]
+
+        for relativePath in conflictPaths {
+            let home = try makeTemporaryHome()
+            defer { try? FileManager.default.removeItem(at: home) }
+            let gate = GatewayCredentialLifecycleGate(homeDirectory: home.path)
+            try gate.withWriteAdmission {}
+            let conflict = URL(fileURLWithPath: home.path + "/" + relativePath)
+            try FileManager.default.createDirectory(
+                at: conflict.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            XCTAssertTrue(FileManager.default.createFile(
+                atPath: conflict.path,
+                contents: Data("untrusted".utf8),
+                attributes: [.posixPermissions: 0o600]
+            ))
+            var entered = false
+
+            XCTAssertThrowsError(try gate.withWriteAdmission { entered = true }) { error in
+                XCTAssertEqual(error as? GatewayCredentialStoreError, .lifecycleConflict)
+            }
+            XCTAssertFalse(entered)
+        }
+    }
+
+    func testCredentialLifecycleGateTreatsReservationInspectionErrorAsConflict() throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let gate = GatewayCredentialLifecycleGate(homeDirectory: home.path)
+        try gate.withWriteAdmission {}
+        let reservationParent = home
+            .appendingPathComponent(".local", isDirectory: true)
+            .appendingPathComponent("lib", isDirectory: true)
+            .appendingPathComponent("opencodex-relay", isDirectory: true)
+            .appendingPathComponent("relay", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: reservationParent,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        XCTAssertEqual(Darwin.chmod(reservationParent.path, mode_t(0o000)), 0)
+        defer { _ = Darwin.chmod(reservationParent.path, mode_t(0o700)) }
+        var entered = false
+
+        XCTAssertThrowsError(try gate.withWriteAdmission { entered = true }) { error in
+            XCTAssertEqual(error as? GatewayCredentialStoreError, .lifecycleConflict)
+        }
+        XCTAssertFalse(entered)
+    }
+
+    func testCredentialLifecycleGateRejectsLooseLockWithoutRepair() throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let lifecycleDirectory = home
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("OpenCodexRelayLifecycle", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: lifecycleDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let lock = lifecycleDirectory.appendingPathComponent("lifecycle.lock", isDirectory: false)
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: lock.path,
+            contents: Data(),
+            attributes: [.posixPermissions: 0o644]
+        ))
+        XCTAssertEqual(Darwin.chmod(lock.path, mode_t(0o644)), 0)
+        var entered = false
+
+        XCTAssertThrowsError(
+            try GatewayCredentialLifecycleGate(homeDirectory: home.path)
+                .withWriteAdmission { entered = true }
+        ) { error in
+            XCTAssertEqual(error as? GatewayCredentialStoreError, .lifecycleUnsafe)
+        }
+        XCTAssertFalse(entered)
+        XCTAssertEqual(
+            try lstatInfo(at: lock).st_mode & mode_t(0o777),
+            mode_t(0o644)
+        )
+    }
+
+    func testSystemCredentialStoreRejectsLifecycleConflictBeforeKeychainAccess() throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let lifecycleDirectory = home
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("OpenCodexRelayLifecycle", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: lifecycleDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let journal = lifecycleDirectory.appendingPathComponent(
+            "standalone-native.open-codex-removal.json",
+            isDirectory: false
+        )
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: journal.path,
+            contents: Data("untrusted".utf8),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        let store = SystemGatewayCredentialStore(
+            trustedApplicationPath: "/path-that-must-not-be-inspected",
+            lifecycleHomeDirectory: home.path
+        )
+
+        XCTAssertThrowsError(
+            try store.replace(
+                .gatewayAPIKey,
+                account: "temporary-account",
+                value: "temporary-secret"
+            )
+        ) { error in
+            XCTAssertEqual(error as? GatewayCredentialStoreError, .lifecycleConflict)
+        }
     }
 
     func testSystemKeychainAdapterCreatesAndReplacesTemporaryACLItems() throws {
@@ -1330,6 +1547,25 @@ final class GatewaySettingsTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertTrue(condition())
+    }
+
+    private func makeTemporaryHome() throws -> URL {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opencodex-gateway-home-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: home,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return home
+    }
+
+    private func lstatInfo(at url: URL) throws -> stat {
+        var info = stat()
+        guard Darwin.lstat(url.path, &info) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        return info
     }
 }
 

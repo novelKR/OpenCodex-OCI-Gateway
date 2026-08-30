@@ -3,6 +3,7 @@ package handoff
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,14 +13,15 @@ import (
 )
 
 const (
-	removalCleanupSchemaVersion  = 5
-	legacyRemovalCleanupVersion  = 4
-	maxRemovalCleanupBytes       = 16 << 10
-	maxRemovalPackageAttempts    = 32
-	maxRemovalExecutionAttempts  = maxRemovalPackageAttempts * 3
-	maxRemovalSelectionRevisions = 32
-	maxRemovalRetiredDataItems   = maxRemovalDataItems
-	removalDataOutcomeUnknown    = "unknown"
+	removalCleanupSchemaVersion   = 6
+	legacyRemovalCleanupVersion   = 4
+	previousRemovalCleanupVersion = 5
+	maxRemovalCleanupBytes        = 16 << 10
+	maxRemovalPackageAttempts     = 32
+	maxRemovalExecutionAttempts   = maxRemovalPackageAttempts * 4
+	maxRemovalSelectionRevisions  = 32
+	maxRemovalRetiredDataItems    = maxRemovalDataItems
+	removalDataOutcomeUnknown     = "unknown"
 
 	RemovalCleanupPhaseIntent          = "operation_intent"
 	RemovalCleanupPhaseDataOutcome     = "data_outcome_recorded"
@@ -29,12 +31,20 @@ const (
 	RemovalCleanupPhasePackageVerified = "package_cleanup_verified"
 )
 
+type RemovalContext string
+
+const (
+	RemovalContextIntegrated       RemovalContext = "integrated"
+	RemovalContextStandaloneNative RemovalContext = "standalone_native"
+)
+
 type RemovalExecutionKind string
 
 const (
-	RemovalExecutionTeardown RemovalExecutionKind = "teardown"
-	RemovalExecutionTrash    RemovalExecutionKind = "trash"
-	RemovalExecutionPackage  RemovalExecutionKind = "package"
+	RemovalExecutionTeardown      RemovalExecutionKind = "teardown"
+	RemovalExecutionNativeRestore RemovalExecutionKind = "native_restore"
+	RemovalExecutionTrash         RemovalExecutionKind = "trash"
+	RemovalExecutionPackage       RemovalExecutionKind = "package"
 )
 
 // RemovalExecutionResolution is a durable, finite marker for an execution
@@ -79,6 +89,7 @@ var (
 type RemovalCleanupRecord struct {
 	SchemaVersion                     int                        `json:"schema_version"`
 	Operation                         string                     `json:"operation"`
+	Context                           RemovalContext             `json:"context"`
 	Phase                             string                     `json:"phase"`
 	InstallationID                    string                     `json:"installation_id"`
 	Fingerprint                       string                     `json:"installation_fingerprint"`
@@ -105,10 +116,35 @@ type RemovalCleanupRecord struct {
 	FinalizationActive                bool                       `json:"finalization_active"`
 	PackageRoot                       string                     `json:"package_root"`
 	Launchers                         []string                   `json:"launchers"`
+	NativeOriginBoundaryRevision      string                     `json:"native_origin_boundary_revision,omitempty"`
+	NativeOriginState                 string                     `json:"native_origin_state,omitempty"`
+	NativeVerifiedBoundaryRevision    string                     `json:"native_verified_boundary_revision,omitempty"`
+	NativeRestoreFingerprint          string                     `json:"native_restore_fingerprint,omitempty"`
+	NativeInventoryRevision           string                     `json:"native_inventory_revision,omitempty"`
+	NativeState                       string                     `json:"native_state,omitempty"`
+	NativeRecoveryRequired            bool                       `json:"native_recovery_required"`
+	TeardownCompleted                 bool                       `json:"teardown_completed"`
 }
 
 func RemovalCleanupPath(relayConfigPath string) string {
 	return filepath.Clean(relayConfigPath) + ".open-codex-removal.json"
+}
+
+func StandaloneRemovalAnchorPath(home string) (string, error) {
+	home = filepath.Clean(home)
+	if !filepath.IsAbs(home) {
+		return "", ErrRemovalCleanupUnsafe
+	}
+	resolved, err := filepath.EvalSymlinks(home)
+	if err != nil || !filepath.IsAbs(resolved) {
+		return "", ErrRemovalCleanupUnsafe
+	}
+	return filepath.Join(filepath.Clean(resolved), "Library", "Application Support", "OpenCodexRelayLifecycle", "standalone-native"), nil
+}
+
+func isStandaloneRemovalAnchor(path string) bool {
+	return filepath.Base(filepath.Clean(path)) == "standalone-native" &&
+		filepath.Base(filepath.Dir(filepath.Clean(path))) == "OpenCodexRelayLifecycle"
 }
 
 func RemovalDataSelectionDigest(itemIDs []string) string {
@@ -189,6 +225,7 @@ func newRemovalCleanupRecord(candidate NPMInstallation, request OpenCodexRemoval
 	record := RemovalCleanupRecord{
 		SchemaVersion:     removalCleanupSchemaVersion,
 		Operation:         "remove-open-codex",
+		Context:           RemovalContextIntegrated,
 		Phase:             phase,
 		InstallationID:    candidate.ID,
 		Fingerprint:       candidate.Fingerprint,
@@ -201,6 +238,15 @@ func newRemovalCleanupRecord(candidate NPMInstallation, request OpenCodexRemoval
 		DataOutcome:       dataOutcome,
 		PackageRoot:       candidate.PackageRoot,
 		Launchers:         uniqueSortedStrings(append([]string(nil), candidate.Launchers...)),
+	}
+	if request.Context == RemovalContextStandaloneNative {
+		record.Operation = "remove-open-codex-native"
+		record.Context = RemovalContextStandaloneNative
+		record.NativeOriginBoundaryRevision = request.ExpectedBoundaryRevision
+		record.NativeOriginState = request.ExpectedNativeState
+		record.NativeRestoreFingerprint = request.NativeRestoreFingerprint
+		record.NativeInventoryRevision = request.NativeInventoryRevision
+		record.NativeState = request.ExpectedNativeState
 	}
 	if err := validateRemovalCleanupRecord(record); err != nil {
 		return RemovalCleanupRecord{}, err
@@ -292,9 +338,18 @@ func RemovalCleanupMatchesRequest(record RemovalCleanupRecord, request OpenCodex
 	if validateRemovalCleanupRecord(record) != nil || validateRemovalRequest(request) != nil {
 		return false
 	}
-	return record.InstallationID == request.Selection.ID && record.Fingerprint == request.Selection.Fingerprint &&
+	context := request.Context
+	if context == "" {
+		context = RemovalContextIntegrated
+	}
+	return record.Context == context && record.InstallationID == request.Selection.ID && record.Fingerprint == request.Selection.Fingerprint &&
 		record.Mode == request.Mode && record.SelectionDigest == RemovalDataSelectionDigest(request.DataItemIDs) &&
-		record.SelectedDataItems == len(request.DataItemIDs) && sameOrderedStrings(record.SelectedItemIDs, request.DataItemIDs)
+		record.SelectedDataItems == len(request.DataItemIDs) && sameOrderedStrings(record.SelectedItemIDs, request.DataItemIDs) &&
+		(context != RemovalContextStandaloneNative ||
+			record.NativeOriginBoundaryRevision == request.ExpectedBoundaryRevision &&
+				record.NativeOriginState == request.ExpectedNativeState &&
+				record.NativeRestoreFingerprint == request.NativeRestoreFingerprint &&
+				record.NativeInventoryRevision == request.NativeInventoryRevision)
 }
 
 // MarkRemovalDataRefreshRequired durably converts ambiguous Trash state into a
@@ -374,6 +429,7 @@ func SupersedeRemovalDataRefreshRequired(
 	record.SelectionDigest = RemovalDataSelectionDigest(request.DataItemIDs)
 	record.SelectedItemIDs = append([]string{}, request.DataItemIDs...)
 	record.SelectedDataItems = len(request.DataItemIDs)
+	record.NativeInventoryRevision = request.NativeInventoryRevision
 	record.SelectionRevision++
 	record.MovedDataItems = 0
 	record.DataOutcome = ""
@@ -535,14 +591,19 @@ func ReadRemovalCleanup(relayConfigPath string) (RemovalCleanupRecord, bool, err
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return RemovalCleanupRecord{}, false, ErrRemovalCleanupUnsafe
 	}
-	if record.SchemaVersion == legacyRemovalCleanupVersion {
+	if record.SchemaVersion == legacyRemovalCleanupVersion || record.SchemaVersion == previousRemovalCleanupVersion {
+		if isStandaloneRemovalAnchor(relayConfigPath) {
+			return RemovalCleanupRecord{}, false, ErrRemovalCleanupUnsafe
+		}
 		migrated, err := migrateLegacyRemovalCleanupRecord(record)
 		if err != nil {
 			return RemovalCleanupRecord{}, false, err
 		}
-		if err := writeRemovalCleanupFile(path, migrated); err != nil {
-			return RemovalCleanupRecord{}, false, err
-		}
+		// Reads, including status and admission checks, must never persist a
+		// migration. A mutating caller that subsequently passes this normalized
+		// record through WriteRemovalCleanup performs the v6 replacement while
+		// holding its lifecycle writer lock. This prevents a delayed read-only
+		// migration from overwriting a newer transaction record.
 		record = migrated
 	}
 	if err := validateRemovalCleanupRecord(record); err != nil {
@@ -552,12 +613,19 @@ func ReadRemovalCleanup(relayConfigPath string) (RemovalCleanupRecord, bool, err
 }
 
 func migrateLegacyRemovalCleanupRecord(record RemovalCleanupRecord) (RemovalCleanupRecord, error) {
-	if record.SchemaVersion != legacyRemovalCleanupVersion || record.ActiveExecution != nil || record.ExecutionAttempt != 0 {
+	if record.SchemaVersion != legacyRemovalCleanupVersion && record.SchemaVersion != previousRemovalCleanupVersion {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	legacyV4 := record.SchemaVersion == legacyRemovalCleanupVersion
+	if legacyV4 && (record.ActiveExecution != nil || record.ExecutionAttempt != 0) {
 		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
 	}
 	record.SchemaVersion = removalCleanupSchemaVersion
-	record.ExecutionAttempt = record.PackageAttempt
-	if record.Phase == RemovalCleanupPhasePackageInFlight {
+	record.Context = RemovalContextIntegrated
+	if legacyV4 {
+		record.ExecutionAttempt = record.PackageAttempt
+	}
+	if legacyV4 && record.Phase == RemovalCleanupPhasePackageInFlight {
 		if record.PackageAttempt < 1 || !isFingerprint(record.ExecutionBootSession) {
 			return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
 		}
@@ -628,6 +696,114 @@ func RemoveRemovalCleanup(relayConfigPath string) error {
 	return nil
 }
 
+// StandaloneTerminalRemovalReplayReady identifies the retained terminal v6
+// witness used to replay a completed receipt after the caller disappears.
+// It deliberately excludes every nonterminal, ambiguous, or recovery state.
+func StandaloneTerminalRemovalReplayReady(record RemovalCleanupRecord) bool {
+	return validateRemovalCleanupRecord(record) == nil &&
+		record.Context == RemovalContextStandaloneNative &&
+		record.Phase == RemovalCleanupPhasePackageVerified &&
+		record.ActiveExecution == nil && record.ExecutionResolution == "" &&
+		!record.RecoveryPending && !record.NativeRecoveryRequired &&
+		record.NativeState == NativeStateNative && isFingerprint(record.NativeVerifiedBoundaryRevision) &&
+		record.RoutingRecoveryReleased && record.FinalizationActive &&
+		VerifyRemovalCleanupAbsent(record) == nil
+}
+
+// StandaloneTerminalReceiptDigest binds the caller's acknowledgement to the
+// exact retained terminal v6 witness that produced its successful receipt.
+// The digest is an ordering token, not a secret or an authorization grant.
+func StandaloneTerminalReceiptDigest(record RemovalCleanupRecord) (string, error) {
+	if !StandaloneTerminalRemovalReplayReady(record) {
+		return "", ErrRemovalCleanupUnsafe
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return "", ErrRemovalCleanupUnsafe
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("opencodex-standalone-terminal-receipt-v1\x00"))
+	_, _ = hash.Write(payload)
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// AcknowledgeStandaloneTerminalRemoval consumes a terminal record only when
+// the supplied receipt digest matches the exact record still on disk. A
+// different valid digest is a harmless non-acknowledgement and leaves the
+// journal intact for replay.
+func AcknowledgeStandaloneTerminalRemoval(anchorPath, receiptDigest string) (bool, error) {
+	if !isFingerprint(receiptDigest) {
+		return false, ErrRemovalCleanupUnsafe
+	}
+	current, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	expectedDigest, err := StandaloneTerminalReceiptDigest(current)
+	if err != nil {
+		return false, nil
+	}
+	if subtle.ConstantTimeCompare([]byte(receiptDigest), []byte(expectedDigest)) != 1 {
+		return false, nil
+	}
+	if err := RetireStandaloneTerminalRemoval(anchorPath, current); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RetireStandaloneTerminalRemoval consumes only the exact retained terminal
+// record the caller independently verified. It cannot retire a replacement or
+// a nonterminal journal.
+func RetireStandaloneTerminalRemoval(anchorPath string, expected RemovalCleanupRecord) error {
+	if !StandaloneTerminalRemovalReplayReady(expected) {
+		return ErrRemovalCleanupUnsafe
+	}
+	current, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || !sameRemovalCleanupRecord(current, expected) ||
+		!StandaloneTerminalRemovalReplayReady(current) {
+		return ErrRemovalCleanupUnsafe
+	}
+	return RemoveRemovalCleanup(anchorPath)
+}
+
+func MarkStandaloneTeardownComplete(anchorPath string) (RemovalCleanupRecord, error) {
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || record.Context != RemovalContextStandaloneNative ||
+		record.Phase != RemovalCleanupPhaseIntent || record.ActiveExecution != nil || record.NativeRecoveryRequired {
+		return RemovalCleanupRecord{}, ErrRemovalCleanupUnsafe
+	}
+	if record.TeardownCompleted {
+		return record, nil
+	}
+	record.TeardownCompleted = true
+	if err := validateRemovalCleanupRecord(record); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	if err := writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), record); err != nil {
+		return RemovalCleanupRecord{}, err
+	}
+	return record, nil
+}
+
+func MarkStandaloneNativeRecovery(anchorPath string) error {
+	record, exists, err := ReadRemovalCleanup(anchorPath)
+	if err != nil || !exists || record.Context != RemovalContextStandaloneNative {
+		return ErrRemovalCleanupUnsafe
+	}
+	if record.NativeRecoveryRequired {
+		return nil
+	}
+	record.NativeRecoveryRequired = true
+	if err := validateRemovalCleanupRecord(record); err != nil {
+		return err
+	}
+	return writeRemovalCleanupFile(RemovalCleanupPath(anchorPath), record)
+}
+
 func VerifyRemovalCleanupAbsent(record RemovalCleanupRecord) error {
 	if err := validateRemovalCleanupRecord(record); err != nil {
 		return err
@@ -650,7 +826,10 @@ func VerifyRemovalCleanupAbsent(record RemovalCleanupRecord) error {
 }
 
 func validateRemovalCleanupRecord(record RemovalCleanupRecord) error {
-	if record.SchemaVersion != removalCleanupSchemaVersion || record.Operation != "remove-open-codex" ||
+	if record.SchemaVersion != removalCleanupSchemaVersion ||
+		(record.Context != RemovalContextIntegrated && record.Context != RemovalContextStandaloneNative) ||
+		(record.Context == RemovalContextIntegrated && record.Operation != "remove-open-codex") ||
+		(record.Context == RemovalContextStandaloneNative && record.Operation != "remove-open-codex-native") ||
 		(record.Phase != RemovalCleanupPhaseIntent && record.Phase != RemovalCleanupPhaseDataOutcome &&
 			record.Phase != RemovalCleanupPhaseDataRefresh && record.Phase != RemovalCleanupPhasePackagePending &&
 			record.Phase != RemovalCleanupPhasePackageInFlight && record.Phase != RemovalCleanupPhasePackageVerified) ||
@@ -667,6 +846,25 @@ func validateRemovalCleanupRecord(record RemovalCleanupRecord) error {
 		!filepath.IsAbs(record.PackageRoot) || filepath.Clean(record.PackageRoot) != record.PackageRoot || !hasOpenCodexPackageSuffix(record.PackageRoot) ||
 		len(record.Launchers) > 4 {
 		return ErrRemovalCleanupUnsafe
+	}
+	if record.Context == RemovalContextIntegrated {
+		if record.NativeOriginBoundaryRevision != "" || record.NativeOriginState != "" || record.NativeVerifiedBoundaryRevision != "" ||
+			record.NativeRestoreFingerprint != "" || record.NativeInventoryRevision != "" || record.NativeState != "" ||
+			record.NativeRecoveryRequired || record.TeardownCompleted {
+			return ErrRemovalCleanupUnsafe
+		}
+	} else {
+		if !isFingerprint(record.NativeOriginBoundaryRevision) ||
+			(record.NativeOriginState != "opencodex" && record.NativeOriginState != "native") ||
+			!isFingerprint(record.NativeRestoreFingerprint) ||
+			(record.Mode == RemovalModePreserveData && record.NativeInventoryRevision != "") ||
+			(record.Mode == RemovalModeTrashSelected && !isFingerprint(record.NativeInventoryRevision)) ||
+			(record.NativeState != "opencodex" && record.NativeState != "native") ||
+			(record.NativeVerifiedBoundaryRevision != "" && !isFingerprint(record.NativeVerifiedBoundaryRevision)) ||
+			(record.NativeVerifiedBoundaryRevision != "" && record.NativeState != "native") ||
+			(!record.TeardownCompleted && record.NativeVerifiedBoundaryRevision != "" && record.Phase != RemovalCleanupPhaseIntent) {
+			return ErrRemovalCleanupUnsafe
+		}
 	}
 	if record.ActiveExecution != nil {
 		active := record.ActiveExecution
@@ -689,12 +887,27 @@ func validateRemovalCleanupRecord(record RemovalCleanupRecord) error {
 				record.ExecutionBootSession != "" || record.ProcessReconciledAfterReboot {
 				return ErrRemovalCleanupUnsafe
 			}
-		case RemovalExecutionTrash:
-			if record.Phase != RemovalCleanupPhaseIntent || record.Mode != RemovalModeTrashSelected ||
+		case RemovalExecutionNativeRestore:
+			if record.Context != RemovalContextStandaloneNative || record.Phase != RemovalCleanupPhaseIntent ||
+				!record.TeardownCompleted || record.NativeVerifiedBoundaryRevision != "" ||
 				record.PackageAttempt != 0 || record.ExecutionBootSession != "" || record.ProcessReconciledAfterReboot {
 				return ErrRemovalCleanupUnsafe
 			}
+		case RemovalExecutionTrash:
+			if record.Phase != RemovalCleanupPhaseIntent || record.Mode != RemovalModeTrashSelected ||
+				record.PackageAttempt != 0 || record.ExecutionBootSession != "" || record.ProcessReconciledAfterReboot ||
+				record.Context == RemovalContextStandaloneNative && !record.TeardownCompleted {
+				return ErrRemovalCleanupUnsafe
+			}
 		}
+	}
+	if record.Context == RemovalContextStandaloneNative &&
+		(record.Phase != RemovalCleanupPhaseIntent || record.ActiveExecution != nil && record.ActiveExecution.Kind != RemovalExecutionTeardown && record.ActiveExecution.Kind != RemovalExecutionNativeRestore) &&
+		record.NativeVerifiedBoundaryRevision == "" {
+		return ErrRemovalCleanupUnsafe
+	}
+	if record.Context == RemovalContextStandaloneNative && record.Phase != RemovalCleanupPhaseIntent && !record.TeardownCompleted {
+		return ErrRemovalCleanupUnsafe
 	}
 	if record.ExecutionResolution == "" && record.ResolutionRequiresRoutingRecovery ||
 		record.ExecutionResolution != "" && (!validRemovalExecutionResolution(record.ExecutionResolution) ||
@@ -946,7 +1159,7 @@ func validRemovalExecutionTransition(previous, next RemovalCleanupRecord) bool {
 			return false
 		}
 		switch active.Kind {
-		case RemovalExecutionTeardown, RemovalExecutionTrash:
+		case RemovalExecutionTeardown, RemovalExecutionNativeRestore, RemovalExecutionTrash:
 			if active.Kind == RemovalExecutionTeardown {
 				previousCore.OperationRetryPending = nextCore.OperationRetryPending
 			}
@@ -980,6 +1193,10 @@ func validRemovalExecutionTransition(previous, next RemovalCleanupRecord) bool {
 		switch active.Kind {
 		case RemovalExecutionTeardown:
 			return previous.Phase == RemovalCleanupPhaseIntent && next.Phase == previous.Phase &&
+				sameRemovalCleanupRecord(previousCore, nextCore)
+		case RemovalExecutionNativeRestore:
+			return previous.Context == RemovalContextStandaloneNative && previous.Phase == RemovalCleanupPhaseIntent &&
+				next.Phase == previous.Phase &&
 				sameRemovalCleanupRecord(previousCore, nextCore)
 		case RemovalExecutionTrash:
 			if next.Phase == previous.Phase {
@@ -1019,7 +1236,14 @@ func validRemovalExecutionTransition(previous, next RemovalCleanupRecord) bool {
 
 func validRemovalRefreshSupersession(previous, next RemovalCleanupRecord) bool {
 	if previous.SchemaVersion != next.SchemaVersion || previous.Operation != next.Operation ||
+		previous.Context != next.Context ||
 		previous.InstallationID != next.InstallationID || previous.Fingerprint != next.Fingerprint ||
+		previous.NativeOriginBoundaryRevision != next.NativeOriginBoundaryRevision ||
+		previous.NativeOriginState != next.NativeOriginState ||
+		previous.NativeVerifiedBoundaryRevision != next.NativeVerifiedBoundaryRevision ||
+		previous.NativeRestoreFingerprint != next.NativeRestoreFingerprint ||
+		previous.NativeState != next.NativeState || previous.NativeRecoveryRequired != next.NativeRecoveryRequired ||
+		previous.TeardownCompleted != next.TeardownCompleted ||
 		previous.PackageRoot != next.PackageRoot || !sameOrderedStrings(previous.Launchers, next.Launchers) ||
 		!sameOrderedStrings(previous.RetiredItemIDs, next.RetiredItemIDs) ||
 		previous.TrashSelectionLocked != next.TrashSelectionLocked || previous.RoutingRecoveryReleased != next.RoutingRecoveryReleased ||
@@ -1058,6 +1282,11 @@ func removalCleanupMatchesCandidateRequest(record RemovalCleanupRecord, candidat
 	expected.RetiredItemIDs = append([]string(nil), record.RetiredItemIDs...)
 	expected.TrashSelectionLocked = record.TrashSelectionLocked
 	expected.ExecutionAttempt = record.ExecutionAttempt
+	expected.NativeVerifiedBoundaryRevision = record.NativeVerifiedBoundaryRevision
+	expected.NativeInventoryRevision = record.NativeInventoryRevision
+	expected.NativeState = record.NativeState
+	expected.NativeRecoveryRequired = record.NativeRecoveryRequired
+	expected.TeardownCompleted = record.TeardownCompleted
 	actual := record
 	actual.Phase = RemovalCleanupPhaseIntent
 	actual.MovedDataItems = 0
