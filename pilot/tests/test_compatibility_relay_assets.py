@@ -702,6 +702,12 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertNotIn("gh api user", publisher)
         self.assertIn("--draft=false", publisher)
         self.assertIn("isImmutable", publisher)
+        self.assertIn("isPrerelease", publisher)
+        self.assertIn("release_create_flags+=(--prerelease)", publisher)
+        self.assertIn("--release-notes-fragment FILE", publisher)
+        self.assertIn("--json body", publisher)
+        self.assertIn("GitHub release body differs from the reviewed release notes", publisher)
+        self.assertIn('gh release delete "$version"', publisher)
         self.assertIn('release_files=("$manifest" "$signature" "$notices")', publisher)
         self.assertIn('--notes-file "$release_notes"', publisher)
         self.assertNotIn('--notes "Manifest-signed', publisher)
@@ -718,6 +724,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("`1755` directories carrying only the sticky bit", publisher)
         self.assertIn("setuid/setgid", publisher)
         self.assertLess(publisher.index("verify_release_assets true"), publisher.index("--draft=false"))
+        self.assertLess(publisher.index("verify_release_body"), publisher.index("--draft=false"))
         self.assertIn('verify_release_assets false', publisher)
         self.assertIn('"compatibility_revision":4', builder)
         self.assertIn(r'\"signing_mode\":\"adhoc\"', builder)
@@ -1037,6 +1044,11 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             gh_state = root / "gh-state"
             gh_state.mkdir()
             gh_log = gh_state / "calls.log"
+            release_fragment = root / "release-fragment.md"
+            release_fragment.write_text(
+                "## What changed\n\n- Stable publisher test fragment.\n",
+                encoding="utf-8",
+            )
             fake_gh = fake_bin / "gh"
             fake_gh.write_text(
                 "#!/usr/bin/env bash\n"
@@ -1045,19 +1057,22 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "if [[ ${1:-} == api && ${2:-} == repos/* ]]; then printf 'public\\n'; exit 0; fi\n"
                 "if [[ ${1:-} == release && ${2:-} == view ]]; then\n"
                 "  [[ -f $FAKE_GH_STATE/created ]] || exit 1\n"
-                "  if [[ \" $* \" == *\" --json isDraft,isImmutable \"* ]]; then printf 'false\\ttrue\\n'; exit 0; fi\n"
-                "  if [[ \" $* \" == *\" --json isDraft \"* ]]; then cat \"$FAKE_GH_STATE/draft\"; exit 0; fi\n"
+                "  if [[ \" $* \" == *\" --json isDraft,isPrerelease,isImmutable \"* ]]; then printf '%s\\t%s\\ttrue\\n' \"$(cat \"$FAKE_GH_STATE/draft\")\" \"$(cat \"$FAKE_GH_STATE/prerelease\")\"; exit 0; fi\n"
+                "  if [[ \" $* \" == *\" --json isDraft,isPrerelease \"* ]]; then printf '%s\\t%s\\n' \"$(cat \"$FAKE_GH_STATE/draft\")\" \"$(cat \"$FAKE_GH_STATE/prerelease\")\"; exit 0; fi\n"
+                "  if [[ \" $* \" == *\" --json body \"* ]]; then if [[ ${FAKE_GH_CORRUPT_BODY:-0} == 1 ]]; then printf 'corrupted body\\n' | jq -Rs '{body:.}'; else jq -Rs '{body:.}' \"$FAKE_GH_STATE/notes\"; fi; exit 0; fi\n"
                 "  if [[ \" $* \" == *\" --json assets \"* ]]; then cat \"$FAKE_GH_STATE/assets\"; exit 0; fi\n"
                 "  exit 0\n"
                 "fi\n"
                 "if [[ ${1:-} == release && ${2:-} == create ]]; then\n"
                 "  shift 3\n"
                 "  : > \"$FAKE_GH_STATE/assets\"\n"
+                "  printf 'false\\n' > \"$FAKE_GH_STATE/prerelease\"\n"
                 "  while [[ $# -gt 0 ]]; do\n"
                 "    case $1 in\n"
                 "      --repo|--title) shift 2 ;;\n"
                 "      --notes-file) cp \"$2\" \"$FAKE_GH_STATE/notes\"; shift 2 ;;\n"
                 "      --draft|--latest=false) shift ;;\n"
+                "      --prerelease) printf 'true\\n' > \"$FAKE_GH_STATE/prerelease\"; shift ;;\n"
                 "      *) basename -- \"$1\" >> \"$FAKE_GH_STATE/assets\"; shift ;;\n"
                 "    esac\n"
                 "  done\n"
@@ -1065,7 +1080,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "  printf 'true\\n' > \"$FAKE_GH_STATE/draft\"\n"
                 "  exit 0\n"
                 "fi\n"
-                "if [[ ${1:-} == release && ${2:-} == edit ]]; then printf 'false\\n' > \"$FAKE_GH_STATE/draft\"; exit 0; fi\n"
+                "if [[ ${1:-} == release && ${2:-} == edit ]]; then printf 'false\\n' > \"$FAKE_GH_STATE/draft\"; if [[ ${FAKE_GH_CORRUPT_AFTER_EDIT:-0} == 1 ]]; then printf 'true\\n' > \"$FAKE_GH_STATE/prerelease\"; fi; exit 0; fi\n"
+                "if [[ ${1:-} == release && ${2:-} == delete ]]; then : > \"$FAKE_GH_STATE/deleted\"; rm -f \"$FAKE_GH_STATE/created\"; exit 0; fi\n"
                 "exit 2\n",
                 encoding="utf-8",
             )
@@ -1080,6 +1096,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 str(output),
                 "--public-key",
                 str(public_key),
+                "--release-notes-fragment",
+                str(release_fragment),
             ]
             publish_environment = os.environ | {
                 "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
@@ -1101,6 +1119,76 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             self.assertNotIn("release create", gh_log.read_text(encoding="utf-8"))
             built_notices.write_bytes(original_notices)
 
+            for invalid_version in (
+                "01.2.3",
+                "1.02.3",
+                "1.2.03",
+                "1.2.3-01",
+                "1.2.3-rc..1",
+                "1.2.3-rc.",
+            ):
+                invalid_publish = subprocess.run(
+                    [
+                        "bash",
+                        str(RELAY / "scripts" / "publish-github-release.sh"),
+                        invalid_version,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=publish_environment,
+                )
+                self.assertNotEqual(invalid_publish.returncode, 0)
+                self.assertIn("strict SemVer", invalid_publish.stderr)
+
+            corrupt_body_state = root / "gh-corrupt-body-state"
+            corrupt_body_state.mkdir()
+            corrupt_body_log = corrupt_body_state / "calls.log"
+            corrupt_body_environment = publish_environment | {
+                "FAKE_GH_LOG": str(corrupt_body_log),
+                "FAKE_GH_STATE": str(corrupt_body_state),
+                "FAKE_GH_CORRUPT_BODY": "1",
+            }
+            corrupt_body_publish = subprocess.run(
+                publish_command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=corrupt_body_environment,
+            )
+            self.assertNotEqual(corrupt_body_publish.returncode, 0)
+            self.assertIn(
+                "release body differs from the reviewed release notes",
+                corrupt_body_publish.stderr,
+            )
+            corrupt_body_calls = corrupt_body_log.read_text(encoding="utf-8")
+            self.assertIn("release delete", corrupt_body_calls)
+            self.assertNotIn("release edit", corrupt_body_calls)
+            self.assertTrue((corrupt_body_state / "deleted").is_file())
+
+            corrupt_final_state = root / "gh-corrupt-final-state"
+            corrupt_final_state.mkdir()
+            corrupt_final_log = corrupt_final_state / "calls.log"
+            corrupt_final_environment = publish_environment | {
+                "FAKE_GH_LOG": str(corrupt_final_log),
+                "FAKE_GH_STATE": str(corrupt_final_state),
+                "FAKE_GH_CORRUPT_AFTER_EDIT": "1",
+            }
+            corrupt_final_publish = subprocess.run(
+                publish_command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=corrupt_final_environment,
+            )
+            self.assertNotEqual(corrupt_final_publish.returncode, 0)
+            corrupt_final_calls = corrupt_final_log.read_text(encoding="utf-8")
+            self.assertLess(
+                corrupt_final_calls.index("release edit"),
+                corrupt_final_calls.index("release delete"),
+            )
+            self.assertTrue((corrupt_final_state / "deleted").is_file())
+
             published = subprocess.run(
                 publish_command,
                 check=False,
@@ -1109,6 +1197,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 env=publish_environment,
             )
             self.assertEqual(published.returncode, 0, published.stderr)
+            self.assertIn("prerelease=false", published.stdout)
             self.assertIn("immutable=true", published.stdout)
             self.assertEqual(
                 set((gh_state / "assets").read_text(encoding="utf-8").splitlines()),
@@ -1116,6 +1205,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             )
             release_notes = (gh_state / "notes").read_text(encoding="utf-8")
             self.assertIn("# OpenCodex Relay 1.2.3", release_notes)
+            self.assertIn("Stable publisher test fragment.", release_notes)
+            self.assertNotIn("This is a pre-release", release_notes)
             self.assertIn("## Choose your download", release_notes)
             self.assertIn("`OpenCodexRelay.app.zip`", release_notes)
             self.assertIn("## Install or update", release_notes)
@@ -1135,6 +1226,102 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             self.assertNotIn("__REPOSITORY__", release_notes)
             gh_calls = gh_log.read_text(encoding="utf-8")
             self.assertLess(gh_calls.index("release create"), gh_calls.index("release edit"))
+            self.assertNotIn("--prerelease", gh_calls)
+
+            prerelease_version = "1.2.4-rc.1"
+            prerelease_output = root / "prerelease-output"
+            prerelease_output.mkdir()
+            for artifact in output.iterdir():
+                if artifact.name.startswith("manifest-"):
+                    continue
+                shutil.copy2(artifact, prerelease_output / artifact.name)
+            prerelease_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            prerelease_manifest["version"] = prerelease_version
+            for entry in [
+                *prerelease_manifest["artifacts"],
+                *prerelease_manifest["documents"],
+            ]:
+                entry["url"] = entry["url"].replace(
+                    "/releases/download/1.2.3/",
+                    f"/releases/download/{prerelease_version}/",
+                )
+            prerelease_manifest_path = (
+                prerelease_output / f"manifest-{prerelease_version}.json"
+            )
+            prerelease_manifest_path.write_text(
+                json.dumps(prerelease_manifest, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            prerelease_signature = subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-sign",
+                    "-rawin",
+                    "-inkey",
+                    str(private_key),
+                    "-in",
+                    str(prerelease_manifest_path),
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            (
+                prerelease_output / f"manifest-{prerelease_version}.sig"
+            ).write_text(
+                base64.b64encode(prerelease_signature).decode("ascii") + "\n",
+                encoding="ascii",
+            )
+            prerelease_fragment = root / "prerelease-fragment.md"
+            prerelease_fragment.write_text(
+                "## What changed\n\n- First-run Settings CTA evaluation.\n",
+                encoding="utf-8",
+            )
+            prerelease_state = root / "gh-prerelease-state"
+            prerelease_state.mkdir()
+            prerelease_log = prerelease_state / "calls.log"
+            prerelease_environment = publish_environment | {
+                "FAKE_GH_LOG": str(prerelease_log),
+                "FAKE_GH_STATE": str(prerelease_state),
+            }
+            prerelease_publish = subprocess.run(
+                [
+                    "bash",
+                    str(RELAY / "scripts" / "publish-github-release.sh"),
+                    prerelease_version,
+                    "--repo",
+                    "owner/private-release",
+                    "--input",
+                    str(prerelease_output),
+                    "--public-key",
+                    str(public_key),
+                    "--release-notes-fragment",
+                    str(prerelease_fragment),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=prerelease_environment,
+            )
+            self.assertEqual(
+                prerelease_publish.returncode,
+                0,
+                prerelease_publish.stderr,
+            )
+            self.assertIn("prerelease=true", prerelease_publish.stdout)
+            self.assertEqual(
+                (prerelease_state / "prerelease").read_text(encoding="utf-8"),
+                "true\n",
+            )
+            prerelease_notes = (prerelease_state / "notes").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("This is a pre-release", prerelease_notes)
+            self.assertIn("First-run Settings CTA evaluation.", prerelease_notes)
+            self.assertIn(
+                "--prerelease",
+                prerelease_log.read_text(encoding="utf-8"),
+            )
 
     def test_private_github_release_installs_only_after_api_redirect_and_signature_checks(self) -> None:
         installer_path = RELAY / "scripts" / "install-relay.sh"

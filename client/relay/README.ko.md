@@ -400,11 +400,17 @@ lightweight strict-SemVer tag만 public `novelKR/OpenCodex-OCI-Gateway` 저장�
 시작합니다. preflight는 tag가 현재 public `main`과 일치하는지, exact commit의 `linux`,
 `macos`, `analyze`가 성공했는지와 같은 version release가 없는지를 확인합니다. job token은
 저장소 관리용 immutable-release 설정을 읽을 수 없으므로 운영자가 tag 전에 이를 활성화하고
-확인합니다. publisher는 게시 직후 release의 immutable 상태를 검증하고 실패 시 새 release를
-삭제합니다. 보호된 `relay-release` Environment의 v2 Ed25519 private key는 macOS build
+확인합니다. publisher는 게시 직후 release의 immutable 상태를 검증하고 실패 시 제한된 삭제를
+시도합니다. 보호된 `relay-release` Environment의 v2 Ed25519 private key는 macOS build
 step에서만 사용하며 tracked public key와 일치해야 합니다. CI는 정확히 8개 asset과 GitHub
 build provenance를 만들고 검증한 뒤 immutable release를 게시합니다. 이 public CI 경로의
 최초 version은 `0.3.6`입니다.
+draft 생성 이후 실패하면 publisher는 제한된 release 삭제를 시도합니다. 이미 immutable
+상태여서 GitHub가 삭제를 거부하면 CI가 해소되지 않은 공개 상태를 보고하며, 이를 수동으로
+해소할 때까지 client 등록을 중단해야 합니다.
+`0.3.8-rc.1`처럼 SemVer suffix가 있는 tag는 GitHub pre-release로 게시되고 그대로
+readback되어야 합니다. 새 tag마다 `client/relay/release-notes/VERSION.md`에 제한된 크기의
+version별 설명을 추가하며, CI는 검토된 조각을 공통 설치·검증 안내 앞에 포함합니다.
 
 소비 host에서는 `install-relay.sh --github-repo novelKR/OpenCodex-OCI-Gateway`와
 `config/trust/opencodex-relay-release-ed25519.pub`를 사용합니다. 익명 API rate limit이 부족할

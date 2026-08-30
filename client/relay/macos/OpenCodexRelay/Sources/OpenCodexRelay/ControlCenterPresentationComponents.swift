@@ -1,4 +1,5 @@
 import SwiftUI
+import OpenCodexRelayCore
 import OpenCodexRelayLocalization
 
 enum ControlCenterPresentationMetrics {
@@ -24,6 +25,29 @@ enum ControlCenterStatusTone: Equatable {
         statusError: SafeStatusMessage?
     ) -> Self {
         statusError == message ? .error : .neutral
+    }
+
+    static func messageTone(
+        for message: SafeStatusMessage,
+        statusError: SafeStatusMessage?,
+        integrationMessage: SafeStatusMessage?,
+        integrationAvailability: RelayIntegrationAvailability
+    ) -> Self {
+        if message == integrationMessage {
+            return integrationTone(for: integrationAvailability)
+        }
+        return statusError == message ? .error : .neutral
+    }
+
+    static func integrationTone(
+        for availability: RelayIntegrationAvailability
+    ) -> Self {
+        switch availability {
+        case .ready: .neutral
+        case .preview: .info
+        case .missing: .warning
+        case .unsafe, .invalid, .helperUnavailable: .error
+        }
     }
 
     var color: Color {
@@ -65,21 +89,35 @@ struct ControlCenterPage<Content: View>: View {
                 if let integrationMessage = model.integrationStatusMessage,
                    integrationMessage != model.message,
                    integrationMessage != model.statusError {
-                    ControlCenterNotice(tone: integrationTone) {
+                    ControlCenterNotice(
+                        tone: .integrationTone(for: model.integrationAvailability)
+                    ) {
                         SafeStatusMessageView(message: integrationMessage, localizer: localizer)
                     }
                 }
 
                 if let message = model.message {
                     ControlCenterNotice(
-                        tone: .messageTone(for: message, statusError: model.statusError)
+                        tone: .messageTone(
+                            for: message,
+                            statusError: model.statusError,
+                            integrationMessage: model.integrationStatusMessage,
+                            integrationAvailability: model.integrationAvailability
+                        )
                     ) {
                         SafeStatusMessageView(message: message, localizer: localizer)
                     }
                 }
 
                 if let statusError = model.statusError, statusError != model.message {
-                    ControlCenterNotice(tone: .error) {
+                    ControlCenterNotice(
+                        tone: .messageTone(
+                            for: statusError,
+                            statusError: statusError,
+                            integrationMessage: model.integrationStatusMessage,
+                            integrationAvailability: model.integrationAvailability
+                        )
+                    ) {
                         SafeStatusMessageView(message: statusError, localizer: localizer)
                     }
                 }
@@ -95,15 +133,6 @@ struct ControlCenterPage<Content: View>: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .controlSize(.regular)
-    }
-
-    private var integrationTone: ControlCenterStatusTone {
-        switch model.integrationAvailability {
-        case .ready: .neutral
-        case .preview: .info
-        case .missing: .warning
-        case .unsafe, .invalid, .helperUnavailable: .error
-        }
     }
 }
 

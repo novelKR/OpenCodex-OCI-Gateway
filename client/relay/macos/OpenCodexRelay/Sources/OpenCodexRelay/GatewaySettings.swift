@@ -663,6 +663,7 @@ final class GatewaySettingsController: ObservableObject {
 
     var canPrepareIntegration: Bool {
         guard !isBusy,
+              state == .integrationRequired,
               integrationInspection?.state == .integrationRequired else { return false }
         return hasCurrentCredentialMetadata &&
             GatewayInspection.isCandidateInput(draftURL) &&
@@ -671,7 +672,8 @@ final class GatewaySettingsController: ObservableObject {
     }
 
     var canRecoverIntegration: Bool {
-        !isBusy && integrationInspection?.state == .recoveryRequired
+        !isBusy && state == .recoveryRequired &&
+            integrationInspection?.state == .recoveryRequired
     }
 
     var canTest: Bool {
@@ -1118,6 +1120,9 @@ final class GatewaySettingsController: ObservableObject {
                 await refresh()
             } catch {
                 apply(error)
+                if state == .recoveryRequired {
+                    await synchronizeRecoveryInspection(using: integrationClient)
+                }
                 activityLog.record(
                     .error,
                     category: .operation,
@@ -1154,6 +1159,9 @@ final class GatewaySettingsController: ObservableObject {
                 await refresh()
             } catch {
                 apply(error)
+                if state == .recoveryRequired {
+                    await synchronizeRecoveryInspection(using: integrationClient)
+                }
                 activityLog.record(
                     .error,
                     category: .operation,
@@ -1347,6 +1355,20 @@ final class GatewaySettingsController: ObservableObject {
         default:
             state = .failed
         }
+    }
+
+    private func synchronizeRecoveryInspection(
+        using integrationClient: any SelfHostedIntegrationManaging
+    ) async {
+        guard state == .recoveryRequired else { return }
+        guard let nextInspection = try? await integrationClient.inspect(),
+              state == .recoveryRequired,
+              nextInspection.state == .recoveryRequired else { return }
+        integrationInspection = nextInspection
+        inspection = nil
+        credentialMetadata = [:]
+        credentialMetadataContext = nil
+        credentialMetadataState = .idle
     }
 
     private func refreshIntegration(requestID: Int) async {

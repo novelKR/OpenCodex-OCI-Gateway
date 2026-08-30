@@ -220,6 +220,7 @@ final class MenuBarModel: ObservableObject {
 		loginRegistration: any LoginRegistrationManaging = MainAppLoginRegistration(),
         homebrewGuard: (any HomebrewGuardManaging)? = nil,
 		bindingURL: URL? = nil,
+		helperURL: URL? = nil,
 		startsPolling: Bool = true,
 		distributionFlavor: DistributionFlavor = .current,
         runtimeMode: RelayRuntimeMode = .current,
@@ -227,7 +228,7 @@ final class MenuBarModel: ObservableObject {
         localization: LocalizationStore = LocalizationStore(),
         activityLog: RelayActivityLogStore? = nil
     ) {
-        self.helperURL = RelayctlHelperLocation.resolve()
+        self.helperURL = helperURL ?? RelayctlHelperLocation.resolve()
         self.bindingURL = bindingURL ?? RoutingBindingReader.defaultURL()
         self.injectedClient = client
         self.injectedDiscoveryClient = discoveryClient
@@ -961,8 +962,10 @@ final class MenuBarModel: ObservableObject {
     /// never searches PATH or invokes `ocx` directly: relayctl receives the
     /// fingerprinted absolute executable and carries out the selected action.
     func addLocalOpenCodexBackend() {
+        guard requireOpenCodexDiscoveryAccess() else { return }
         guard resolveSelectedDesktopTarget(missingKey: .messageDesktopNotSelectedHandoff) != nil else { return }
         guard let discoveryClient = configuredOpenCodexDiscoveryClient(), !isBusy else { return }
+        guard requireOpenCodexDiscoveryAccess() else { return }
         isBusy = true
         openCodexDiscoveryState = .searching(.a)
         Task { [weak self] in
@@ -970,18 +973,21 @@ final class MenuBarModel: ObservableObject {
             defer { self.isBusy = false }
             do {
                 let tierA = try await discoveryClient.discover(tier: .a, broadScanApproved: false)
+                guard self.requireOpenCodexDiscoveryAccess() else { return }
                 if !tierA.candidates.isEmpty {
                     self.openCodexDiscoveryState = .candidates(tierA)
                     return
                 }
                 self.openCodexDiscoveryState = .searching(.b)
                 let tierB = try await discoveryClient.discover(tier: .b, broadScanApproved: false)
+                guard self.requireOpenCodexDiscoveryAccess() else { return }
                 if !tierB.candidates.isEmpty {
                     self.openCodexDiscoveryState = .candidates(tierB)
                 } else {
                     self.openCodexDiscoveryState = .broadScanApprovalRequired(tierB)
                 }
             } catch {
+                guard self.requireOpenCodexDiscoveryAccess() else { return }
                 let safe = self.safeMessage(for: error)
                 self.openCodexDiscoveryState = .failed(safe.code)
                 self.message = safe
@@ -991,7 +997,9 @@ final class MenuBarModel: ObservableObject {
 
     func approveBroadOpenCodexDiscovery() {
         guard case .broadScanApprovalRequired = openCodexDiscoveryState,
+              requireOpenCodexDiscoveryAccess(),
               let discoveryClient = configuredOpenCodexDiscoveryClient(),
+              requireOpenCodexDiscoveryAccess(),
               !isBusy else { return }
         isBusy = true
         openCodexDiscoveryState = .searching(.c)
@@ -1000,8 +1008,10 @@ final class MenuBarModel: ObservableObject {
             defer { self.isBusy = false }
             do {
                 let result = try await discoveryClient.discover(tier: .c, broadScanApproved: true)
+                guard self.requireOpenCodexDiscoveryAccess() else { return }
                 self.openCodexDiscoveryState = result.candidates.isEmpty ? .notFound(result) : .candidates(result)
             } catch {
+                guard self.requireOpenCodexDiscoveryAccess() else { return }
                 let safe = self.safeMessage(for: error)
                 self.openCodexDiscoveryState = .failed(safe.code)
                 self.message = safe
@@ -1021,10 +1031,12 @@ final class MenuBarModel: ObservableObject {
         }
     }
 
-    func chooseDiscoveredOpenCodexCandidate(id: String) {
+    @discardableResult
+    func chooseDiscoveredOpenCodexCandidate(id: String) -> Bool {
+        guard requireOpenCodexDiscoveryAccess() else { return false }
         guard let candidate = discoveredOpenCodexCandidates.first(where: { $0.id == id }) else {
             message = SafeStatusMessage(code: "ocx_selection_invalid", key: .messageOCXSelectionInvalid)
-            return
+            return false
         }
         do {
             openCodexRemovalFlow = OpenCodexRemovalFlow(
@@ -1035,12 +1047,15 @@ final class MenuBarModel: ObservableObject {
             Task { [weak self] in
                 await self?.refreshHomebrewGuardAvailability(for: candidate)
             }
+            return true
         } catch {
             message = SafeStatusMessage(code: "ocx_selection_invalid", key: .messageOCXSelectionInvalid)
+            return false
         }
     }
 
     func selectOpenCodexExecutableManually() {
+        guard requireOpenCodexDiscoveryAccess() else { return }
         let panel = NSOpenPanel()
         panel.title = localizer.text(.panelOpenCodexTitle)
         panel.message = localizer.text(.panelOpenCodexMessage)
@@ -2100,6 +2115,26 @@ final class MenuBarModel: ObservableObject {
             executableURL: helperURL,
             additionalArguments: ["--config", binding.relayConfig]
         )
+    }
+
+    /// Discovery is an integration-owned operation even when a test or local
+    /// development build injects its discovery transport. Re-read the binding
+    /// before every direct entry point and after every asynchronous result so a
+    /// removed or replaced binding cannot leave stale discovery controls live.
+    private func requireOpenCodexDiscoveryAccess() -> Bool {
+        let availability = refreshedIntegrationAvailability()
+        guard availability.permitsManagedOperations else {
+            openCodexDiscoveryState = .idle
+            applyIntegrationFailure()
+            reportBindingFailure()
+            return false
+        }
+        guard canRequestRouting else {
+            openCodexDiscoveryState = .idle
+            message = routingPreflightFailureMessage()
+            return false
+        }
+        return true
     }
 
     private func configuredOpenCodexRemovalClient() -> (any OpenCodexRemovalExecuting)? {

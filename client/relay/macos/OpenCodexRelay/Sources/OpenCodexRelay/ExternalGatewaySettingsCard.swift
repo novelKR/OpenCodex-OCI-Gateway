@@ -2,6 +2,35 @@ import SwiftUI
 import OpenCodexRelayCore
 import OpenCodexRelayLocalization
 
+enum GatewaySettingsActionMode: Equatable {
+    case prepare
+    case recover
+    case testAndApply
+
+    static func resolve(
+        state: GatewaySettingsState,
+        integrationState: SelfHostedIntegrationState?
+    ) -> Self {
+        switch state {
+        case .integrationRequired:
+            return .prepare
+        case .recoveryRequired:
+            return .recover
+        case .applying:
+            switch integrationState {
+            case .integrationRequired:
+                return .prepare
+            case .recoveryRequired:
+                return .recover
+            case .ready, .none:
+                return .testAndApply
+            }
+        default:
+            return .testAndApply
+        }
+    }
+}
+
 struct ExternalGatewaySettingsCard: View {
     @ObservedObject var controller: GatewaySettingsController
     let localizer: AppLocalizer
@@ -86,24 +115,27 @@ struct ExternalGatewaySettingsCard: View {
                 )
 
                 ControlCenterActionFooter {
-                    if controller.canRecoverIntegration {
-                        Button(localizer.text(.gatewayIntegrationRecover)) {
-                            controller.recoverIntegration()
-                        }
-                    } else {
+                    if actionMode == .testAndApply {
                         Button(localizer.text(.gatewayConnectionTest)) {
                             controller.test()
                         }
                         .disabled(!controller.canTest)
                     }
                 } primary: {
-                    if controller.integrationInspection?.state == .integrationRequired {
+                    switch actionMode {
+                    case .prepare:
                         Button(localizer.text(.gatewayIntegrationPrepare)) {
                             controller.prepareIntegration()
                         }
                         .buttonStyle(.glassProminent)
                         .disabled(!controller.canPrepareIntegration)
-                    } else {
+                    case .recover:
+                        Button(localizer.text(.gatewayIntegrationRecover)) {
+                            controller.recoverIntegration()
+                        }
+                        .buttonStyle(.glassProminent)
+                        .disabled(!controller.canRecoverIntegration)
+                    case .testAndApply:
                         Button(localizer.text(.gatewayApply)) {
                             controller.apply()
                         }
@@ -275,6 +307,13 @@ struct ExternalGatewaySettingsCard: View {
         case .cloudflareAccessAndGatewayAPIKey:
             .gatewayAuthenticationCloudflareDetail
         }
+    }
+
+    private var actionMode: GatewaySettingsActionMode {
+        GatewaySettingsActionMode.resolve(
+            state: controller.state,
+            integrationState: controller.integrationInspection?.state
+        )
     }
 
     private var statusKey: AppStringKey {

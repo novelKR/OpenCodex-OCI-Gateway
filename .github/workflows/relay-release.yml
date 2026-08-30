@@ -38,7 +38,21 @@ jobs:
             printf 'ERROR: Relay release must run from a tag\n' >&2
             exit 1
           }
-          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || {
+          validate_release_version() {
+            local value="$1"
+            local prerelease
+            local identifier
+            local -a identifiers
+            [[ "$value" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?$ ]] || return 1
+            if [[ "$value" == *-* ]]; then
+              prerelease="${value#*-}"
+              IFS='.' read -r -a identifiers <<< "$prerelease"
+              for identifier in "${identifiers[@]}"; do
+                [[ ! "$identifier" =~ ^[0-9]+$ || "$identifier" == 0 || "$identifier" != 0* ]] || return 1
+              done
+            fi
+          }
+          validate_release_version "$version" || {
             printf 'ERROR: Relay release tag must be strict SemVer without a v prefix\n' >&2
             exit 1
           }
@@ -287,7 +301,8 @@ jobs:
           ./client/relay/scripts/publish-github-release.sh "$version" \
             --repo "$RELEASE_REPOSITORY" \
             --input "${{ steps.build.outputs.artifact_dir }}" \
-            --public-key "$RELEASE_PUBLIC_KEY"
+            --public-key "$RELEASE_PUBLIC_KEY" \
+            --release-notes-fragment "client/relay/release-notes/${version}.md"
           release_url="$(gh release view "$version" --repo "$RELEASE_REPOSITORY" --json url --jq .url)"
           printf 'release_url=%s\n' "$release_url" >> "$GITHUB_OUTPUT"
           {
