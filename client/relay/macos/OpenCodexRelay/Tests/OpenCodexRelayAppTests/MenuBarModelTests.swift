@@ -1138,6 +1138,133 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(blockedCalls.discoveries, 0)
     }
 
+    func testStandaloneManualCandidateExplainsReasonAndCopiesOnlyBoundedDiagnostics() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let native = NativeRemovalClient(
+            discovery: try nativeManualDiscoveryResult(reason: .unreviewedPackageClosure),
+            inspection: try nativeRemovalInspection()
+        )
+        let activityLog = RelayActivityLogStore(subsystem: "test.relay.manual-diagnostics")
+        let model = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("routing-binding.json"),
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization(),
+            activityLog: activityLog
+        )
+
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+            return false
+        }
+        let candidate = try XCTUnwrap(model.discoveredOpenCodexCandidatePresentations.first)
+        XCTAssertFalse(candidate.automaticRemovalEligible)
+        XCTAssertEqual(candidate.automaticRemovalReason, .unreviewedPackageClosure)
+        XCTAssertFalse(model.chooseDiscoveredOpenCodexCandidate(id: candidate.id))
+
+        NSPasteboard.general.clearContents()
+        model.copyOpenCodexManualRemovalDiagnostics(candidateID: candidate.id)
+        XCTAssertEqual(
+            NSPasteboard.general.string(forType: .string),
+            "version=2.22.0\nmanager=homebrew\nautomatic_removal_reason=unreviewed_package_closure"
+        )
+        XCTAssertTrue(activityLog.events.contains {
+            $0.code == "opencodex_manual_removal_diagnostics_copied" &&
+                $0.fields == [
+                    "version": "2.22.0",
+                    "manager": "homebrew",
+                    "reason": "unreviewed_package_closure",
+                ]
+        })
+    }
+
+    func testStandaloneManualCandidateFitsCommonWidthsInEnglishAndKorean() async throws {
+        for selection in [AppLanguageSelection.english, .korean] {
+            let appURL = try makeAppBundle()
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer {
+                try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: root)
+            }
+            let helper = root.appendingPathComponent("opencodex-relayctl")
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+            let native = NativeRemovalClient(
+                discovery: try nativeManualDiscoveryResult(reason: .unreviewedPackageClosure),
+                inspection: try nativeRemovalInspection()
+            )
+            let localization = LocalizationStore()
+            localization.selection = selection
+            let model = MenuBarModel(
+                client: nil,
+                nativeRemovalClient: native,
+                targetStore: TargetStore(DesktopTarget(url: appURL)),
+                desktopApplication: DesktopController(runningValues: []),
+                desktopTrustPolicy: trustedPolicy,
+                desktopTrustValidator: TrustValidator(),
+                desktopDiscoverer: DesktopDiscoverer(),
+                loginRegistration: LoginRegistration(),
+                bindingURL: root.appendingPathComponent("routing-binding.json"),
+                helperURL: helper,
+                startsPolling: false,
+                runtimeMode: .managed,
+                localization: localization
+            )
+
+            model.addLocalOpenCodexBackend()
+            try await waitUntil {
+                if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+                return false
+            }
+            XCTAssertFalse(localization.localizer.text(.menuDiscoveryCopyDiagnosticsAccessibility).isEmpty)
+            XCTAssertFalse(localization.localizer.text(.menuDiscoveryCopyDiagnosticsHint).isEmpty)
+
+            for width in [CGFloat(800), 600, 320] {
+                let hostingView = NSHostingView(
+                    rootView: LocalOpenCodexControlCenterPage(
+                        model: model,
+                        localizer: localization.localizer,
+                        title: localization.localizer.text(.controlCenterLocalOpenCodex),
+                        systemImage: "shippingbox",
+                        openMaintenance: {},
+                        openSettings: {}
+                    )
+                    .environmentObject(localization)
+                    .frame(width: width)
+                )
+                hostingView.layoutSubtreeIfNeeded()
+                XCTAssertGreaterThan(hostingView.fittingSize.height, 80)
+                XCTAssertLessThanOrEqual(
+                    hostingView.fittingSize.width,
+                    width,
+                    "manual candidate exceeded \(width)pt for \(selection)"
+                )
+            }
+        }
+    }
+
     func testStandaloneNativeRemovalCompletesWithoutCreatingRelayIntegrationAssets() async throws {
         let appURL = try makeAppBundle()
         let root = FileManager.default.temporaryDirectory
@@ -5488,6 +5615,15 @@ final class MenuBarModelTests: XCTestCase {
     ) throws -> OpenCodexNativeDiscoveryResult {
         let source = Data("""
         {"schema_version":1,"operation":"discover-open-codex-native","context":"standalone_native","status":"ready","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"opencodex","native_recovery_required":false,"candidates":[{"installation_id":"0123456789abcdef01234567","installation_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","native_restore_fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","version":"2.22.0","manager":"npm","removal_capability":"exact_npm","removal_authority":"automatic","data_capability":"\(dataCapability)","automatic_removal_eligible":true,"homebrew_guard_required":false}],"rejected":0,"truncated":false}
+        """.utf8)
+        return try JSONDecoder().decode(OpenCodexNativeDiscoveryResult.self, from: source).validated()
+    }
+
+    private func nativeManualDiscoveryResult(
+        reason: OpenCodexAutomaticRemovalReason
+    ) throws -> OpenCodexNativeDiscoveryResult {
+        let source = Data("""
+        {"schema_version":2,"operation":"discover-open-codex-native","context":"standalone_native","status":"ready","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"opencodex","native_recovery_required":false,"candidates":[{"installation_id":"0123456789abcdef01234567","installation_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","native_restore_fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","version":"2.22.0","manager":"homebrew","removal_capability":"manual","removal_authority":"manual","data_capability":"preserve_only","automatic_removal_eligible":false,"automatic_removal_reason":"\(reason.rawValue)","homebrew_guard_required":false}],"rejected":0,"truncated":false}
         """.utf8)
         return try JSONDecoder().decode(OpenCodexNativeDiscoveryResult.self, from: source).validated()
     }

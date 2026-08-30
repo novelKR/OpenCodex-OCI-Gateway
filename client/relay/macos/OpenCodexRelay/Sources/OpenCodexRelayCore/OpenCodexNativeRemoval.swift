@@ -16,6 +16,19 @@ public enum OpenCodexNativeReadStatus: String, Codable, Equatable, Sendable {
     case recoveryRequired = "recovery_required"
 }
 
+public enum OpenCodexAutomaticRemovalReason: String, Codable, Equatable, Sendable {
+    case eligible
+    case unreviewedPackageClosure = "unreviewed_package_closure"
+    case unsupportedPackageVersion = "unsupported_package_version"
+    case packageModuleChanged = "package_module_changed"
+    case executionEvidenceIncomplete = "execution_evidence_incomplete"
+    case manualPackageManager = "manual_package_manager"
+    case identityUnverified = "identity_unverified"
+    // Schema 1 did not include a reason. This value is app-local and is never
+    // accepted from a schema 2 relayctl response.
+    case verificationUnavailable = "verification_unavailable"
+}
+
 public enum OpenCodexNativeRemovalContractError: LocalizedError, Equatable, Sendable {
     case invalidDiscovery
     case invalidSelection
@@ -158,6 +171,7 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
     public let removalAuthority: OpenCodexRemovalAuthority
     public let dataCapability: OpenCodexDataCapability?
     public let automaticRemovalEligible: Bool
+    public let automaticRemovalReason: OpenCodexAutomaticRemovalReason?
     public let homebrewGuardRequired: Bool
     public let homebrewGuard: OpenCodexNativeHomebrewGuardSnapshot?
 
@@ -173,6 +187,7 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
         case removalAuthority = "removal_authority"
         case dataCapability = "data_capability"
         case automaticRemovalEligible = "automatic_removal_eligible"
+        case automaticRemovalReason = "automatic_removal_reason"
         case homebrewGuardRequired = "homebrew_guard_required"
         case homebrewGuard = "homebrew_guard"
     }
@@ -188,7 +203,8 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
         dataCapability: OpenCodexDataCapability?,
         automaticRemovalEligible: Bool,
         homebrewGuardRequired: Bool,
-        homebrewGuard: OpenCodexNativeHomebrewGuardSnapshot?
+        homebrewGuard: OpenCodexNativeHomebrewGuardSnapshot?,
+        automaticRemovalReason: OpenCodexAutomaticRemovalReason? = nil
     ) throws {
         guard NativeRemovalValidation.isLowercaseHex(installationID, count: 24),
               NativeRemovalValidation.isLowercaseHex(installationFingerprint, count: 64),
@@ -209,9 +225,12 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
             guard nativeRestoreFingerprint != nil,
                   removalAuthority == .automatic,
                   removalCapability == .exactNPM || removalCapability == .homebrewGuardedNPM,
-                  dataCapability == .preserveOnly || dataCapability == .selectiveTrashV1 else {
+                  dataCapability == .preserveOnly || dataCapability == .selectiveTrashV1,
+                  automaticRemovalReason == nil || automaticRemovalReason == .eligible else {
                 throw OpenCodexNativeRemovalContractError.invalidDiscovery
             }
+        } else if automaticRemovalReason == .eligible {
+            throw OpenCodexNativeRemovalContractError.invalidDiscovery
         }
         self.installationID = installationID
         self.installationFingerprint = installationFingerprint
@@ -222,6 +241,7 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
         self.removalAuthority = removalAuthority
         self.dataCapability = dataCapability
         self.automaticRemovalEligible = automaticRemovalEligible
+        self.automaticRemovalReason = automaticRemovalReason
         self.homebrewGuardRequired = homebrewGuardRequired
         self.homebrewGuard = homebrewGuard
     }
@@ -233,7 +253,7 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
                 "installation_id", "installation_fingerprint", "native_restore_fingerprint",
                 "version", "manager", "removal_capability", "removal_authority",
                 "data_capability", "automatic_removal_eligible", "homebrew_guard_required",
-                "homebrew_guard",
+                "homebrew_guard", "automatic_removal_reason",
             ],
             required: [
                 "installation_id", "installation_fingerprint", "version", "manager",
@@ -253,7 +273,8 @@ public struct OpenCodexNativeRemovalCandidate: Codable, Equatable, Identifiable,
             dataCapability: values.decodeIfPresent(OpenCodexDataCapability.self, forKey: .dataCapability),
             automaticRemovalEligible: values.decode(Bool.self, forKey: .automaticRemovalEligible),
             homebrewGuardRequired: values.decode(Bool.self, forKey: .homebrewGuardRequired),
-            homebrewGuard: values.decodeIfPresent(OpenCodexNativeHomebrewGuardSnapshot.self, forKey: .homebrewGuard)
+            homebrewGuard: values.decodeIfPresent(OpenCodexNativeHomebrewGuardSnapshot.self, forKey: .homebrewGuard),
+            automaticRemovalReason: values.decodeIfPresent(OpenCodexAutomaticRemovalReason.self, forKey: .automaticRemovalReason)
         )
     }
 }
@@ -284,7 +305,7 @@ public struct OpenCodexNativeDiscoveryResult: Codable, Equatable, Sendable {
     }
 
     public func validated() throws -> Self {
-        guard schemaVersion == 1,
+        guard schemaVersion == 1 || schemaVersion == 2,
               operation == "discover-open-codex-native",
               context == .standaloneNative,
               NativeRemovalValidation.isLowercaseHex(boundaryRevision, count: 64),
@@ -292,6 +313,19 @@ public struct OpenCodexNativeDiscoveryResult: Codable, Equatable, Sendable {
               rejected >= 0,
               Set(candidates.map(\.installationID)).count == candidates.count else {
             throw OpenCodexNativeRemovalContractError.invalidDiscovery
+        }
+        if schemaVersion == 1 {
+            guard candidates.allSatisfy({ $0.automaticRemovalReason == nil }) else {
+                throw OpenCodexNativeRemovalContractError.invalidDiscovery
+            }
+        } else {
+            guard candidates.allSatisfy({ candidate in
+                guard let reason = candidate.automaticRemovalReason,
+                      reason != .verificationUnavailable else { return false }
+                return candidate.automaticRemovalEligible == (reason == .eligible)
+            }) else {
+                throw OpenCodexNativeRemovalContractError.invalidDiscovery
+            }
         }
         switch status {
         case .ready:
@@ -394,7 +428,7 @@ public struct OpenCodexNativeRemovalInspection: Codable, Equatable, Sendable {
     }
 
     public func validated(for selection: OpenCodexNativeRemovalSelection) throws -> Self {
-        guard schemaVersion == 1,
+        guard schemaVersion == 1 || schemaVersion == 2,
               operation == "inspect-open-codex-native-removal",
               context == .standaloneNative,
               boundaryRevision == selection.boundaryRevision else {
@@ -410,6 +444,15 @@ public struct OpenCodexNativeRemovalInspection: Codable, Equatable, Sendable {
                   candidate.installationFingerprint == selection.installationFingerprint,
                   candidate.nativeRestoreFingerprint == selection.nativeRestoreFingerprint else {
                 throw OpenCodexNativeRemovalContractError.invalidInspection
+            }
+            if schemaVersion == 1 {
+                guard candidate.automaticRemovalReason == nil else {
+                    throw OpenCodexNativeRemovalContractError.invalidInspection
+                }
+            } else {
+                guard candidate.automaticRemovalReason == .eligible else {
+                    throw OpenCodexNativeRemovalContractError.invalidInspection
+                }
             }
         case .recoveryRequired:
             guard nativeRecoveryRequired, nativeState == .unavailable, candidate == nil else {

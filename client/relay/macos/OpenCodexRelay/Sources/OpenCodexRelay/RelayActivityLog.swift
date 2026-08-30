@@ -56,7 +56,7 @@ final class RelayActivityLogStore: ObservableObject {
         "nonrouting_cleanup_incomplete", "openai_base_url", "owner", "owner_restore_attempts", "owner_restore_result", "phase", "repair_phase",
         "configuration", "integration", "retry_exhausted",
         "relay_admission", "relay_running", "remote_gateway", "result_code", "runtime_mode",
-        "routing_sync", "schema", "section", "tier", "visible", "width",
+        "routing_sync", "schema", "section", "tier", "visible", "width", "version", "manager", "reason",
         "teardown_capability", "data_preserved",
     ]
 

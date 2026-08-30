@@ -56,7 +56,7 @@ func modeDiscoverOpenCodexNative(args []string) {
 	}
 	if boundary.recovery != nil {
 		emitNativeJSON(handoff.NativeRemovalDiscovery{
-			SchemaVersion: handoff.NativeRemovalSchemaVersion, Operation: "discover-open-codex-native",
+			SchemaVersion: handoff.NativeRemovalReadSchemaVersion, Operation: "discover-open-codex-native",
 			Context: handoff.RemovalContextStandaloneNative, Status: handoff.NativeRemovalStatusRecoveryRequired,
 			BoundaryRevision: boundary.revision, NativeState: handoff.NativeStateUnavailable,
 			NativeRecoveryRequired: true, Candidates: []handoff.NativeRemovalCandidate{},
@@ -76,7 +76,7 @@ func modeDiscoverOpenCodexNative(args []string) {
 		candidates = append(candidates, handoff.ProjectNativeRemovalCandidate(candidate))
 	}
 	emitNativeJSON(handoff.NativeRemovalDiscovery{
-		SchemaVersion: handoff.NativeRemovalSchemaVersion, Operation: "discover-open-codex-native",
+		SchemaVersion: handoff.NativeRemovalReadSchemaVersion, Operation: "discover-open-codex-native",
 		Context: handoff.RemovalContextStandaloneNative, Status: handoff.NativeRemovalStatusReady,
 		BoundaryRevision: boundary.revision, NativeState: boundary.state,
 		Candidates: candidates, Rejected: result.Rejected, Truncated: result.Truncated,
@@ -97,7 +97,7 @@ func modeInspectOpenCodexNativeRemoval(args []string) {
 	}
 	if boundary.recovery != nil {
 		emitNativeJSON(handoff.NativeRemovalInspection{
-			SchemaVersion: handoff.NativeRemovalSchemaVersion, Operation: "inspect-open-codex-native-removal",
+			SchemaVersion: handoff.NativeRemovalReadSchemaVersion, Operation: "inspect-open-codex-native-removal",
 			Context: handoff.RemovalContextStandaloneNative, Status: handoff.NativeRemovalStatusRecoveryRequired,
 			BoundaryRevision: boundary.revision, NativeState: handoff.NativeStateUnavailable,
 			NativeRecoveryRequired: true,
@@ -117,7 +117,7 @@ func modeInspectOpenCodexNativeRemoval(args []string) {
 		fatal(handoff.ErrRemovalManualOnly)
 	}
 	emitNativeJSON(handoff.NativeRemovalInspection{
-		SchemaVersion: handoff.NativeRemovalSchemaVersion, Operation: "inspect-open-codex-native-removal",
+		SchemaVersion: handoff.NativeRemovalReadSchemaVersion, Operation: "inspect-open-codex-native-removal",
 		Context: handoff.RemovalContextStandaloneNative, Status: handoff.NativeRemovalStatusReady,
 		BoundaryRevision: boundary.revision, NativeState: boundary.state, Candidate: &projected,
 	})

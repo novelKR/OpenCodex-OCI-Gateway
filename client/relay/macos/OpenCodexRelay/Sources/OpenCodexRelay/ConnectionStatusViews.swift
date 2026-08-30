@@ -421,16 +421,17 @@ struct OpenCodexDiscoveryControls: View {
                 Text(localizer.text(.menuDiscoveryCandidates))
                     .font(.body.weight(.semibold))
                 ForEach(result.candidates) { candidate in
-                    Button(candidateTitle(candidate, context: result.context)) {
-                        if model.chooseDiscoveredOpenCodexCandidate(id: candidate.id) {
-                            onRemovalFlowPresented()
+                    if result.context == .standaloneNative && !candidate.automaticRemovalEligible {
+                        manualRemovalCandidate(candidate)
+                    } else {
+                        Button(candidateTitle(candidate, context: result.context)) {
+                            if model.chooseDiscoveredOpenCodexCandidate(id: candidate.id) {
+                                onRemovalFlowPresented()
+                            }
                         }
+                        .disabled(model.isBusy)
+                        .help(candidate.help ?? "")
                     }
-                    .disabled(
-                        model.isBusy ||
-                        (result.context == .standaloneNative && !candidate.automaticRemovalEligible)
-                    )
-                    .help(candidate.help ?? "")
                 }
                 if result.truncated {
                     ControlCenterSupportingText(
@@ -516,6 +517,58 @@ struct OpenCodexDiscoveryControls: View {
                 }
                 .disabled(model.isBusy)
             }
+        }
+    }
+
+    private func manualRemovalCandidate(_ candidate: OpenCodexDiscoveryCandidatePresentation) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(candidateTitle(candidate, context: .standaloneNative))
+                        .font(.body.weight(.medium))
+                    Spacer(minLength: 8)
+                    ControlCenterStatusBadge(
+                        text: localizer.text(.menuDiscoveryManualRemovalBadge),
+                        tone: .warning
+                    )
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(candidateTitle(candidate, context: .standaloneNative))
+                        .font(.body.weight(.medium))
+                    ControlCenterStatusBadge(
+                        text: localizer.text(.menuDiscoveryManualRemovalBadge),
+                        tone: .warning
+                    )
+                }
+            }
+            Text(localizer.text(reasonKey(candidate.automaticRemovalReason)))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                model.copyOpenCodexManualRemovalDiagnostics(candidateID: candidate.id)
+            } label: {
+                Label(localizer.text(.menuDiscoveryCopyDiagnostics), systemImage: "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.isBusy)
+            .accessibilityLabel(localizer.text(.menuDiscoveryCopyDiagnosticsAccessibility))
+            .accessibilityHint(localizer.text(.menuDiscoveryCopyDiagnosticsHint))
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func reasonKey(_ reason: OpenCodexAutomaticRemovalReason?) -> AppStringKey {
+        switch reason ?? .verificationUnavailable {
+        case .eligible: .menuDiscoveryReasonEligible
+        case .unreviewedPackageClosure: .menuDiscoveryReasonUnreviewedPackageClosure
+        case .unsupportedPackageVersion: .menuDiscoveryReasonUnsupportedPackageVersion
+        case .packageModuleChanged: .menuDiscoveryReasonPackageModuleChanged
+        case .executionEvidenceIncomplete: .menuDiscoveryReasonExecutionEvidenceIncomplete
+        case .manualPackageManager: .menuDiscoveryReasonManualPackageManager
+        case .identityUnverified: .menuDiscoveryReasonIdentityUnverified
+        case .verificationUnavailable: .menuDiscoveryReasonVerificationUnavailable
         }
     }
 

@@ -81,22 +81,32 @@ func TestProductionTeardownRegistryUsesExactStableProfiles(t *testing.T) {
 			t.Fatalf("profile %s adapter = %q, want %q", profile.artifactVariant, profile.adapterID, wantAdapterID)
 		}
 	}
-	if productionProfileCount != len(wantVersions)+1 {
-		t.Fatalf("production profiles = %d, want %d", productionProfileCount, len(wantVersions)+1)
+	if productionProfileCount != len(wantVersions)+2 {
+		t.Fatalf("production profiles = %d, want %d", productionProfileCount, len(wantVersions)+2)
 	}
 	for _, version := range wantVersions {
 		wantCount := 1
 		if version == "2.22.0" {
-			wantCount = 2
+			wantCount = 3
 		}
 		if profilesByVersion[version] != wantCount {
 			t.Fatalf("profiles for %s = %d, want %d", version, profilesByVersion[version], wantCount)
 		}
 	}
+	var v3 *teardownAdapterProfile
+	for index := range teardownAdapterProfiles {
+		if teardownAdapterProfiles[index].artifactVariant == "npm_2_22_0_darwin_arm64_v3" {
+			v3 = &teardownAdapterProfiles[index]
+			break
+		}
+	}
+	if v3 == nil || v3.reviewedClosureSHA256 != "9f11a0612349a286546f8a2be07b30baca8db541b79a0f2de3f8b42e14d52249" {
+		t.Fatalf("2.22.0 v3 profile = %#v", v3)
+	}
 	if got := teardownAdapterIDForVersion("2.33.0"); got != "opencodex_npm_2_33_0_preserve_v1" {
 		t.Fatalf("2.33 adapter id = %q", got)
 	}
-	for _, unsupported := range []string{"2.30.0", "2.33.0-preview.1", "2.34.0"} {
+	for _, unsupported := range []string{"2.30.0", "2.33.0-preview.1", "2.34.0", "2.35.0", "2.36.0"} {
 		if profilesByVersion[unsupported] != 0 {
 			t.Fatalf("unsupported version %s was registered", unsupported)
 		}
@@ -202,6 +212,18 @@ func TestTeardownRegistrySelectsExactFutureProfile(t *testing.T) {
 	}
 
 	if err := os.WriteFile(filepath.Join(root, "transitive.ts"), []byte("reviewed transitive module\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "transitive.ts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capability, _, reason, _, _ = inspectTeardownCompatibility(
+		context.Background(), root, npmPackageManifest{Name: OpenCodexPackageName, Version: profile.version},
+	)
+	if capability != TeardownCapabilityNone || reason != teardownCompatibilityClosureChanged {
+		t.Fatalf("changed executable mode compatibility = %q %q", capability, reason)
+	}
+	if err := os.Chmod(filepath.Join(root, "transitive.ts"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(root, "selected.ts")); err != nil {

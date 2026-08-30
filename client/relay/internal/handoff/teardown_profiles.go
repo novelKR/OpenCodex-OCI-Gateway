@@ -86,6 +86,16 @@ var teardownAdapterProfiles = []teardownAdapterProfile{
 		),
 	),
 	reviewedTeardownProfile(
+		"2.22.0", "npm_2_22_0_darwin_arm64_v3",
+		"sha512-YFWwTrHEgCEeBOsRBuFltLUdmmhf48xEQM4oaIDO9mEiWBor0wAqE0uIvj6eJpyZY0xd/Mhz8O77q9Nflp/y7A==",
+		"9f11a0612349a286546f8a2be07b30baca8db541b79a0f2de3f8b42e14d52249",
+		teardownModuleHashes(
+			"23d58fd93c12138baca76f044899d82aea45768aa38f5f78c86e957e080be06b", moduleDesired222, moduleInject222, moduleShimLegacy,
+			"299b6ebd1a6d89bc34352ac5e2fcf446e4fb7fd08da7bbd178123c85a6a8162d", moduleGrokLegacy, moduleRegistry222, moduleStateLegacy,
+			moduleWriterLegacy, moduleSystem222, "da173595e82233c5b20b78026255027004f0eea388fc66a7bf073229dd69e45e",
+		),
+	),
+	reviewedTeardownProfile(
 		"2.23.0", "npm_2_23_0_darwin_arm64_v1",
 		"sha512-oX90wP95Inh9CjxL6CL6+qPGCDWBm0WbcD4gyG+BMi+NvzmuhamVGdmsWIhJwlKd01mEMnUW6BJqmmUT/epF3A==",
 		"1114ab69f65069569a18b64ba971d211cf62a075e9997fc274e45a35f865f648",

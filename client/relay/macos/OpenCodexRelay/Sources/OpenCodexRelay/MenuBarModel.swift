@@ -101,6 +101,7 @@ struct OpenCodexDiscoveryCandidatePresentation: Equatable, Identifiable {
     let tier: OpenCodexDiscoveryTier?
     let help: String?
     let automaticRemovalEligible: Bool
+    let automaticRemovalReason: OpenCodexAutomaticRemovalReason?
 }
 
 enum OpenCodexDiscoverySnapshot: Equatable {
@@ -124,7 +125,8 @@ enum OpenCodexDiscoverySnapshot: Equatable {
                     version: $0.version,
                     tier: $0.tier,
                     help: $0.packageRoot,
-                    automaticRemovalEligible: $0.isAutomaticRemovalEligible
+                    automaticRemovalEligible: $0.isAutomaticRemovalEligible,
+                    automaticRemovalReason: nil
                 )
             }
         case let .standaloneNative(result):
@@ -135,7 +137,8 @@ enum OpenCodexDiscoverySnapshot: Equatable {
                     version: $0.version,
                     tier: nil,
                     help: nil,
-                    automaticRemovalEligible: $0.automaticRemovalEligible
+                    automaticRemovalEligible: $0.automaticRemovalEligible,
+                    automaticRemovalReason: $0.automaticRemovalReason ?? .verificationUnavailable
                 )
             }
         }
@@ -1221,6 +1224,29 @@ final class MenuBarModel: ObservableObject {
         case let .candidates(result): result.candidates
         default: []
         }
+    }
+
+    func copyOpenCodexManualRemovalDiagnostics(candidateID: String) {
+        guard case let .candidates(.standaloneNative(result)) = openCodexDiscoveryState,
+              let candidate = result.candidates.first(where: { $0.installationID == candidateID }),
+              !candidate.automaticRemovalEligible else { return }
+        let reason = candidate.automaticRemovalReason ?? .verificationUnavailable
+        let diagnostic = [
+            "version=\(candidate.version)",
+            "manager=\(candidate.manager.rawValue)",
+            "automatic_removal_reason=\(reason.rawValue)",
+        ].joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(diagnostic, forType: .string)
+        activityLog.record(
+            category: .removal,
+            code: "opencodex_manual_removal_diagnostics_copied",
+            fields: [
+                "version": candidate.version,
+                "manager": candidate.manager.rawValue,
+                "reason": reason.rawValue,
+            ]
+        )
     }
 
     @discardableResult
