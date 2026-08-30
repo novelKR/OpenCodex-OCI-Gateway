@@ -14,6 +14,7 @@ import pathlib
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -23,6 +24,7 @@ import urllib.parse
 
 REGISTRY = "https://registry.npmjs.org/"
 PACKAGE_ROOT = "@bitkyc08/opencodex"
+NPM_INSTALL_STRATEGY = "global_ignore_scripts_v1"
 MAX_PACKAGES = 256
 MAX_TARBALL_BYTES = 128 * 1024 * 1024
 MAX_METADATA_BYTES = 32 * 1024 * 1024
@@ -203,20 +205,23 @@ def canonical_field(digest: object, value: bytes) -> None:
     digest.update(value)
 
 
+def closure_entries(root: pathlib.Path):
+    """Yield the same depth-first lexical order as Go filepath.WalkDir."""
+    pending = [root]
+    while pending:
+        path = pending.pop()
+        yield path
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        children = sorted(path.iterdir(), key=lambda item: os.fsencode(item.name), reverse=True)
+        pending.extend(children)
+
+
 def closure_digest(root: pathlib.Path) -> str:
     digest = hashlib.sha256()
     canonical_field(digest, b"relay-reviewed-package-closure-v1")
-    entries = [root]
-    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
-        names.sort()
-        files.sort()
-        base = pathlib.Path(directory)
-        entries.extend(base / name for name in names + files)
-    entries = sorted(
-        set(entries),
-        key=lambda path: "." if path == root else path.relative_to(root).as_posix(),
-    )
-    for path in entries:
+    for path in closure_entries(root):
         relative = "." if path == root else path.relative_to(root).as_posix()
         info = path.lstat()
         canonical_field(digest, relative.encode())
@@ -234,14 +239,47 @@ def closure_digest(root: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def go_closure_digest(repo: pathlib.Path, root: pathlib.Path) -> str:
+    environment = os.environ.copy()
+    # macOS tempfile paths commonly begin with /var, which resolves through
+    # /private/var. The production verifier intentionally rejects a root whose
+    # spelling is not already canonical, so pass the resolved path here too.
+    environment["OPENCODEX_REVIEW_CLOSURE_ROOT"] = str(root.resolve(strict=True))
+    result = subprocess.run(
+        [
+            "go", "test", "./internal/handoff",
+            "-run", "^TestReviewedPackageClosureDigestExternalRoot$",
+            "-count=1", "-v",
+        ],
+        cwd=repo / "client/relay",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        diagnostic = (result.stdout + "\n" + result.stderr).strip()[-4_096:]
+        raise ReviewError(f"Go closure verifier failed: {diagnostic}")
+    matches = re.findall(r"reviewed_closure_sha256=([0-9a-f]{64})", result.stdout)
+    if len(matches) != 1:
+        raise ReviewError("Go closure verifier returned no unique digest")
+    return matches[0]
+
+
 def validate_manifest(manifest: dict[str, object]) -> None:
     if set(manifest) != {
-        "schema_version", "platform", "architecture", "packages", "symlinks",
-        "postinstall_transforms", "profile",
+        "schema_version", "platform", "architecture", "npm_install_strategy",
+        "npm_resolution_before", "packages", "symlinks", "postinstall_transforms", "profile",
     }:
         raise ReviewError("unexpected review manifest field")
     if manifest.get("schema_version") != 1 or manifest.get("platform") != "darwin" or manifest.get("architecture") != "arm64":
         raise ReviewError("unsupported review manifest")
+    if manifest.get("npm_install_strategy") != NPM_INSTALL_STRATEGY or re.fullmatch(
+        r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z",
+        str(manifest.get("npm_resolution_before", "")),
+    ) is None:
+        raise ReviewError("invalid npm reconstruction contract")
     packages = manifest.get("packages")
     symlinks = manifest.get("symlinks")
     transforms = manifest.get("postinstall_transforms")
@@ -316,6 +354,56 @@ def reconstruct(manifest: dict[str, object], destination: pathlib.Path, payloads
     create_symlinks(destination, manifest["symlinks"])
     for transform in manifest["postinstall_transforms"]:
         apply_transform(destination, transform)
+
+
+def reconstruct_with_npm(
+    manifest: dict[str, object],
+    temporary: pathlib.Path,
+    label: str,
+) -> pathlib.Path:
+    npm = shutil.which("npm")
+    if npm is None:
+        raise ReviewError("npm is required for installed-closure reconstruction")
+    prefix = temporary / f"npm-prefix-{label}"
+    cache = temporary / f"npm-cache-{label}"
+    home = temporary / f"npm-home-{label}"
+    home.mkdir()
+    environment = os.environ.copy()
+    environment.update({
+        "HOME": str(home),
+        "NPM_CONFIG_USERCONFIG": str(home / "user.npmrc"),
+        "NPM_CONFIG_GLOBALCONFIG": str(home / "global.npmrc"),
+        "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+    })
+    profile = manifest["profile"]
+    result = subprocess.run(
+        [
+            npm, "install", "--global",
+            "--prefix", str(prefix),
+            "--cache", str(cache),
+            "--registry", REGISTRY,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--umask", "0022",
+            "--before", str(manifest["npm_resolution_before"]),
+            f"{PACKAGE_ROOT}@{profile['package_version']}",
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        diagnostic = (result.stdout + "\n" + result.stderr).strip()[-4_096:]
+        raise ReviewError(f"isolated npm reconstruction failed: {diagnostic}")
+    root = prefix / "lib/node_modules/@bitkyc08/opencodex"
+    if not root.is_dir() or root.is_symlink():
+        raise ReviewError("isolated npm reconstruction has no regular package root")
+    for transform in manifest["postinstall_transforms"]:
+        apply_transform(root, transform)
+    return root
 
 
 def verify_adapter_preflight(repo: pathlib.Path, root: pathlib.Path, profile: dict[str, object], temporary: pathlib.Path) -> None:
@@ -412,23 +500,44 @@ def check_manifest(repo: pathlib.Path, path: pathlib.Path) -> None:
     expected_inventory = sorted((item["path"], item["name"], item["version"]) for item in packages)
     with tempfile.TemporaryDirectory(prefix="opencodex-profile-review-") as temporary_name:
         temporary = pathlib.Path(temporary_name)
-        roots = [temporary / "root-a", temporary / "root-b"]
+        registry_root = temporary / "registry-artifact-root"
+        reconstruct(manifest, registry_root, payloads)
+        if package_inventory(registry_root) != expected_inventory:
+            raise ReviewError("registry-artifact transitive package inventory differs")
+        if closure_digest(registry_root) != profile["closure_sha256"]:
+            raise ReviewError("registry-artifact closure differs")
+
+        roots = [
+            reconstruct_with_npm(manifest, temporary, "a"),
+            reconstruct_with_npm(manifest, temporary, "b"),
+        ]
         for root in roots:
-            reconstruct(manifest, root, payloads)
             if package_inventory(root) != expected_inventory:
                 raise ReviewError("reconstructed transitive package inventory differs")
             actual = closure_digest(root)
             if actual != profile["closure_sha256"]:
                 raise ReviewError(f"closure mismatch: {actual}")
+            runtime_digest = go_closure_digest(repo, root)
+            if runtime_digest != actual:
+                raise ReviewError(
+                    f"Go/Python closure digest mismatch: go={runtime_digest} python={actual}"
+                )
             for relative, expected in profile["critical_modules"].items():
                 actual_module = hashlib.sha256((root / relative).read_bytes()).hexdigest()
                 if actual_module != expected:
                     raise ReviewError(f"critical module mismatch: {relative}")
+            for symlink in manifest["symlinks"]:
+                path = root.joinpath(*safe_relative(symlink["path"]).parts)
+                if not path.is_symlink() or os.readlink(path) != symlink["target"]:
+                    raise ReviewError(f"npm symlink mismatch: {symlink['path']}")
         if closure_digest(roots[0]) != closure_digest(roots[1]):
             raise ReviewError("independent reconstruction mismatch")
         verify_adapter_preflight(repo, roots[0], profile, temporary / "preflight-a")
         verify_adapter_preflight(repo, roots[1], profile, temporary / "preflight-b")
-    print(f"profile={profile['artifact_variant']} packages={len(packages)} closure={profile['closure_sha256']} status=verified")
+    print(
+        f"profile={profile['artifact_variant']} packages={len(packages)} "
+        f"closure={profile['closure_sha256']} npm_before={manifest['npm_resolution_before']} status=verified"
+    )
 
 
 def audit_latest(repo: pathlib.Path) -> None:

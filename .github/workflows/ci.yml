@@ -51,6 +51,10 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: client/relay/go.sum
       - name: Reproduce reviewed teardown profiles
         run: client/relay/scripts/review-teardown-profiles.py --check
       - name: Swift test and build
