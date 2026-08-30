@@ -2,21 +2,31 @@ import SwiftUI
 import OpenCodexRelayCore
 import OpenCodexRelayLocalization
 
-enum LocalOpenCodexPrimaryAction: Equatable {
-    case find
-    case openSettings
+enum LocalOpenCodexPageMode: Equatable {
+    case integrated
+    case standaloneNative
     case blocked
 
-    static func resolve(_ availability: RelayIntegrationAvailability) -> Self {
-        switch availability {
-        case .ready: .find
-        case .missing: .openSettings
+    static func resolve(
+        _ availability: RelayIntegrationAvailability,
+        recoveryRequired: Bool = false
+    ) -> Self {
+        if recoveryRequired {
+            return .blocked
+        }
+        return switch availability {
+        case .ready: .integrated
+        case .missing: .standaloneNative
         case .preview, .unsafe, .invalid, .helperUnavailable: .blocked
         }
     }
 
-    static func showsDiscoveryControls(_ availability: RelayIntegrationAvailability) -> Bool {
-        availability == .ready || availability == .missing
+    var showsDiscoveryControls: Bool {
+        self == .integrated || self == .standaloneNative
+    }
+
+    var showsRelaySetupCard: Bool {
+        self == .standaloneNative
     }
 }
 
@@ -242,9 +252,35 @@ struct LocalOpenCodexControlCenterPage: View {
     let openSettings: () -> Void
 
     var body: some View {
-        ControlCenterPage(title: title, systemImage: systemImage, model: model, localizer: localizer) {
-            ControlCenterSectionCard(localizer.text(.viewLocalOpenCodex), systemImage: "shippingbox") {
-                VStack(alignment: .leading, spacing: 12) {
+        let mode = LocalOpenCodexPageMode.resolve(
+            model.integrationAvailability,
+            recoveryRequired: model.hasPendingOpenCodexRemovalRecovery ||
+                model.status?.phase == .recoveryRequired
+        )
+        ControlCenterPage(
+            title: title,
+            systemImage: systemImage,
+            model: model,
+            localizer: localizer,
+            handlesMissingIntegrationInline: mode == .standaloneNative
+        ) {
+            localManagementCard(mode: mode)
+
+            if mode.showsRelaySetupCard {
+                relaySetupCard
+            }
+        }
+    }
+
+    private func localManagementCard(
+        mode: LocalOpenCodexPageMode
+    ) -> some View {
+        ControlCenterSectionCard(
+            localizer.text(.controlCenterLocalOpenCodexManagement),
+            systemImage: "shippingbox"
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if mode == .integrated {
                     StatusRow(
                         localizer.text(.viewLocalOpenCodex),
                         value: model.localOpenCodexDisplay,
@@ -252,53 +288,39 @@ struct LocalOpenCodexControlCenterPage: View {
                         showsDivider: true
                     )
                     Divider()
-
-                    localOpenCodexPrimaryAction
-
-                    if LocalOpenCodexPrimaryAction.showsDiscoveryControls(
-                        model.integrationAvailability
-                    ) {
-                        OpenCodexDiscoveryControls(
-                            model: model,
-                            localizer: localizer,
-                            onRemovalFlowPresented: openMaintenance
-                        )
-                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
+
+                if mode == .blocked {
+                    ControlCenterSupportingText(
+                        localizer.text(.controlCenterLocalOpenCodexBlockedDetail),
+                        systemImage: "exclamationmark.triangle"
+                    )
+                } else {
+                    ControlCenterSupportingText(
+                        localizer.text(.controlCenterLocalOpenCodexManagementDetail),
+                        systemImage: "magnifyingglass"
+                    )
+
+                    discoveryAction(mode: mode)
+                }
+
+                if mode.showsDiscoveryControls {
+                    OpenCodexDiscoveryControls(
+                        model: model,
+                        localizer: localizer,
+                        onRemovalFlowPresented: openMaintenance
+                    )
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
         }
     }
 
     @ViewBuilder
-    private var localOpenCodexPrimaryAction: some View {
-        switch LocalOpenCodexPrimaryAction.resolve(model.integrationAvailability) {
-        case .openSettings:
-            ControlCenterSupportingText(
-                localizer.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
-                systemImage: "gearshape"
-            )
-            ControlCenterActionFooter {
-                EmptyView()
-            } primary: {
-                Button(action: openSettings) {
-                    Label(
-                        localizer.text(.controlCenterLocalOpenCodexOpenSettings),
-                        systemImage: "gearshape"
-                    )
-                }
-                .buttonStyle(.glassProminent)
-                .disabled(model.isBusy)
-                .accessibilityHint(
-                    localizer.text(.controlCenterLocalOpenCodexOpenSettingsHint)
-                )
-            }
-
-            ControlCenterSupportingText(
-                localizer.text(.controlCenterLocalOpenCodexNativeRemovalDetail),
-                systemImage: "arrow.uturn.backward.circle"
-            )
+    private func discoveryAction(mode: LocalOpenCodexPageMode) -> some View {
+        switch mode {
+        case .standaloneNative:
             ControlCenterActionFooter {
                 EmptyView()
             } primary: {
@@ -306,18 +328,18 @@ struct LocalOpenCodexControlCenterPage: View {
                     model.addLocalOpenCodexBackend()
                 } label: {
                     Label(
-                        localizer.text(.controlCenterLocalOpenCodexNativeRemovalAction),
-                        systemImage: "arrow.uturn.backward.circle"
+                        localizer.text(.controlCenterLocalOpenCodexInspectAction),
+                        systemImage: "magnifyingglass"
                     )
                 }
                 .buttonStyle(.glassProminent)
                 .disabled(!model.canDiscoverOpenCodex)
                 .accessibilityHint(
-                    localizer.text(.controlCenterLocalOpenCodexNativeRemovalHint)
+                    localizer.text(.controlCenterLocalOpenCodexInspectHint)
                 )
             }
 
-        case .find:
+        case .integrated:
             ControlCenterActionFooter {
                 EmptyView()
             } primary: {
@@ -330,8 +352,44 @@ struct LocalOpenCodexControlCenterPage: View {
                 .disabled(!model.canDiscoverOpenCodex)
                 .accessibilityHint(localizer.text(.menuAddLocalHint))
             }
+
         case .blocked:
             EmptyView()
+        }
+    }
+
+    private var relaySetupCard: some View {
+        ControlCenterSectionCard(
+            localizer.text(.controlCenterLocalOpenCodexRelayTitle),
+            systemImage: "network"
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                ControlCenterSupportingText(
+                    localizer.text(.controlCenterLocalOpenCodexRelayDetail),
+                    systemImage: "gearshape"
+                )
+                ControlCenterActionFooter {
+                    EmptyView()
+                } primary: {
+                    Button(action: openSettings) {
+                        Label(
+                            localizer.text(.controlCenterLocalOpenCodexRelayAction),
+                            systemImage: "gearshape"
+                        )
+                    }
+                    .disabled(model.isBusy)
+                    .accessibilityHint(
+                        localizer.text(.controlCenterLocalOpenCodexRelayHint)
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+        } accessory: {
+            ControlCenterStatusBadge(
+                text: localizer.text(.controlCenterLocalOpenCodexRelayBadge),
+                tone: .warning
+            )
         }
     }
 }

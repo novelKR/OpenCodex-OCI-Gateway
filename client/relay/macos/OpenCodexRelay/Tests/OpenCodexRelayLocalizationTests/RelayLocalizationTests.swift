@@ -140,37 +140,52 @@ final class RelayLocalizationTests: XCTestCase {
             "보호된 라우팅 binding을 사용할 수 없습니다. Codex 설정을 확인하기 전에 설정에서 Relay 준비를 진행하거나 복구가 필요한 경우 설정 복구를 사용하세요."
         )
         XCTAssertEqual(
-            english.text(.controlCenterLocalOpenCodexNativeRemovalAction),
-            "Return to Native Codex and Remove…"
+            english.text(.controlCenterLocalOpenCodexManagement),
+            "Local OpenCodex management"
         )
         XCTAssertEqual(
-            korean.text(.controlCenterLocalOpenCodexNativeRemovalAction),
-            "Native Codex로 복귀 후 제거…"
-        )
-
-        XCTAssertEqual(
-            english.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
-            "Relay setup is still required for remote gateway routing. It is not required to return a verified OpenCodex installation to Native Codex and remove it."
+            korean.text(.controlCenterLocalOpenCodexManagement),
+            "Local OpenCodex 관리"
         )
         XCTAssertEqual(
-            korean.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
-            "원격 게이트웨이 라우팅에는 Relay 설정이 필요합니다. 검증된 OpenCodex 설치를 Native Codex로 복귀시킨 뒤 제거하는 데에는 Relay 설정이 필요하지 않습니다."
+            english.text(.controlCenterLocalOpenCodexInspectAction),
+            "Inspect OpenCodex installation…"
         )
         XCTAssertEqual(
-            english.text(.controlCenterLocalOpenCodexOpenSettings),
-            "Open self-hosted server settings"
+            korean.text(.controlCenterLocalOpenCodexInspectAction),
+            "OpenCodex 설치 검사…"
         )
         XCTAssertEqual(
-            korean.text(.controlCenterLocalOpenCodexOpenSettings),
-            "셀프 호스팅 서버 설정 열기"
+            english.text(.controlCenterLocalOpenCodexRelayBadge),
+            "Relay setup required"
         )
         XCTAssertEqual(
-            english.text(.controlCenterLocalOpenCodexOpenSettingsHint),
+            korean.text(.controlCenterLocalOpenCodexRelayBadge),
+            "Relay 준비 필요"
+        )
+        XCTAssertEqual(
+            english.text(.controlCenterLocalOpenCodexRelayHint),
             "Opens Settings > Connect a self-hosted server, where you can prepare Relay or recover setup when required."
         )
         XCTAssertEqual(
-            korean.text(.controlCenterLocalOpenCodexOpenSettingsHint),
+            korean.text(.controlCenterLocalOpenCodexRelayHint),
             "설정 > 셀프 호스팅 서버 연결을 열어 Relay를 준비하거나 필요한 경우 설정을 복구합니다."
+        )
+        XCTAssertEqual(
+            english.text(.homebrewGuardDevelopmentSetupSuccessTitle),
+            "Privileged helper is ready"
+        )
+        XCTAssertEqual(
+            korean.text(.homebrewGuardDevelopmentSetupSuccessTitle),
+            "권한 helper 준비 완료"
+        )
+        XCTAssertEqual(
+            english.text(.homebrewGuardDevelopmentSetupReviewUpdatedState),
+            "View updated status"
+        )
+        XCTAssertEqual(
+            korean.text(.homebrewGuardDevelopmentSetupReviewUpdatedState),
+            "갱신된 상태 보기"
         )
 
         XCTAssertFalse(english.text(.bindingMissing).localizedCaseInsensitiveContains("reinstall"))

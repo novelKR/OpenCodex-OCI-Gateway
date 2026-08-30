@@ -71,11 +71,28 @@ enum ControlCenterStatusTone: Equatable {
     }
 }
 
+enum ControlCenterNoticePresentation {
+    static func presents(
+        _ message: SafeStatusMessage,
+        integrationMessage: SafeStatusMessage?,
+        integrationAvailability: RelayIntegrationAvailability,
+        handlesMissingIntegrationInline: Bool
+    ) -> Bool {
+        guard handlesMissingIntegrationInline,
+              integrationAvailability == .missing,
+              message == integrationMessage else {
+            return true
+        }
+        return false
+    }
+}
+
 struct ControlCenterPage<Content: View>: View {
     let title: String
     let systemImage: String
     @ObservedObject var model: MenuBarModel
     let localizer: AppLocalizer
+    var handlesMissingIntegrationInline = false
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -88,7 +105,13 @@ struct ControlCenterPage<Content: View>: View {
 
                 if let integrationMessage = model.integrationStatusMessage,
                    integrationMessage != model.message,
-                   integrationMessage != model.statusError {
+                   integrationMessage != model.statusError,
+                   ControlCenterNoticePresentation.presents(
+                       integrationMessage,
+                       integrationMessage: model.integrationStatusMessage,
+                       integrationAvailability: model.integrationAvailability,
+                       handlesMissingIntegrationInline: handlesMissingIntegrationInline
+                   ) {
                     ControlCenterNotice(
                         tone: .integrationTone(for: model.integrationAvailability)
                     ) {
@@ -96,7 +119,13 @@ struct ControlCenterPage<Content: View>: View {
                     }
                 }
 
-                if let message = model.message {
+                if let message = model.message,
+                   ControlCenterNoticePresentation.presents(
+                       message,
+                       integrationMessage: model.integrationStatusMessage,
+                       integrationAvailability: model.integrationAvailability,
+                       handlesMissingIntegrationInline: handlesMissingIntegrationInline
+                   ) {
                     ControlCenterNotice(
                         tone: .messageTone(
                             for: message,
@@ -109,7 +138,14 @@ struct ControlCenterPage<Content: View>: View {
                     }
                 }
 
-                if let statusError = model.statusError, statusError != model.message {
+                if let statusError = model.statusError,
+                   statusError != model.message,
+                   ControlCenterNoticePresentation.presents(
+                       statusError,
+                       integrationMessage: model.integrationStatusMessage,
+                       integrationAvailability: model.integrationAvailability,
+                       handlesMissingIntegrationInline: handlesMissingIntegrationInline
+                   ) {
                     ControlCenterNotice(
                         tone: .messageTone(
                             for: statusError,
