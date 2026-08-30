@@ -230,6 +230,11 @@ gh attestation verify FILE --repo __REPOSITORY__ \
 
 The macOS app is ad-hoc signed with the Hardened Runtime. It is not Developer ID signed or notarized. On first launch, open **System Settings → Privacy & Security**, choose **Open Anyway** for OpenCodexRelay, then confirm **Open**. Do not remove quarantine attributes or disable Gatekeeper.
 
+Privileged helper setup preserves existing system directory modes. Root-owned
+`0755` directories and `1755` directories carrying only the sticky bit are
+accepted; foreign ownership, symlinks, setuid/setgid, and group/world write
+remain fail-closed.
+
 ## Source
 
 This immutable release was built from the public [`__VERSION__` source tag](https://github.com/__REPOSITORY__/tree/__VERSION__).

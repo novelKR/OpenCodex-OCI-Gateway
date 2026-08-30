@@ -106,6 +106,111 @@ final class HelperInstallerTests: XCTestCase {
         }
     }
 
+    func testInstallAcceptsStickySystemPublishingDirectoriesWithoutChangingMode() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let publishingDirectories = [
+            installedHelper(fixture).deletingLastPathComponent(),
+            installedPlist(fixture).deletingLastPathComponent(),
+        ]
+        for directory in publishingDirectories {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            XCTAssertEqual(chmod(directory.path, 0o1755), 0)
+        }
+
+        let receipt = try fixture.controller.perform(.install)
+
+        XCTAssertEqual(receipt.state, .ready)
+        XCTAssertEqual(receipt.resultCode, "installed")
+        for directory in publishingDirectories {
+            XCTAssertEqual(fileMode(directory), 0o1755)
+        }
+        XCTAssertEqual(fixture.runtime.events, ["bootout", "bootstrap", "probe"])
+    }
+
+    func testInstallRejectsUnsafeSystemPublishingDirectoryModesAndRollsBack() throws {
+        for mode: mode_t in [0o2755, 0o4755, 0o775, 0o757] {
+            let fixture = try makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let helperDirectory = installedHelper(fixture).deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: helperDirectory,
+                withIntermediateDirectories: true
+            )
+            XCTAssertEqual(chmod(helperDirectory.path, mode), 0)
+
+            XCTAssertThrowsError(try fixture.controller.perform(.install)) { error in
+                let failure = error as? HelperInstallerFailure
+                XCTAssertEqual(failure?.errorCode, .installationFailed)
+                XCTAssertEqual(failure?.phase, .statePrepare)
+                XCTAssertEqual(failure?.reason, .ownerOrModeMismatch)
+                XCTAssertEqual(failure?.rollbackResult, .completed)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: installedHelper(fixture).path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: installedPlist(fixture).path))
+            XCTAssertFalse(transactionExists(fixture))
+            XCTAssertEqual(fixture.runtime.events, ["bootout"])
+        }
+    }
+
+    func testStateDirectoryStillRejectsStickyBit() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let stateDirectory = fixture.root.appending(
+            path: HelperInstallerConstants.stateDirectoryRelativePath
+        )
+        try FileManager.default.createDirectory(
+            at: stateDirectory,
+            withIntermediateDirectories: true
+        )
+        XCTAssertEqual(chmod(stateDirectory.path, 0o1700), 0)
+
+        XCTAssertThrowsError(try fixture.controller.perform(.install)) { error in
+            let failure = error as? HelperInstallerFailure
+            XCTAssertEqual(failure?.errorCode, .installationFailed)
+            XCTAssertEqual(failure?.phase, .statePrepare)
+            XCTAssertEqual(failure?.reason, .ownerOrModeMismatch)
+            XCTAssertEqual(failure?.rollbackResult, .notNeeded)
+        }
+        XCTAssertFalse(transactionExists(fixture))
+        XCTAssertTrue(fixture.runtime.events.isEmpty)
+    }
+
+    func testInstallRejectsSymlinkSystemPublishingDirectory() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let helperDirectory = installedHelper(fixture).deletingLastPathComponent()
+        let redirectedDirectory = fixture.root.appending(path: "redirected-helper-directory")
+        try FileManager.default.createDirectory(
+            at: redirectedDirectory,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.createSymbolicLink(
+            at: helperDirectory,
+            withDestinationURL: redirectedDirectory
+        )
+
+        XCTAssertThrowsError(try fixture.controller.perform(.install)) { error in
+            let failure = error as? HelperInstallerFailure
+            XCTAssertEqual(failure?.errorCode, .installationFailed)
+            XCTAssertEqual(failure?.phase, .statePrepare)
+            XCTAssertEqual(failure?.reason, .ownerOrModeMismatch)
+            XCTAssertEqual(failure?.rollbackResult, .completed)
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: redirectedDirectory.appending(
+                    path: installedHelper(fixture).lastPathComponent
+                ).path
+            )
+        )
+        XCTAssertFalse(transactionExists(fixture))
+        XCTAssertEqual(fixture.runtime.events, ["bootout"])
+    }
+
     func testUpdateReplacesChangedHelperAndRestartsDaemon() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -827,29 +932,31 @@ final class HelperInstallerTests: XCTestCase {
     }
 
     func testRecoverRejectsInsecureTransactionDirectoryWithoutMutation() throws {
-        let fixture = try makeFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        _ = try fixture.controller.perform(.install)
-        let helperBefore = try Data(contentsOf: installedHelper(fixture))
-        let plistBefore = try Data(contentsOf: installedPlist(fixture))
-        try createTransaction(
-            fixture,
-            command: "update",
-            phase: "backups_ready",
-            hadHelper: true,
-            hadPlist: true,
-            wasServiceLoaded: true,
-            helperBackup: helperBefore,
-            plistBackup: plistBefore
-        )
-        XCTAssertEqual(chmod(try transactionDirectory(fixture).path, 0o755), 0)
+        for mode: mode_t in [0o755, 0o1700] {
+            let fixture = try makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            _ = try fixture.controller.perform(.install)
+            let helperBefore = try Data(contentsOf: installedHelper(fixture))
+            let plistBefore = try Data(contentsOf: installedPlist(fixture))
+            try createTransaction(
+                fixture,
+                command: "update",
+                phase: "backups_ready",
+                hadHelper: true,
+                hadPlist: true,
+                wasServiceLoaded: true,
+                helperBackup: helperBefore,
+                plistBackup: plistBefore
+            )
+            XCTAssertEqual(chmod(try transactionDirectory(fixture).path, mode), 0)
 
-        XCTAssertThrowsError(try fixture.controller.perform(.recover)) { error in
-            XCTAssertEqual(error as? HelperInstallerErrorCode, .recoveryUnavailable)
+            XCTAssertThrowsError(try fixture.controller.perform(.recover)) { error in
+                XCTAssertEqual(error as? HelperInstallerErrorCode, .recoveryUnavailable)
+            }
+            XCTAssertEqual(try Data(contentsOf: installedHelper(fixture)), helperBefore)
+            XCTAssertEqual(try Data(contentsOf: installedPlist(fixture)), plistBefore)
+            XCTAssertTrue(transactionExists(fixture))
         }
-        XCTAssertEqual(try Data(contentsOf: installedHelper(fixture)), helperBefore)
-        XCTAssertEqual(try Data(contentsOf: installedPlist(fixture)), plistBefore)
-        XCTAssertTrue(transactionExists(fixture))
     }
 
     func testSymlinkTargetIsNeverAccepted() throws {

@@ -485,6 +485,7 @@ struct HomebrewGuardDiagnosticGuidanceBlock: View {
         return [
             ["daemon_start_rejected"],
             ["probe_timeout", "xpc_rejected", "invalid_response"],
+            ["owner_or_mode_mismatch"],
             ["rollback_result=failed"],
         ]
     }
@@ -503,6 +504,11 @@ struct HomebrewGuardDiagnosticGuidanceBlock: View {
                 HomebrewGuardDiagnosticGuidanceRow(
                     codes: Self.codeGroups(isRecovery: false)[1],
                     text: localizer.text(.homebrewGuardDevelopmentGuidanceProbe)
+                )
+                Divider()
+                HomebrewGuardDiagnosticGuidanceRow(
+                    codes: Self.codeGroups(isRecovery: false)[2],
+                    text: localizer.text(.homebrewGuardDevelopmentGuidanceOwnership)
                 )
                 Divider()
             }

@@ -309,6 +309,10 @@ path; the existing Go removal helper and removal/routing journals remain the
 only deletion authority. World-writable paths, ACLs, foreign ownership,
 symlinks, conflicting launchers, incomplete evidence, a missing approval, or
 an unresolved protection journal remain fail-closed and manual-only.
+Existing fixed system publishing directories must be root-owned regular
+directories with `0755` base permissions. A pre-existing sticky bit (`1755`)
+is accepted and preserved; setuid, setgid, group/world write, foreign ownership,
+and symlinks remain fail-closed.
 
 The Control Center's **App Information** and **Maintenance & Recovery** pages
 can start privileged-helper setup before an uninstall candidate is selected.

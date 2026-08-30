@@ -715,6 +715,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             self.assertIn(release_notes_heading, publisher)
         self.assertIn("gh attestation verify FILE", publisher)
         self.assertIn("Open Anyway", publisher)
+        self.assertIn("`1755` directories carrying only the sticky bit", publisher)
+        self.assertIn("setuid/setgid", publisher)
         self.assertLess(publisher.index("verify_release_assets true"), publisher.index("--draft=false"))
         self.assertIn('verify_release_assets false', publisher)
         self.assertIn('"compatibility_revision":4', builder)
