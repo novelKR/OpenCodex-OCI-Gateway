@@ -939,7 +939,7 @@ final class MenuBarModelTests: XCTestCase {
 
         XCTAssertEqual(model.integrationAvailability, .missing)
         XCTAssertTrue(
-            LocalOpenCodexPrimaryAction.showsDiscoveryControls(model.integrationAvailability)
+            LocalOpenCodexPageMode.resolve(model.integrationAvailability).showsDiscoveryControls
         )
 
         model.addLocalOpenCodexBackend()
@@ -1948,6 +1948,44 @@ final class MenuBarModelTests: XCTestCase {
         )
     }
 
+    func testLocalPageHandlesOnlyTheExactMissingIntegrationNoticeInline() {
+        let missing = SafeStatusMessage(code: "routing_binding_missing", key: .bindingMissing)
+        let unsafe = SafeStatusMessage(code: "routing_binding_unsafe", key: .bindingUnsafe)
+
+        XCTAssertFalse(
+            ControlCenterNoticePresentation.presents(
+                missing,
+                integrationMessage: missing,
+                integrationAvailability: .missing,
+                handlesMissingIntegrationInline: true
+            )
+        )
+        XCTAssertTrue(
+            ControlCenterNoticePresentation.presents(
+                missing,
+                integrationMessage: missing,
+                integrationAvailability: .missing,
+                handlesMissingIntegrationInline: false
+            )
+        )
+        XCTAssertTrue(
+            ControlCenterNoticePresentation.presents(
+                unsafe,
+                integrationMessage: unsafe,
+                integrationAvailability: .unsafe,
+                handlesMissingIntegrationInline: true
+            )
+        )
+        XCTAssertTrue(
+            ControlCenterNoticePresentation.presents(
+                unsafe,
+                integrationMessage: missing,
+                integrationAvailability: .missing,
+                handlesMissingIntegrationInline: true
+            )
+        )
+    }
+
     func testDedicatedControlCenterPagesFitCommonDetailWidthsInEnglishAndKorean() {
         for selection in [AppLanguageSelection.english, .korean] {
             let localization = LocalizationStore()
@@ -2078,6 +2116,67 @@ final class MenuBarModelTests: XCTestCase {
         }
     }
 
+    func testSuccessfulDevelopmentHelperSheetFitsCommonWidthsInEnglishAndKorean() async throws {
+        for selection in [AppLanguageSelection.english, .korean] {
+            let localization = LocalizationStore()
+            localization.selection = selection
+            let guardClient = HomebrewGuardClient(
+                availability: HomebrewGuardAvailability(
+                    registration: .ready,
+                    helperVersion: "0.3.8-rc.3",
+                    protocolVersion: homebrewGuardProtocolVersion,
+                    errorCode: nil,
+                    operationID: nil
+                )
+            )
+            guardClient.backendValue = .manualAdmin
+            let model = MenuBarModel(
+                client: RelayctlClient(response: externalStatus()),
+                targetStore: TargetStore(nil),
+                desktopApplication: DesktopController(runningValues: []),
+                desktopTrustPolicy: trustedPolicy,
+                desktopTrustValidator: TrustValidator(),
+                desktopDiscoverer: DesktopDiscoverer(),
+                loginRegistration: LoginRegistration(),
+                homebrewGuard: guardClient,
+                startsPolling: false,
+                distributionFlavor: .localDevelopment,
+                localization: localization
+            )
+            try await waitUntil {
+                model.homebrewGuardAvailability.registration == .ready
+            }
+
+            for width in [CGFloat(800), 600, 320] {
+                let sheet = DevelopmentHomebrewGuardSetupView(
+                    command: "/usr/bin/sudo -- '/Applications/OpenCodexRelay.app/installer' update",
+                    initialRegistration: .manualUpdateRequired,
+                    isRecovery: false,
+                    model: model,
+                    localizer: localization.localizer,
+                    isPresented: .constant(true)
+                )
+                let hostingView = NSHostingView(
+                    rootView: sheet
+                        .environmentObject(localization)
+                        .frame(width: width)
+                )
+                hostingView.layoutSubtreeIfNeeded()
+
+                XCTAssertGreaterThan(
+                    hostingView.fittingSize.height,
+                    80,
+                    "successful helper sheet was empty at \(width)pt for \(selection)"
+                )
+                XCTAssertLessThanOrEqual(
+                    hostingView.fittingSize.width,
+                    width,
+                    "successful helper sheet exceeded \(width)pt for \(selection)"
+                )
+            }
+        }
+    }
+
     func testHomebrewGuardPrimaryActionAndRecoveryGuidanceAreExclusive() {
         XCTAssertEqual(HomebrewGuardPrimaryAction.resolve(.notRegistered), .register)
         XCTAssertEqual(HomebrewGuardPrimaryAction.resolve(.approvalRequired), .openSettings)
@@ -2102,20 +2201,97 @@ final class MenuBarModelTests: XCTestCase {
         )
     }
 
-    func testLocalOpenCodexPrimaryActionUsesSettingsOnlyForMissingIntegration() {
-        XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(.missing), .openSettings)
-        XCTAssertTrue(LocalOpenCodexPrimaryAction.showsDiscoveryControls(.missing))
-        XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(.ready), .find)
-        XCTAssertTrue(LocalOpenCodexPrimaryAction.showsDiscoveryControls(.ready))
+    func testLocalOpenCodexPageSeparatesNativeManagementFromRelaySetup() {
+        let missing = LocalOpenCodexPageMode.resolve(.missing)
+        XCTAssertEqual(missing, .standaloneNative)
+        XCTAssertTrue(missing.showsDiscoveryControls)
+        XCTAssertTrue(missing.showsRelaySetupCard)
+
+        let ready = LocalOpenCodexPageMode.resolve(.ready)
+        XCTAssertEqual(ready, .integrated)
+        XCTAssertTrue(ready.showsDiscoveryControls)
+        XCTAssertFalse(ready.showsRelaySetupCard)
+
         for availability in [
             RelayIntegrationAvailability.preview,
             .unsafe,
             .invalid,
             .helperUnavailable,
         ] {
-            XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(availability), .blocked)
-            XCTAssertFalse(LocalOpenCodexPrimaryAction.showsDiscoveryControls(availability))
+            let blocked = LocalOpenCodexPageMode.resolve(availability)
+            XCTAssertEqual(blocked, .blocked)
+            XCTAssertFalse(blocked.showsDiscoveryControls)
+            XCTAssertFalse(blocked.showsRelaySetupCard)
         }
+
+        for availability in [
+            RelayIntegrationAvailability.missing,
+            .ready,
+        ] {
+            let recovering = LocalOpenCodexPageMode.resolve(
+                availability,
+                recoveryRequired: true
+            )
+            XCTAssertEqual(recovering, .blocked)
+            XCTAssertFalse(recovering.showsDiscoveryControls)
+            XCTAssertFalse(recovering.showsRelaySetupCard)
+        }
+    }
+
+    func testDevelopmentSetupSheetPresentationInvalidatesStaleCommands() {
+        for initial in [
+            HomebrewGuardRegistrationState.manualInstallRequired,
+            .manualUpdateRequired,
+            .manualInstallerRecoveryRequired,
+        ] {
+            XCTAssertEqual(
+                DevelopmentSetupSheetPresentation.resolve(
+                    initial: initial,
+                    current: initial,
+                    didCheck: false,
+                    isChecking: false
+                ),
+                .command
+            )
+            XCTAssertEqual(
+                DevelopmentSetupSheetPresentation.resolve(
+                    initial: initial,
+                    current: initial,
+                    didCheck: false,
+                    isChecking: true
+                ),
+                .checking
+            )
+            XCTAssertEqual(
+                DevelopmentSetupSheetPresentation.resolve(
+                    initial: initial,
+                    current: initial,
+                    didCheck: true,
+                    isChecking: false
+                ),
+                .unchanged
+            )
+            XCTAssertEqual(
+                DevelopmentSetupSheetPresentation.resolve(
+                    initial: initial,
+                    current: .ready,
+                    didCheck: true,
+                    isChecking: false
+                ),
+                .ready
+            )
+        }
+
+        let changed = DevelopmentSetupSheetPresentation.resolve(
+            initial: .manualUpdateRequired,
+            current: .manualInstallerRecoveryRequired,
+            didCheck: true,
+            isChecking: false
+        )
+        XCTAssertEqual(changed, .stateChanged)
+        XCTAssertFalse(changed.showsCommand)
+        XCTAssertFalse(DevelopmentSetupSheetPresentation.ready.showsCommand)
+        XCTAssertTrue(DevelopmentSetupSheetPresentation.unchanged.showsCommand)
     }
 
     func testRemovalRecoveryStoreKeepsLegacyIntegratedAndRejectsSplitBrain() throws {

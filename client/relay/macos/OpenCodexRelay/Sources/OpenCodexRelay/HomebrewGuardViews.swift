@@ -38,12 +38,48 @@ enum DevelopmentSetupSheetLayout {
     }
 }
 
+enum DevelopmentSetupSheetPresentation: Equatable {
+    case command
+    case checking
+    case unchanged
+    case ready
+    case stateChanged
+
+    static func resolve(
+        initial: HomebrewGuardRegistrationState,
+        current: HomebrewGuardRegistrationState,
+        didCheck: Bool,
+        isChecking: Bool
+    ) -> Self {
+        if isChecking {
+            return .checking
+        }
+        if current == .ready {
+            return .ready
+        }
+        if current != initial {
+            return .stateChanged
+        }
+        return didCheck ? .unchanged : .command
+    }
+
+    var showsCommand: Bool {
+        switch self {
+        case .command, .checking, .unchanged:
+            true
+        case .ready, .stateChanged:
+            false
+        }
+    }
+}
+
 struct HomebrewGuardStatusCard: View {
     @ObservedObject var model: MenuBarModel
     let localizer: AppLocalizer
     var showsActions = true
     @Environment(\.scenePhase) private var scenePhase
     @State private var setupCommand: String?
+    @State private var developmentSetupInitialRegistration: HomebrewGuardRegistrationState?
     @State private var developmentSetupIsRecovery = false
     @State private var showsDevelopmentSetup = false
 
@@ -123,11 +159,13 @@ struct HomebrewGuardStatusCard: View {
         }
         .sheet(isPresented: $showsDevelopmentSetup, onDismiss: {
             setupCommand = nil
+            developmentSetupInitialRegistration = nil
             developmentSetupIsRecovery = false
         }) {
-            if let setupCommand {
+            if let setupCommand, let developmentSetupInitialRegistration {
                 DevelopmentHomebrewGuardSetupView(
                     command: setupCommand,
+                    initialRegistration: developmentSetupInitialRegistration,
                     isRecovery: developmentSetupIsRecovery,
                     model: model,
                     localizer: localizer,
@@ -214,10 +252,11 @@ struct HomebrewGuardStatusCard: View {
                 guard let command = model.developmentHomebrewGuardSetupCommand() else {
                     return
                 }
+                let registration = model.homebrewGuardAvailability.registration
                 setupCommand = command
+                developmentSetupInitialRegistration = registration
                 developmentSetupIsRecovery =
-                    model.homebrewGuardAvailability.registration ==
-                    .manualInstallerRecoveryRequired
+                    registration == .manualInstallerRecoveryRequired
                 showsDevelopmentSetup = true
             } label: {
                 Label(localizer.text(developmentSetupLabelKey), systemImage: "terminal")
@@ -328,14 +367,26 @@ struct HomebrewGuardStatusCard: View {
 
 struct DevelopmentHomebrewGuardSetupView: View {
     let command: String
+    let initialRegistration: HomebrewGuardRegistrationState
     let isRecovery: Bool
     @ObservedObject var model: MenuBarModel
     let localizer: AppLocalizer
     @Binding var isPresented: Bool
     @State private var visibleFrameSize = CGSize(width: 800, height: 600)
+    @State private var didCheck = false
+    @State private var isChecking = false
 
     private var sheetSize: CGSize {
         DevelopmentSetupSheetLayout.size(for: visibleFrameSize)
+    }
+
+    private var presentation: DevelopmentSetupSheetPresentation {
+        DevelopmentSetupSheetPresentation.resolve(
+            initial: initialRegistration,
+            current: model.homebrewGuardAvailability.registration,
+            didCheck: didCheck,
+            isChecking: isChecking
+        )
     }
 
     var body: some View {
@@ -358,55 +409,14 @@ struct DevelopmentHomebrewGuardSetupView: View {
             Divider()
 
             ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 18) {
-                    Text(localizer.text(detailKey))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    GroupBox(localizer.text(.homebrewGuardDevelopmentSetupCommand)) {
-                        Text(command)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
-                            .lineLimit(nil)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.vertical, 6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    HomebrewGuardDiagnosticGuidanceBlock(
-                        isRecovery: isRecovery,
-                        localizer: localizer
-                    )
-                }
+                sheetContent
                 .padding(24)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Divider()
 
-            ControlCenterActionFooter {
-                Button {
-                    Task {
-                        await model.refreshHomebrewGuardAvailability()
-                    }
-                } label: {
-                    Label(
-                        localizer.text(.homebrewGuardRefresh),
-                        systemImage: "arrow.clockwise"
-                    )
-                }
-            } primary: {
-                Button {
-                    model.copyDevelopmentHomebrewGuardSetupCommand(command)
-                } label: {
-                    Label(
-                        localizer.text(.homebrewGuardDevelopmentSetupCopy),
-                        systemImage: "doc.on.doc"
-                    )
-                }
-                .buttonStyle(.glassProminent)
-                .keyboardShortcut(.defaultAction)
-            }
+            sheetFooter
             .padding(.horizontal, 24)
             .padding(.vertical, 16)
         }
@@ -426,9 +436,157 @@ struct DevelopmentHomebrewGuardSetupView: View {
         }
     }
 
-    private var titleKey: AppStringKey {
+    @ViewBuilder
+    private var sheetContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            switch presentation {
+            case .ready:
+                ControlCenterNotice(tone: .success) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(localizer.text(.homebrewGuardDevelopmentSetupSuccessTitle))
+                            .font(.headline)
+                        Text(localizer.text(.homebrewGuardDevelopmentSetupSuccessDetail))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                StatusRow(
+                    localizer.text(.homebrewGuardVersion),
+                    value: model.homebrewGuardAvailability.helperVersion
+                        ?? localizer.text(.genericUnknown),
+                    systemImage: "number"
+                )
 
-        isRecovery ? .homebrewGuardDevelopmentRecoveryTitle : .homebrewGuardDevelopmentSetupTitle
+            case .stateChanged:
+                ControlCenterNotice(tone: .warning) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(localizer.text(.homebrewGuardDevelopmentSetupStateChangedTitle))
+                            .font(.headline)
+                        Text(localizer.text(.homebrewGuardDevelopmentSetupStateChangedDetail))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+            case .command, .checking, .unchanged:
+                if presentation == .checking {
+                    ControlCenterNotice(tone: .info) {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(localizer.text(.homebrewGuardDevelopmentSetupChecking))
+                        }
+                    }
+                } else if presentation == .unchanged {
+                    ControlCenterNotice(tone: .warning) {
+                        Text(localizer.text(.homebrewGuardDevelopmentSetupUnchanged))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Text(localizer.text(detailKey))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                GroupBox(localizer.text(.homebrewGuardDevelopmentSetupCommand)) {
+                    Text(command)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                HomebrewGuardDiagnosticGuidanceBlock(
+                    isRecovery: isRecovery,
+                    localizer: localizer
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sheetFooter: some View {
+        switch presentation {
+        case .ready:
+            ControlCenterActionFooter {
+                EmptyView()
+            } primary: {
+                Button(localizer.text(.homebrewGuardDevelopmentSetupDone)) {
+                    isPresented = false
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+
+        case .stateChanged:
+            ControlCenterActionFooter {
+                EmptyView()
+            } primary: {
+                Button(localizer.text(.homebrewGuardDevelopmentSetupReviewUpdatedState)) {
+                    isPresented = false
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+
+        case .command, .checking, .unchanged:
+            ControlCenterActionFooter {
+                Button {
+                    checkHelperStatus()
+                } label: {
+                    if isChecking {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(localizer.text(.homebrewGuardDevelopmentSetupChecking))
+                        }
+                    } else {
+                        Label(
+                            localizer.text(.homebrewGuardRefresh),
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                }
+                .disabled(isChecking || model.isBusy)
+            } primary: {
+                Button {
+                    model.copyDevelopmentHomebrewGuardSetupCommand(command)
+                } label: {
+                    Label(
+                        localizer.text(.homebrewGuardDevelopmentSetupCopy),
+                        systemImage: "doc.on.doc"
+                    )
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(isChecking || model.isBusy)
+            }
+        }
+    }
+
+    private func checkHelperStatus() {
+        guard !isChecking else { return }
+        isChecking = true
+        Task { @MainActor in
+            await model.refreshHomebrewGuardAvailability()
+            didCheck = true
+            isChecking = false
+        }
+    }
+
+    private var titleKey: AppStringKey {
+        switch presentation {
+        case .ready:
+            .homebrewGuardDevelopmentSetupSuccessTitle
+        case .stateChanged:
+            .homebrewGuardDevelopmentSetupStateChangedTitle
+        case .command, .checking, .unchanged:
+            isRecovery
+                ? .homebrewGuardDevelopmentRecoveryTitle
+                : .homebrewGuardDevelopmentSetupTitle
+        }
     }
 
     private var detailKey: AppStringKey {
