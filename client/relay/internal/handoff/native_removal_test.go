@@ -403,6 +403,59 @@ func TestNativeCandidateProjectionExposesPathsOnlyForHomebrewGuard(t *testing.T)
 	}
 }
 
+func TestNativeCandidateProjectionUsesBoundedAutomaticRemovalReasons(t *testing.T) {
+	if NativeRemovalSchemaVersion != 1 || NativeRemovalReadSchemaVersion != 2 {
+		t.Fatalf("native removal schema versions = receipt %d read %d", NativeRemovalSchemaVersion, NativeRemovalReadSchemaVersion)
+	}
+	base := NPMInstallation{
+		ID: testRemovalID, Fingerprint: testRemovalFingerprint, NativeRestoreFingerprint: strings.Repeat("c", 64),
+		Version: "2.22.0", Manager: DiscoveryManagerNPM, RemovalCapability: RemovalCapabilityExactNPM,
+		RemovalAuthority: RemovalAuthorityManual, TeardownCompatibility: teardownCompatibilityClosureChanged,
+	}
+	if got := automaticRemovalReason(base, true); got != AutomaticRemovalReasonEligible {
+		t.Fatalf("eligible reason = %q", got)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*NPMInstallation)
+		want   string
+	}{
+		{name: "closure", want: AutomaticRemovalReasonUnreviewedPackageClosure},
+		{name: "version", mutate: func(candidate *NPMInstallation) {
+			candidate.TeardownCompatibility = teardownCompatibilityUnsupportedVersion
+		}, want: AutomaticRemovalReasonUnsupportedPackageVersion},
+		{name: "module", mutate: func(candidate *NPMInstallation) {
+			candidate.TeardownCompatibility = teardownCompatibilityModuleChanged
+		}, want: AutomaticRemovalReasonPackageModuleChanged},
+		{name: "execution", mutate: func(candidate *NPMInstallation) {
+			candidate.TeardownCompatibility = teardownCompatibilityCompatible
+		}, want: AutomaticRemovalReasonExecutionEvidenceIncomplete},
+		{name: "manager", mutate: func(candidate *NPMInstallation) {
+			candidate.Manager = DiscoveryManagerVolta
+			candidate.TeardownCompatibility = teardownCompatibilityIdentityUnverified
+		}, want: AutomaticRemovalReasonManualPackageManager},
+		{name: "identity", mutate: func(candidate *NPMInstallation) {
+			candidate.TeardownCompatibility = teardownCompatibilityIdentityUnverified
+		}, want: AutomaticRemovalReasonIdentityUnverified},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := base
+			if test.mutate != nil {
+				test.mutate(&candidate)
+			}
+			projected := ProjectNativeRemovalCandidate(candidate)
+			if projected.AutomaticRemovalEligible || projected.AutomaticRemovalReason != test.want {
+				t.Fatalf("projection = %#v, want reason %q", projected, test.want)
+			}
+			encoded, err := json.Marshal(projected)
+			if err != nil || strings.Contains(string(encoded), "package_root") || strings.Contains(string(encoded), "teardown_compatibility") {
+				t.Fatalf("bounded projection = %s, err=%v", encoded, err)
+			}
+		})
+	}
+}
+
 func TestNativeInventoryRevisionBindsBoundaryAndRestoreWitness(t *testing.T) {
 	base := OpenCodexDataInventoryReceipt{
 		Status: "verified", InstallationID: testRemovalID, InstallationFingerprint: testRemovalFingerprint,

@@ -51,6 +51,8 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      - name: Reproduce reviewed teardown profiles
+        run: client/relay/scripts/review-teardown-profiles.py --check
       - name: Swift test and build
         working-directory: client/relay/macos/OpenCodexRelay
         run: |

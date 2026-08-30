@@ -20,6 +20,52 @@ final class OpenCodexNativeRemovalTests: XCTestCase {
         XCTAssertThrowsError(try decodeDiscovery(candidateSuffix: ",\"homebrew_guard\":{}"))
     }
 
+    func testDiscoveryAcceptsSchemaOneAndStrictSchemaTwoReasons() throws {
+        let schemaOne = try decodeDiscovery(candidateSuffix: "")
+        XCTAssertEqual(schemaOne.schemaVersion, 1)
+        XCTAssertNil(schemaOne.candidates[0].automaticRemovalReason)
+
+        let schemaTwoEligible = Data("""
+        {"schema_version":2,"operation":"discover-open-codex-native","context":"standalone_native","status":"ready","boundary_revision":"\(boundaryRevision)","native_state":"opencodex","native_recovery_required":false,"candidates":[{"installation_id":"\(installationID)","installation_fingerprint":"\(installationFingerprint)","native_restore_fingerprint":"\(nativeRestoreFingerprint)","version":"2.22.0","manager":"npm","removal_capability":"exact_npm","removal_authority":"automatic","data_capability":"preserve_only","automatic_removal_eligible":true,"automatic_removal_reason":"eligible","homebrew_guard_required":false}],"rejected":0,"truncated":false}
+        """.utf8)
+        let eligible = try JSONDecoder().decode(
+            OpenCodexNativeDiscoveryResult.self,
+            from: schemaTwoEligible
+        ).validated()
+        XCTAssertEqual(eligible.candidates[0].automaticRemovalReason, .eligible)
+
+        let manual = String(decoding: schemaTwoEligible, as: UTF8.self)
+            .replacingOccurrences(of: #""removal_authority":"automatic""#, with: #""removal_authority":"manual""#)
+            .replacingOccurrences(of: #""automatic_removal_eligible":true"#, with: #""automatic_removal_eligible":false"#)
+            .replacingOccurrences(of: #""automatic_removal_reason":"eligible""#, with: #""automatic_removal_reason":"unreviewed_package_closure""#)
+        let manualResult = try JSONDecoder().decode(
+            OpenCodexNativeDiscoveryResult.self,
+            from: Data(manual.utf8)
+        ).validated()
+        XCTAssertEqual(manualResult.candidates[0].automaticRemovalReason, .unreviewedPackageClosure)
+
+        let missingReason = String(decoding: schemaTwoEligible, as: UTF8.self)
+            .replacingOccurrences(of: ",\"automatic_removal_reason\":\"eligible\"", with: "")
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            OpenCodexNativeDiscoveryResult.self,
+            from: Data(missingReason.utf8)
+        ).validated())
+
+        let unknownReason = String(decoding: schemaTwoEligible, as: UTF8.self)
+            .replacingOccurrences(of: "eligible", with: "path_or_hash_detail")
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            OpenCodexNativeDiscoveryResult.self,
+            from: Data(unknownReason.utf8)
+        ))
+
+        let schemaOneWithReason = String(decoding: schemaTwoEligible, as: UTF8.self)
+            .replacingOccurrences(of: #""schema_version":2"#, with: #""schema_version":1"#)
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            OpenCodexNativeDiscoveryResult.self,
+            from: Data(schemaOneWithReason.utf8)
+        ).validated())
+    }
+
     func testConditionalHomebrewGuardRequiresTheExactBoundedSnapshot() throws {
         let guardJSON = """
         ,"homebrew_guard":{"prefix":"/opt/homebrew","package_root":"/opt/homebrew/lib/node_modules/@bitkyc08/opencodex","executable":"/opt/homebrew/lib/node_modules/@bitkyc08/opencodex/bin/ocx.mjs","executable_sha256":"\(String(repeating: "1", count: 64))","cli_entry":"/opt/homebrew/lib/node_modules/@bitkyc08/opencodex/dist/cli.js","cli_entry_sha256":"\(String(repeating: "2", count: 64))","bun_executable":"/opt/homebrew/lib/node_modules/@bitkyc08/opencodex/node_modules/bun/bin/bun","bun_sha256":"\(String(repeating: "3", count: 64))","node_executable":"/opt/homebrew/bin/node","node_sha256":"\(String(repeating: "4", count: 64))","npm_cli":"/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js","npm_cli_sha256":"\(String(repeating: "5", count: 64))","launchers":["/opt/homebrew/bin/ocx"]}

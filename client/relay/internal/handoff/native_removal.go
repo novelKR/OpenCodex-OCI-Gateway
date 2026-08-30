@@ -8,14 +8,24 @@ import (
 	"errors"
 )
 
-const NativeRemovalSchemaVersion = 1
+const (
+	NativeRemovalSchemaVersion     = 1
+	NativeRemovalReadSchemaVersion = 2
+)
 
 const (
-	NativeRemovalStatusReady            = "ready"
-	NativeRemovalStatusRecoveryRequired = "recovery_required"
-	NativeStateNative                   = "native"
-	NativeStateOpenCodex                = "opencodex"
-	NativeStateUnavailable              = "unavailable"
+	NativeRemovalStatusReady                          = "ready"
+	NativeRemovalStatusRecoveryRequired               = "recovery_required"
+	NativeStateNative                                 = "native"
+	NativeStateOpenCodex                              = "opencodex"
+	NativeStateUnavailable                            = "unavailable"
+	AutomaticRemovalReasonEligible                    = "eligible"
+	AutomaticRemovalReasonUnreviewedPackageClosure    = "unreviewed_package_closure"
+	AutomaticRemovalReasonUnsupportedPackageVersion   = "unsupported_package_version"
+	AutomaticRemovalReasonPackageModuleChanged        = "package_module_changed"
+	AutomaticRemovalReasonExecutionEvidenceIncomplete = "execution_evidence_incomplete"
+	AutomaticRemovalReasonManualPackageManager        = "manual_package_manager"
+	AutomaticRemovalReasonIdentityUnverified          = "identity_unverified"
 )
 
 var (
@@ -165,6 +175,7 @@ type NativeRemovalCandidate struct {
 	RemovalAuthority         RemovalAuthority             `json:"removal_authority"`
 	DataCapability           DataCapability               `json:"data_capability,omitempty"`
 	AutomaticRemovalEligible bool                         `json:"automatic_removal_eligible"`
+	AutomaticRemovalReason   string                       `json:"automatic_removal_reason"`
 	HomebrewGuardRequired    bool                         `json:"homebrew_guard_required"`
 	HomebrewGuard            *NativeHomebrewGuardSnapshot `json:"homebrew_guard,omitempty"`
 }
@@ -183,6 +194,7 @@ func ProjectNativeRemovalCandidate(candidate NPMInstallation) NativeRemovalCandi
 		RemovalAuthority:         candidate.RemovalAuthority,
 		DataCapability:           candidate.DataCapability,
 		AutomaticRemovalEligible: eligible,
+		AutomaticRemovalReason:   automaticRemovalReason(candidate, eligible),
 		HomebrewGuardRequired:    candidate.HomebrewGuardRequired,
 	}
 	if candidate.HomebrewGuardRequired {
@@ -197,6 +209,31 @@ func ProjectNativeRemovalCandidate(candidate NPMInstallation) NativeRemovalCandi
 		}
 	}
 	return projected
+}
+
+func automaticRemovalReason(candidate NPMInstallation, eligible bool) string {
+	if eligible {
+		return AutomaticRemovalReasonEligible
+	}
+	switch candidate.TeardownCompatibility {
+	case teardownCompatibilityClosureChanged:
+		return AutomaticRemovalReasonUnreviewedPackageClosure
+	case teardownCompatibilityUnsupportedVersion:
+		return AutomaticRemovalReasonUnsupportedPackageVersion
+	case teardownCompatibilityModuleChanged:
+		return AutomaticRemovalReasonPackageModuleChanged
+	}
+	if candidate.Manager != DiscoveryManagerNPM && candidate.Manager != DiscoveryManagerHomebrew {
+		return AutomaticRemovalReasonManualPackageManager
+	}
+	if candidate.TeardownCompatibility == teardownCompatibilityCompatible &&
+		(candidate.RemovalAuthority != RemovalAuthorityAutomatic ||
+			candidate.RemovalCapability == RemovalCapabilityManual ||
+			candidate.NodeExecutable == "" || candidate.NPMCLI == "" || candidate.CLIEntry == "" ||
+			candidate.BunExecutable == "" || candidate.PackageTreeSHA256 == "" || candidate.NPMTreeSHA256 == "") {
+		return AutomaticRemovalReasonExecutionEvidenceIncomplete
+	}
+	return AutomaticRemovalReasonIdentityUnverified
 }
 
 type NativeRemovalDiscovery struct {

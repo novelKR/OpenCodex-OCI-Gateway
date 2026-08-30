@@ -306,6 +306,29 @@ untruncated Tier-B pass must still reproduce the exact installation ID and
 fingerprint exactly once; all ambiguous, partial, Tier C, and manual results
 remain manual-only.
 
+Standalone Native discovery schema 2 adds only a bounded
+`automatic_removal_reason`; the app also accepts schema 1 and presents its
+manual candidates as `verification_unavailable`. Removal receipts, inventory,
+the runtime API, routing binding, and release manifest revision remain
+unchanged. An eligible candidate can enter the existing removal wizard. A
+manual candidate instead reports one of the bounded version, closure, critical
+module, execution-evidence, package-manager, or identity reasons and offers a
+sanitized diagnostic containing only version, manager, and reason code.
+
+New automatic-removal profiles require a review manifest under
+`internal/handoff/review-manifests`. The manifest pins every transitive package
+path, version, official npm tarball integrity, required-module digest, complete
+closure digest, symlink, and approved install transform. Run
+`scripts/review-teardown-profiles.py --check` on darwin/arm64 to fetch official
+registry artifacts, reconstruct two isolated roots, compare both complete
+closures, and run the teardown adapter dry-run preflight. CI enforces this for
+profile changes. A weekly read-only audit repeats registered-manifest checks
+and reports a new stable upstream version as `unsupported`; it does not modify
+profiles or open an issue automatically. Historical profiles through `2.33.0`
+(including the original `2.22.0` v1/v2 variants) are a closed pre-manifest
+baseline, so any newly registered variant without a review manifest fails the
+check.
+
 A standard arm64 Homebrew global npm installation under exactly
 `/opt/homebrew` may use `homebrew_guarded_npm` when its current-user ownership
 and complete execution evidence are proven and only group-write prevents the
