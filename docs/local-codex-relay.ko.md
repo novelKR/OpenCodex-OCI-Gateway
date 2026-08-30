@@ -664,31 +664,68 @@ status와 후보를 모두 다시 조회하고, 같은 canonical package root와
 새 후보와 적격 fingerprint가 결합된 경우에만 자동 제거를 활성화합니다. 후보가 없거나 중복·
 변경되면 제거를 잠그고 재탐색을 요구합니다.
 helper가 partial/unknown 결과를 반환해도 Desktop 재실행과 status 재확인을 시도해 확인된
-recovery 상태를 표시하지만, External 또는 Native 안정 상태가 증명되기 전에는 제거 버튼을
-활성화하지 않습니다.
+recovery 상태를 표시하지만 context별 recovery gate를 우회하지 않습니다.
+
+#### 제거 context
+
+자동 제거는 discovery 전에 다음 context 중 하나를 선택하고 작업 중 다른 context로 바꾸지
+않습니다.
+
+- **Integrated**는 owner-only routing binding이 ready인 경우에만 사용합니다. healthy resident
+  Relay와 안정적으로 검증된 External 또는 Native route를 요구하는 기존 조건을 유지합니다.
+- **Standalone Native**는 `routing-binding.json`이 정확히 없고 부분 Relay 자산이나 integration
+  recovery가 없는 경우에만 사용합니다. 표준 `~/.codex/config.toml`만 사용하고 clean Native 또는
+  검증된 OpenCodex 소유 설정만 허용하며, package command를 시작하기 전에 복원된 Native Codex
+  설정과 `clientIntegrations.codex=false`를 검증합니다. 원격 Gateway에 연결하지 않으며
+  server URL, Gateway 자격 증명, Relay config, LaunchAgent, Keychain 항목 또는 실행 중인 Relay
+  service를 요구하지 않습니다. 이 Relay integration 자산은 작업 전후에 변경되지 않습니다.
+
+unsafe·invalid binding, preview mode, integration recovery, 충돌하거나 손상된 journal, custom
+`CODEX_HOME`, local Relay, mixed, foreign, unmanaged Codex 설정은 계속 fail-closed입니다.
+자동 경로는 canonical app-managed root로 한정하며 ambient `XDG_CONFIG_HOME` 또는
+`OPENCODEX_HOME` override는 거부합니다.
+
+공유하는 owner-only lifecycle lock이 Relay 준비·integration과 두 제거 context의 동시 실행을 막습니다.
+recovery record는 최초 context에 고정되며 기존 integrated record를 standalone 제거로 옮기거나
+재해석하지 않습니다.
+
+앱은 Native 전용 relayctl operation인 `discover-open-codex-native`,
+`inspect-open-codex-native-removal`, `inspect-open-codex-native-data`,
+`remove-open-codex-native`를 소유합니다. strict schema 1 응답은 `standalone_native`,
+`boundary_revision`, `native_state`, `native_recovery_required`, opaque 후보 identity를 결합합니다.
+Gateway 입력이나 caller가 선택한 filesystem path를 받지 않으며 거부된 설정의 수동 fallback으로
+사용하지 않습니다.
 
 #### 안전한 npm 제거 절차
 
-안전 제거를 시작하려면 reviewed identity를 통과한 Codex Desktop이 선택되어 있고, resident
-relay가 정상이며, Local OpenCodex가 아닌 **검증된 External 또는 Native** route가 안정적으로
-적용돼 있어야 합니다. 조건이 바뀌면 제거를 시작하지 않고 새 검토를 요구합니다. 현행 경로는
-data inventory나 Trash를 호출하지 않으며 설정·자격 증명·로그를 포함한 모든 OpenCodex data
-root를 보존합니다.
+안전 제거를 시작하려면 reviewed identity를 통과한 Codex Desktop이 선택되어 있어야 합니다.
+integrated 제거는 추가로 resident Relay가 정상이고 Local OpenCodex가 아닌 **검증된 External 또는
+Native** route가 안정적으로 적용돼 있어야 합니다. standalone 제거는 대신 위 Native 경계를
+요구하며 원격 Gateway나 Relay health를 조회하지 않습니다. 조건이 바뀌면 제거를 시작하지 않고
+새 검토를 요구합니다. integrated 제거는 계속 `preserve_only`입니다. standalone 제거도 모든
+OpenCodex data root 보존이 기본값이며, 적격 `selective_trash_v1` 후보인 경우에만 검증된
+inventory에서 항목을 명시적으로 선택하고 기존 두 번째 Trash 확인을 거칠 수 있습니다.
+implicit-all selection과 permanent-delete fallback은 없습니다.
 
 권한 helper는 Control Center의 **앱 정보** 또는 **유지보수 및 복구**에서 미리 설정할 수
 있습니다. 등록 요청 뒤 승인이 필요하면 **로그인 항목 및 확장 프로그램 열기…**로 시스템
 설정에 이동하고, Relay로 돌아오면 상태를 자동 재확인합니다. 이 경로만으로 Homebrew mode나
 OpenCodex package는 변경하지 않습니다.
 
-1. discovery가 정확한 `relay_preserve_v1` identity profile 하나와 `preserve_only`를 schema 4로
-   반환해야 합니다. schema 2·3, 미지원 버전, 변경된 module 또는 transitive closure entry,
-   모호한 registry entry는 화면에
-   표시하되 manual-only입니다.
+1. integrated discovery는 정확한 `relay_preserve_v1` identity profile 하나와 `preserve_only`를
+   schema 4로 반환해야 합니다. standalone discovery는 일치하는 `boundary_revision`, bounded
+   `native_state`, `native_recovery_required=false`, 정확한 적격 후보 하나를 strict schema 1
+   `standalone_native` contract로 반환해야 합니다. schema 2·3, 미지원 버전, 변경된 module 또는
+   transitive closure entry, 모호한 registry entry는 화면에 표시하되 manual-only입니다.
 2. 검토 화면은 보존 대상(모든 OpenCodex data)과 제거 대상(exact npm package 및 검증된 managed
-   integration)을 구분합니다. nonzero `UInt64` routing generation을 freeze하고 package 제거를
-   한 번 명시 확인합니다. data selector, inventory, Trash 확인, path/glob, implicit-all은 없습니다.
-3. 실제 실행 직전에 route 안전 조건과 `homebrew_guarded_npm` 권한 helper 준비 상태를 다시
-   확인합니다. 미등록·미승인은 exact trusted Desktop을 종료하기 전에 차단합니다.
+   integration)을 구분합니다. integrated 검토는 nonzero `UInt64` routing generation을,
+   standalone 검토는 Native boundary fingerprint를 freeze하고 package 제거를 한 번 명시
+   확인합니다. integrated 검토에는 data selector가 없습니다. standalone은 preserve가 기본이며,
+   후보가 `selective_trash_v1`을 명시하면 검증된 inventory의 선택 항목에 두 번째 확인과 exact
+   inventory revision을 요구합니다. 어느 context도 caller path/glob이나 implicit-all을 받지 않습니다.
+3. 실제 실행 직전에 integrated route 안전 조건 또는 standalone Native 경계와
+   `homebrew_guarded_npm` 권한 helper 준비 상태를 다시 확인합니다. 미등록·미승인은 exact trusted
+   Desktop을 종료하기 전에 차단합니다.
 4. root helper가 `prepare`로 Homebrew group-write를 임시 해제하고 동일 후보를 재탐색한 뒤
    `commit`합니다. helper는 `openat`·`O_NOFOLLOW`·`fstat`으로 허용 경로를 확인하고 원래
    inode/device/mode를 root-owned `0600` 저널에 기록하며 package 삭제나 npm 실행을 하지 않습니다.
@@ -708,14 +745,25 @@ OpenCodex package는 변경하지 않습니다.
    `data_preserved=true`, `config_root_removed=false`, 모든 필수 component postcondition을 증명해야
    합니다. refused·malformed·partial·unverified receipt에서는 npm을 시작하지 않습니다. 변경
    가능성이 있는 unknown 결과는 자동 재시도하지 않고 recovery로 전환합니다.
-7. teardown과 routing postcondition을 모두 통과한 뒤에만 기존 private npm snapshot runner가
-   package를 제거합니다. package 부재와 routing ownership을 재검증하고, 마지막으로 `release`가
-   Homebrew mode를 역순 복원한 뒤 Desktop 재실행과 status refresh를 수행합니다.
+7. teardown과 context별 integrated routing 또는 standalone Native postcondition을 모두 통과한
+   뒤에만 standalone selective Trash가 검토한 항목을 옮길 수 있으며 직전·직후 Native 경계를
+   확인합니다. 그 다음 기존 private npm snapshot runner가 package를 제거합니다. package 부재와
+   같은 경계를 재검증하고, 마지막으로 `release`가 Homebrew mode를 역순 복원한 뒤 Desktop 재실행과
+   status refresh를 수행합니다.
 
 exit code나 path 부재만으로 성공을 표시하지 않습니다. strict receipt가 `completed`,
-`package_absent`, `data_preserved`, routing recovery 불필요, 최종 routing ownership 재검증,
-`relay_cleanup_completed`를 모두 증명해야만 recovery를 지우고 exact trusted Desktop을 다시
-실행합니다. commit 전 Homebrew guard crash는 자동 복원하고 commit 이후 불명확한 상태는 보호를
+`package_absent`, `data_preserved`, context recovery 불필요, 최종 integrated routing 또는
+standalone Native 재검증, 재실행 가능한 terminal journal 유지를 모두 증명해야 합니다. 앱은
+context가 포함된 schema 3 `terminal_ack_pending` recovery checkpoint에 정확한
+`terminal_receipt_digest`를 먼저 저장하고 readback합니다. 이어서
+`discover-open-codex-native --acknowledge-terminal-receipt-digest <digest>`를 호출합니다. bare
+discovery나 다른 digest는 journal을 유지합니다. 일치하는 acknowledgement가 같은 경계와 package
+부재를 재검증하여 정확한 terminal journal만 소비하고 `ready/native`를 반환한 뒤에만 앱이 로컬
+checkpoint를 삭제·readback하고 exact trusted Desktop을 다시 실행합니다. backend acknowledgement
+후 로컬 삭제 전 앱이 종료되면 durable checkpoint가 같은 acknowledgement를 idempotent하게
+재시도합니다. Relay Apply와 Recover는
+남아 있거나 손상된 standalone journal을 모두 거부하므로 acknowledgement 중단이 split-brain
+integration 상태를 만들 수 없습니다. commit 전 Homebrew guard crash는 자동 복원하고 commit 이후 불명확한 상태는 보호를
 유지한 채 명시적 복구를 요구합니다. production/dev는 단일 system lock을 공유합니다. 공식
 OpenCodex package와 data는 수정하지 않고 별도 `opencodex/` checkout도 사용하지 않습니다.
 
@@ -729,9 +777,9 @@ OpenCodex package와 data는 수정하지 않고 별도 `opencodex/` checkout도
   operation retry·package retry·data refresh phase로 해제합니다. 어느 경계에서 crash가 나도
   marker에서 같은 순서를 재개하며 routing park와 journal phase 전환이 모두 끝난 뒤에만
   `routing_recovery_persisted`를 발행합니다.
-- 기존 data-inventory/Trash journal은 schema 4로 변환하거나 재개하지 않습니다. fail-closed 상태로
-  유지하고 검토된 수동 복구를 요구합니다. 신규 preserve-only 흐름은 data selection이나 Trash
-  witness를 만들지 않습니다.
+- 기존 integrated data-inventory/Trash journal은 schema 4로 변환하거나 standalone 제거로
+  재해석하지 않습니다. fail-closed 상태로 유지하고 검토된 수동 복구를 요구합니다. 새 standalone
+  inventory와 Trash witness는 schema 6 `standalone_native` journal 및 Native 경계에 고정됩니다.
 - cleanup intent 이전의 검증된 실패는 durable removal recovery가 아닙니다. 정확히 allowlist된
   request·candidate·data-policy·teardown-preflight 순서이고 cleanup journal, child 시작,
   package/data/routing mutation, reboot, process-unknown 증거가 전혀 없는 receipt만 Swift의 임시

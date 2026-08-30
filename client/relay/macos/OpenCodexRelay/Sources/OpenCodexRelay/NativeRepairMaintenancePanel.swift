@@ -114,7 +114,7 @@ struct NativeRepairMaintenancePanel: View {
                 Text(localizer.text(.menuDiscoverySearching, tier.rawValue.uppercased()))
                     .font(.body)
             }
-        case let .candidates(result):
+        case let .candidates(.integrated(result)):
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(result.candidates) { candidate in
                     let restoreReady = candidate.nativeRepairSelection != nil
@@ -157,7 +157,7 @@ struct NativeRepairMaintenancePanel: View {
                 }
                 .disabled(model.isBusy)
             }
-        case .broadScanApprovalRequired, .notFound:
+        case .nativeSearching, .candidates(.standaloneNative), .broadScanApprovalRequired, .notFound:
             VStack(alignment: .leading, spacing: 8) {
                 ControlCenterSupportingText(
                     localizer.text(.controlCenterNativeRepairCandidateNone),

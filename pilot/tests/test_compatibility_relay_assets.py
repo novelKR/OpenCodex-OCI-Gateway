@@ -659,6 +659,13 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("active_local_runtime_is_acknowledged", installer)
         self.assertIn('.applied_backend == "local_opencodex"', installer)
         self.assertIn('"$interactive_listener" local_opencodex', installer)
+        self.assertLess(
+            installer.index("reserve_source_install_lifecycle", installer.index('case "$action" in')),
+            installer.index('install -d -m 0700 "$INSTALL_ROOT"'),
+        )
+        self.assertIn("release_source_install_lifecycle", installer)
+        service = (RELAY / "scripts" / "install-service.sh").read_text(encoding="utf-8")
+        self.assertIn('[[ -f "$config_path" && ! -L "$config_path" ]]', service)
 
     def test_public_github_release_path_is_explicit_and_fail_closed(self) -> None:
         installer_path = RELAY / "scripts" / "install-relay.sh"
@@ -1362,6 +1369,29 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             (asset_dir / relayctl_name).write_text(
                 "#!/usr/bin/env bash\n"
                 "set -eu\n"
+                "if [[ \"${1:-}\" == lifecycle ]]; then\n"
+                "  case \"${2:-}\" in\n"
+                "    source-install-capability) printf '%s\\n' '{\"schema_version\":2,\"state\":\"ready\"}' ;;\n"
+                "    reserve-source-install)\n"
+                "      recovery_file=\n"
+                "      while [[ $# -gt 0 ]]; do\n"
+                "        if [[ \"$1\" == --recovery-file ]]; then recovery_file=\"$2\"; shift 2; else shift; fi\n"
+                "      done\n"
+                "      [[ -n \"$recovery_file\" ]]\n"
+                "      reservation_root=\"$HOME/.local/lib/opencodex-relay/relay\"\n"
+                "      mkdir -p \"$reservation_root\"; chmod 700 \"$reservation_root\"\n"
+                "      printf '%s\\n' '{\"schema_version\":1,\"scope\":\"production\",\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"root_created\":false}' > \"$recovery_file\"\n"
+                "      chmod 600 \"$recovery_file\"\n"
+                "      printf '%s\\n' '{\"schema_version\":1,\"scope\":\"production\",\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}' > \"$reservation_root/.source-install-reservation.json\"\n"
+                "      chmod 600 \"$reservation_root/.source-install-reservation.json\"\n"
+                "      printf '%s\\n' '{\"schema_version\":1,\"scope\":\"production\",\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"root_created\":false}' ;;\n"
+                "    release-source-install)\n"
+                "      rm -f \"$HOME/.local/lib/opencodex-relay/relay/.source-install-reservation.json\"\n"
+                "      printf '%s\\n' '{\"schema_version\":1,\"state\":\"released\"}' ;;\n"
+                "    *) exit 64 ;;\n"
+                "  esac\n"
+                "  exit 0\n"
+                "fi\n"
                 "if [[ \"${1:-}\" == init ]]; then\n"
                 "  shift\n"
                 "  while [[ $# -gt 0 ]]; do\n"
@@ -2071,9 +2101,14 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("same install command", installer)
         install_body = installer[installer.index("install_local_dev()") :]
         self.assertLess(
+            install_body.index("reserve_local_dev_source_install_lifecycle"),
+            install_body.index("prepare_manual_helper_candidate"),
+        )
+        self.assertLess(
             install_body.index("prepare_manual_helper_candidate"),
             install_body.index('ensure_local_dev_config_parent "$config_path"'),
         )
+        self.assertIn('[[ "$relay_bin" == "${INSTALL_ROOT}/current/"* ]]', service)
         self.assertIn('case failurePhase = "failure_phase"', dev_installer)
         self.assertIn('case failureReason = "failure_reason"', dev_installer)
         self.assertIn('case rollbackResult = "rollback_result"', dev_installer)
@@ -2641,6 +2676,29 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 helpers / "opencodex-relayctl": (
                     "#!/usr/bin/env bash\n"
                     "set -euo pipefail\n"
+                    "if [[ \"${1:-}\" == lifecycle ]]; then\n"
+                    "  case \"${2:-}\" in\n"
+                    "    source-install-capability) printf '%s\\n' '{\"schema_version\":2,\"state\":\"ready\"}' ;;\n"
+                    "    reserve-source-install)\n"
+                    "      recovery_file=\n"
+                    "      while [[ $# -gt 0 ]]; do\n"
+                    "        if [[ \"$1\" == --recovery-file ]]; then recovery_file=\"$2\"; shift 2; else shift; fi\n"
+                    "      done\n"
+                    "      [[ -n \"$recovery_file\" ]]\n"
+                    "      reservation_root=\"$HOME/.local/lib/opencodex-relay/relay-dev\"\n"
+                    "      mkdir -p \"$reservation_root\"; chmod 700 \"$reservation_root\"\n"
+                    "      printf '%s\\n' '{\"schema_version\":1,\"scope\":\"local_development\",\"token\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"root_created\":true}' > \"$recovery_file\"\n"
+                    "      chmod 600 \"$recovery_file\"\n"
+                    "      printf '%s\\n' '{\"schema_version\":1,\"scope\":\"local_development\",\"token\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}' > \"$reservation_root/.source-install-reservation.json\"\n"
+                    "      chmod 600 \"$reservation_root/.source-install-reservation.json\"\n"
+                    "      printf '%s\\n' '{\"schema_version\":1,\"scope\":\"local_development\",\"token\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"root_created\":true}' ;;\n"
+                    "    release-source-install)\n"
+                    "      rm -f \"$HOME/.local/lib/opencodex-relay/relay-dev/.source-install-reservation.json\"\n"
+                    "      printf '%s\\n' '{\"schema_version\":1,\"state\":\"released\"}' ;;\n"
+                    "    *) exit 64 ;;\n"
+                    "  esac\n"
+                    "  exit 0\n"
+                    "fi\n"
                     "if [[ \"${1:-}\" == init ]]; then\n"
                     "  shift\n"
                     "  config= upstream= catalog=\n"

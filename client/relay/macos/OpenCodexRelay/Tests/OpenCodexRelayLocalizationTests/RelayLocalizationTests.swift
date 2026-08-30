@@ -139,14 +139,22 @@ final class RelayLocalizationTests: XCTestCase {
             korean.text(.codexConfigBindingMissing),
             "보호된 라우팅 binding을 사용할 수 없습니다. Codex 설정을 확인하기 전에 설정에서 Relay 준비를 진행하거나 복구가 필요한 경우 설정 복구를 사용하세요."
         )
+        XCTAssertEqual(
+            english.text(.controlCenterLocalOpenCodexNativeRemovalAction),
+            "Return to Native Codex and Remove…"
+        )
+        XCTAssertEqual(
+            korean.text(.controlCenterLocalOpenCodexNativeRemovalAction),
+            "Native Codex로 복귀 후 제거…"
+        )
 
         XCTAssertEqual(
             english.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
-            "Complete Relay setup for this user before finding or selecting Local OpenCodex."
+            "Relay setup is still required for remote gateway routing. It is not required to return a verified OpenCodex installation to Native Codex and remove it."
         )
         XCTAssertEqual(
             korean.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
-            "Local OpenCodex를 탐색하거나 선택하기 전에 현재 사용자의 Relay 설정을 완료하세요."
+            "원격 게이트웨이 라우팅에는 Relay 설정이 필요합니다. 검증된 OpenCodex 설치를 Native Codex로 복귀시킨 뒤 제거하는 데에는 Relay 설정이 필요하지 않습니다."
         )
         XCTAssertEqual(
             english.text(.controlCenterLocalOpenCodexOpenSettings),

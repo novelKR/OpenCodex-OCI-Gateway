@@ -65,13 +65,13 @@ public enum RelayIntegrationInspector {
             return .invalid
         }
 
-        guard isExecutableRegularFile(helperURL) else {
+        guard hasExecutableHelper(at: helperURL) else {
             return .helperUnavailable
         }
         return .ready
     }
 
-    private static func isExecutableRegularFile(_ url: URL) -> Bool {
+    public static func hasExecutableHelper(at url: URL) -> Bool {
         guard url.isFileURL else { return false }
         var info = stat()
         return Darwin.lstat(url.path, &info) == 0 &&

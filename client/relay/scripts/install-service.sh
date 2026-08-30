@@ -8,10 +8,30 @@ readonly RELAY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly RELAY_BIN="${HOME}/.local/lib/opencodex-relay/relay/current/opencodex-relay"
 
 usage() {
-  printf '%s\n' 'Usage: install-service.sh install --config PATH | uninstall | stop | status | restore --was-active true|false | snapshot --directory PATH | restore-snapshot --directory PATH'
+  printf '%s\n' 'Usage (macOS mutations are internal to install-relay.sh): install-service.sh install --config PATH | uninstall | stop | status | restore --was-active true|false | snapshot --directory PATH | restore-snapshot --directory PATH'
 }
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+require_macos_source_lifecycle_reservation() {
+  local root="${HOME}/.local/lib/opencodex-relay/relay"
+  local marker="${root}/.source-install-reservation.json"
+  local token="${OPENCODEX_RELAY_SOURCE_INSTALL_RESERVATION:-}" root_mode marker_mode recorded
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || \
+    die 'macOS service mutation requires an active Relay source lifecycle reservation'
+  [[ -d "$root" && ! -L "$root" && -f "$marker" && ! -L "$marker" ]] || \
+    die 'macOS service mutation has no safe Relay source lifecycle reservation'
+  root_mode="$(stat -f '%u:%Lp' "$root")" || die 'unable to inspect Relay source lifecycle root'
+  marker_mode="$(stat -f '%u:%Lp' "$marker")" || die 'unable to inspect Relay source lifecycle marker'
+  [[ "$root_mode" == "$(id -u):700" && "$marker_mode" == "$(id -u):600" ]] || \
+    die 'Relay source lifecycle reservation ownership or mode is unsafe'
+  recorded="$(jq -er '
+    select(.schema_version == 1 and .scope == "production")
+    | select(keys | sort == ["schema_version", "scope", "token"])
+    | .token | select(type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$marker")" || die 'Relay source lifecycle reservation is invalid'
+  [[ "$recorded" == "$token" ]] || die 'Relay source lifecycle reservation token does not match'
+}
 
 safe_path() {
   [[ "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'<'* && "$1" != *'>'* && \
@@ -144,6 +164,8 @@ case "$action" in
     [[ "${1:-}" == "--config" && $# -eq 2 ]] || { usage >&2; exit 2; }
     config_path="$2"
     [[ -x "$RELAY_BIN" ]] || die "relay binary is unavailable: $RELAY_BIN"
+    [[ -f "$config_path" && ! -L "$config_path" ]] || \
+      die "relay config is unavailable or unsafe: $config_path"
     safe_path "$RELAY_BIN" && safe_path "$config_path" || die 'relay service path contains unsupported XML/control characters'
     ;;
   uninstall|stop)
@@ -174,6 +196,11 @@ case "$(uname -s)" in
     plist_dir="${HOME}/Library/LaunchAgents"
     plist="${plist_dir}/${label}.plist"
     uid="$(id -u)"
+    case "$action" in
+      install|uninstall|stop|restore|restore-snapshot)
+        require_macos_source_lifecycle_reservation
+        ;;
+    esac
     if [[ "$action" == status ]]; then
       if launchctl print "gui/${uid}/${label}" >/dev/null 2>&1; then
         printf 'relay_service_active=true manager=launchd\n'

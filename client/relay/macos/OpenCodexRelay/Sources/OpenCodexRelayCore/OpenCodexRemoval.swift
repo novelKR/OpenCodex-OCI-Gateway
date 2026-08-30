@@ -257,7 +257,7 @@ public struct OpenCodexDataInventoryItem: Codable, Equatable, Identifiable, Send
         )
     }
 
-    fileprivate var isValid: Bool {
+    var isValid: Bool {
         guard OpenCodexRemovalValidation.isDataItemID(id),
               OpenCodexRemovalValidation.isSafeRelativePath(relativePath),
               exists == (kind != .absent),
@@ -755,12 +755,15 @@ public enum OpenCodexRemovalRecoveryKind: String, Codable, Sendable {
     case dataSelectionRefreshRequired = "data_selection_refresh_required"
     case rebootRequired = "reboot_required"
     case routingRecoveryRequired = "routing_recovery_required"
+    case nativeRecoveryRequired = "native_recovery_required"
+    case terminalAckPending = "terminal_ack_pending"
 }
 
 public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 3
 
     public let schema: Int
+    public let context: OpenCodexRemovalContext
     public let selection: OpenCodexRemovalSelection
     public let mode: OpenCodexRemovalMode
     public let orderedDataItemIDs: [String]
@@ -776,9 +779,18 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
     /// routing-recovery continuation must carry it so the next confirmation
     /// cannot silently bind to a different parked state.
     public let expectedRoutingGeneration: UInt64?
+    /// The standalone-Native ownership boundary that was reviewed before the
+    /// interrupted operation. Integrated sessions never carry this witness.
+    public let expectedBoundaryRevision: String?
+    /// Exact restore witness required to resume a standalone-Native journal.
+    public let nativeRestoreFingerprint: String?
+    /// Digest emitted by the exact retained terminal journal. It exists only
+    /// while a standalone Native success awaits receipt-bound acknowledgement.
+    public let terminalReceiptDigest: String?
 
     public init(
         schema: Int = schemaVersion,
+        context: OpenCodexRemovalContext = .integrated,
         selection: OpenCodexRemovalSelection,
         mode: OpenCodexRemovalMode,
         orderedDataItemIDs: [String],
@@ -786,9 +798,12 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
         recoveryKind: OpenCodexRemovalRecoveryKind,
         lastCode: String,
         inventoryRevision: String? = nil,
-        expectedRoutingGeneration: UInt64? = nil
+        expectedRoutingGeneration: UInt64? = nil,
+        expectedBoundaryRevision: String? = nil,
+        nativeRestoreFingerprint: String? = nil,
+        terminalReceiptDigest: String? = nil
     ) throws {
-        guard (schema == 1 || schema == Self.schemaVersion),
+        guard (1...Self.schemaVersion).contains(schema),
               expectedRoutingGeneration.map({ $0 > 0 }) ?? true,
               orderedDataItemIDs.count <= 128,
               retiredDataItemIDs.count <= 512,
@@ -800,13 +815,56 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
               OpenCodexRemovalValidation.isSafeToken(lastCode) else {
             throw OpenCodexRemovalContractError.invalidRequest
         }
+        if schema < 3 {
+            guard context == .integrated,
+                  expectedBoundaryRevision == nil,
+                  nativeRestoreFingerprint == nil,
+                  terminalReceiptDigest == nil,
+                  recoveryKind != .nativeRecoveryRequired,
+                  recoveryKind != .terminalAckPending else {
+                throw OpenCodexRemovalContractError.invalidRequest
+            }
+        } else {
+            switch context {
+            case .integrated:
+                guard expectedBoundaryRevision == nil,
+                      nativeRestoreFingerprint == nil,
+                      terminalReceiptDigest == nil,
+                      recoveryKind != .nativeRecoveryRequired,
+                      recoveryKind != .terminalAckPending else {
+                    throw OpenCodexRemovalContractError.invalidRequest
+                }
+            case .standaloneNative:
+                guard expectedRoutingGeneration == nil,
+                      recoveryKind != .routingRecoveryRequired,
+                      expectedBoundaryRevision.map({
+                          OpenCodexRemovalValidation.isLowercaseHex($0, count: 64)
+                      }) == true,
+                      nativeRestoreFingerprint.map({
+                          OpenCodexRemovalValidation.isLowercaseHex($0, count: 64)
+                      }) == true else {
+                    throw OpenCodexRemovalContractError.invalidRequest
+                }
+            }
+        }
+        if recoveryKind == .terminalAckPending {
+            guard schema == Self.schemaVersion,
+                  context == .standaloneNative,
+                  terminalReceiptDigest.map({
+                      OpenCodexRemovalValidation.isLowercaseHex($0, count: 64)
+                  }) == true else {
+                throw OpenCodexRemovalContractError.invalidRequest
+            }
+        } else if terminalReceiptDigest != nil {
+            throw OpenCodexRemovalContractError.invalidRequest
+        }
         switch mode {
         case .preserveData:
             guard orderedDataItemIDs.isEmpty, inventoryRevision == nil else {
                 throw OpenCodexRemovalContractError.invalidRequest
             }
         case .trashSelected:
-            guard schema == Self.schemaVersion,
+            guard schema >= 2,
                   !orderedDataItemIDs.isEmpty,
                   inventoryRevision.map({ OpenCodexRemovalValidation.isLowercaseHex($0, count: 64) }) == true else {
                 throw OpenCodexRemovalContractError.invalidRequest
@@ -820,6 +878,7 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
             throw OpenCodexRemovalContractError.invalidRequest
         }
         self.schema = schema
+        self.context = context
         self.selection = selection
         self.mode = mode
         self.orderedDataItemIDs = orderedDataItemIDs
@@ -828,10 +887,14 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
         self.lastCode = lastCode
         self.inventoryRevision = inventoryRevision
         self.expectedRoutingGeneration = expectedRoutingGeneration
+        self.expectedBoundaryRevision = expectedBoundaryRevision
+        self.nativeRestoreFingerprint = nativeRestoreFingerprint
+        self.terminalReceiptDigest = terminalReceiptDigest
     }
 
     enum CodingKeys: String, CodingKey {
         case schema
+        case context
         case selection
         case mode
         case orderedDataItemIDs = "ordered_data_item_ids"
@@ -840,14 +903,20 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
         case lastCode = "last_code"
         case inventoryRevision = "inventory_revision"
         case expectedRoutingGeneration = "expected_routing_generation"
+        case expectedBoundaryRevision = "expected_boundary_revision"
+        case nativeRestoreFingerprint = "native_restore_fingerprint"
+        case terminalReceiptDigest = "terminal_receipt_digest"
     }
 
     public init(from decoder: Decoder) throws {
         try StrictRemovalJSON.requireKeys(
             decoder,
             allowed: [
-                "schema", "selection", "mode", "ordered_data_item_ids", "retired_data_item_ids",
+                "schema", "context", "selection", "mode", "ordered_data_item_ids", "retired_data_item_ids",
                 "recovery_kind", "last_code", "inventory_revision", "expected_routing_generation",
+                "expected_boundary_revision",
+                "native_restore_fingerprint",
+                "terminal_receipt_digest",
             ],
             required: [
                 "schema", "selection", "mode", "ordered_data_item_ids", "retired_data_item_ids",
@@ -855,8 +924,24 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
             ]
         )
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        let schema = try values.decode(Int.self, forKey: .schema)
+        if values.contains(.terminalReceiptDigest), try values.decodeNil(forKey: .terminalReceiptDigest) {
+            throw OpenCodexRemovalContractError.invalidRequest
+        }
+        if schema >= 3 {
+            guard values.contains(.context) else {
+                throw OpenCodexRemovalContractError.invalidRequest
+            }
+        } else if values.contains(.context) || values.contains(.expectedBoundaryRevision) ||
+                    values.contains(.nativeRestoreFingerprint) || values.contains(.terminalReceiptDigest) {
+            throw OpenCodexRemovalContractError.invalidRequest
+        }
+        if schema < Self.schemaVersion, values.contains(.terminalReceiptDigest) {
+            throw OpenCodexRemovalContractError.invalidRequest
+        }
         try self.init(
-            schema: values.decode(Int.self, forKey: .schema),
+            schema: schema,
+            context: values.decodeIfPresent(OpenCodexRemovalContext.self, forKey: .context) ?? .integrated,
             selection: values.decode(OpenCodexRemovalSelection.self, forKey: .selection),
             mode: values.decode(OpenCodexRemovalMode.self, forKey: .mode),
             orderedDataItemIDs: values.decode([String].self, forKey: .orderedDataItemIDs),
@@ -867,12 +952,45 @@ public struct OpenCodexRemovalRecoverySession: Codable, Equatable, Sendable {
             expectedRoutingGeneration: values.decodeIfPresent(
                 UInt64.self,
                 forKey: .expectedRoutingGeneration
+            ),
+            expectedBoundaryRevision: values.decodeIfPresent(
+                String.self,
+                forKey: .expectedBoundaryRevision
+            ),
+            nativeRestoreFingerprint: values.decodeIfPresent(
+                String.self,
+                forKey: .nativeRestoreFingerprint
+            ),
+            terminalReceiptDigest: values.decodeIfPresent(
+                String.self,
+                forKey: .terminalReceiptDigest
             )
         )
     }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schema, forKey: .schema)
+        if schema >= 3 {
+            try values.encode(context, forKey: .context)
+            try values.encodeIfPresent(expectedBoundaryRevision, forKey: .expectedBoundaryRevision)
+            try values.encodeIfPresent(nativeRestoreFingerprint, forKey: .nativeRestoreFingerprint)
+        }
+        if schema >= Self.schemaVersion {
+            try values.encodeIfPresent(terminalReceiptDigest, forKey: .terminalReceiptDigest)
+        }
+        try values.encode(selection, forKey: .selection)
+        try values.encode(mode, forKey: .mode)
+        try values.encode(orderedDataItemIDs, forKey: .orderedDataItemIDs)
+        try values.encode(retiredDataItemIDs, forKey: .retiredDataItemIDs)
+        try values.encode(recoveryKind, forKey: .recoveryKind)
+        try values.encode(lastCode, forKey: .lastCode)
+        try values.encodeIfPresent(inventoryRevision, forKey: .inventoryRevision)
+        try values.encodeIfPresent(expectedRoutingGeneration, forKey: .expectedRoutingGeneration)
+    }
 }
 
-private enum OpenCodexRemovalValidation {
+enum OpenCodexRemovalValidation {
     static func isLowercaseHex(_ value: String, count: Int) -> Bool {
         value.utf8.count == count && value.utf8.allSatisfy {
             ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)

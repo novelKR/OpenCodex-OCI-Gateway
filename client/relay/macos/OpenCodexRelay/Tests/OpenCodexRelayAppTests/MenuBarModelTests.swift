@@ -78,16 +78,26 @@ final class MenuBarModelTests: XCTestCase {
         func unregister() throws {}
     }
 
-    @MainActor
-    private final class RemovalEventRecorder {
-        private(set) var events: [String] = []
+    private final class RemovalEventRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedEvents: [String] = []
+
+        var events: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return recordedEvents
+        }
 
         func record(_ event: String) {
-            events.append(event)
+            lock.lock()
+            recordedEvents.append(event)
+            lock.unlock()
         }
 
         func reset() {
-            events.removeAll()
+            lock.lock()
+            recordedEvents.removeAll()
+            lock.unlock()
         }
     }
 
@@ -95,6 +105,7 @@ final class MenuBarModelTests: XCTestCase {
         var runningValues: [Bool]
         var requestAccepted = true
         var waitResult = true
+        var waitAction: (() -> Void)?
         private let eventRecorder: RemovalEventRecorder?
         private(set) var runningTargets: [URL] = []
         private(set) var quitTargets: [URL] = []
@@ -123,6 +134,7 @@ final class MenuBarModelTests: XCTestCase {
 
         func waitForExit(at target: URL, timeout _: TimeInterval) async -> Bool {
             waitTargets.append(target)
+            waitAction?()
             return waitResult
         }
 
@@ -424,7 +436,7 @@ final class MenuBarModelTests: XCTestCase {
         func remove(_ request: OpenCodexRemovalRequest) async throws -> OpenCodexRemovalReceipt {
             requests.append(request)
             if let eventRecorder {
-                await eventRecorder.record("remove")
+                eventRecorder.record("remove")
             }
             guard let removal else { throw RelayctlError.invalidStatus }
             return try removal.validated(for: request)
@@ -434,19 +446,146 @@ final class MenuBarModelTests: XCTestCase {
         func recordedRequests() -> [OpenCodexRemovalRequest] { requests }
     }
 
+    private actor NativeRemovalClient: OpenCodexNativeRemovalExecuting {
+        private var discoveryResponses: [OpenCodexNativeDiscoveryResult]
+        private let terminalDiscoveryResponse: OpenCodexNativeDiscoveryResult?
+        private let inspection: OpenCodexNativeRemovalInspection
+        private let inventory: OpenCodexNativeDataInventoryReceipt?
+        private let removal: OpenCodexNativeRemovalReceipt?
+        private let eventRecorder: RemovalEventRecorder?
+        private var removalFailuresRemaining: Int
+        private var terminalDiscoveryFailuresRemaining: Int
+        private var discoveryCount = 0
+        private var acknowledgementCount = 0
+        private var acknowledgedReceiptDigests: [String] = []
+        private var inspectedSelections: [OpenCodexNativeRemovalSelection] = []
+        private var dataSelections: [OpenCodexNativeRemovalSelection] = []
+        private var requests: [OpenCodexNativeRemovalRequest] = []
+
+        init(
+            discovery: OpenCodexNativeDiscoveryResult,
+            terminalDiscovery: OpenCodexNativeDiscoveryResult? = nil,
+            inspection: OpenCodexNativeRemovalInspection,
+            inventory: OpenCodexNativeDataInventoryReceipt? = nil,
+            removal: OpenCodexNativeRemovalReceipt? = nil,
+            removalFailuresRemaining: Int = 0,
+            terminalDiscoveryFailuresRemaining: Int = 0,
+            eventRecorder: RemovalEventRecorder? = nil
+        ) {
+            self.discoveryResponses = [discovery]
+            self.terminalDiscoveryResponse = terminalDiscovery
+            self.inspection = inspection
+            self.inventory = inventory
+            self.removal = removal
+            self.removalFailuresRemaining = removalFailuresRemaining
+            self.terminalDiscoveryFailuresRemaining = terminalDiscoveryFailuresRemaining
+            self.eventRecorder = eventRecorder
+        }
+
+        func discover() async throws -> OpenCodexNativeDiscoveryResult {
+            discoveryCount += 1
+            if let eventRecorder {
+                eventRecorder.record("native_discover_\(discoveryCount)")
+            }
+            guard !discoveryResponses.isEmpty else { throw RelayctlError.invalidStatus }
+            return discoveryResponses.removeFirst()
+        }
+
+        func acknowledgeTerminal(
+            receiptDigest: String
+        ) async throws -> OpenCodexNativeDiscoveryResult {
+            acknowledgementCount += 1
+            acknowledgedReceiptDigests.append(receiptDigest)
+            if let eventRecorder {
+                eventRecorder.record("native_ack_\(acknowledgementCount)")
+            }
+            if terminalDiscoveryFailuresRemaining > 0 {
+                terminalDiscoveryFailuresRemaining -= 1
+                throw RelayctlError.invocationFailed(exitCode: 1)
+            }
+            guard let terminalDiscoveryResponse else { throw RelayctlError.invalidStatus }
+            return terminalDiscoveryResponse
+        }
+
+        func inspect(
+            selection: OpenCodexNativeRemovalSelection
+        ) async throws -> OpenCodexNativeRemovalInspection {
+            inspectedSelections.append(selection)
+            return inspection
+        }
+
+        func inspectData(
+            selection: OpenCodexNativeRemovalSelection
+        ) async throws -> OpenCodexNativeDataInventoryReceipt {
+            dataSelections.append(selection)
+            guard let inventory else { throw RelayctlError.invalidStatus }
+            return try inventory.validated(for: selection)
+        }
+
+        func remove(
+            _ request: OpenCodexNativeRemovalRequest
+        ) async throws -> OpenCodexNativeRemovalReceipt {
+            requests.append(request)
+            if removalFailuresRemaining > 0 {
+                removalFailuresRemaining -= 1
+                throw RelayctlError.invocationFailed(exitCode: 1)
+            }
+            guard let removal else { throw RelayctlError.invalidStatus }
+            return try removal.validated(for: request)
+        }
+
+        func calls() -> (
+            discoveries: Int,
+            acknowledgements: Int,
+            inspections: Int,
+            dataInspections: Int,
+            removals: Int
+        ) {
+            (
+                discoveryCount,
+                acknowledgementCount,
+                inspectedSelections.count,
+                dataSelections.count,
+                requests.count
+            )
+        }
+
+        func recordedRequests() -> [OpenCodexNativeRemovalRequest] { requests }
+        func recordedAcknowledgementDigests() -> [String] { acknowledgedReceiptDigests }
+    }
+
     private final class RecoveryStore: OpenCodexRemovalRecoverySessionStoring {
         var session: OpenCodexRemovalRecoverySession?
+        private let eventRecorder: RemovalEventRecorder?
+        private let clearSucceeds: Bool
+        private var clearFailuresRemaining: Int
         private(set) var saveCount = 0
         private(set) var clearCount = 0
+
+        init(
+            eventRecorder: RemovalEventRecorder? = nil,
+            clearSucceeds: Bool = true,
+            clearFailuresRemaining: Int = 0
+        ) {
+            self.eventRecorder = eventRecorder
+            self.clearSucceeds = clearSucceeds
+            self.clearFailuresRemaining = clearFailuresRemaining
+        }
 
         func load() throws -> OpenCodexRemovalRecoverySession? { session }
         func save(_ session: OpenCodexRemovalRecoverySession) throws {
             self.session = session
             saveCount += 1
+            eventRecorder?.record("recovery_save_\(session.recoveryKind.rawValue)")
         }
         func clear() {
-            session = nil
+            if clearFailuresRemaining > 0 {
+                clearFailuresRemaining -= 1
+            } else if clearSucceeds {
+                session = nil
+            }
             clearCount += 1
+            eventRecorder?.record("recovery_clear")
         }
     }
 
@@ -770,7 +909,7 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertTrue(model.shouldOpenSelfHostedOnboarding)
     }
 
-    func testMissingBindingBlocksInjectedDiscoveryAndManualSelection() async throws {
+    func testMissingBindingWithoutExecutableHelperBlocksBothDiscoveryClientsAndManualSelection() async throws {
         let appURL = try makeAppBundle()
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -799,13 +938,13 @@ final class MenuBarModelTests: XCTestCase {
         )
 
         XCTAssertEqual(model.integrationAvailability, .missing)
-        XCTAssertFalse(
+        XCTAssertTrue(
             LocalOpenCodexPrimaryAction.showsDiscoveryControls(model.integrationAvailability)
         )
 
         model.addLocalOpenCodexBackend()
         XCTAssertEqual(model.openCodexDiscoveryState, .idle)
-        XCTAssertEqual(model.message?.code, "routing_binding_missing")
+        XCTAssertEqual(model.message?.code, "relayctl_unavailable")
 
         XCTAssertFalse(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
         model.selectOpenCodexExecutableManually()
@@ -814,6 +953,738 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(blockedCalls, [])
         XCTAssertNil(model.openCodexRemovalFlow)
         XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+    }
+
+    func testUnsafeInvalidPreviewAndHelperUnavailableNeverDispatchStandaloneRemoval() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let unsafeBinding = root.appendingPathComponent("unsafe-binding.json")
+        try Data("{}".utf8).write(to: unsafeBinding)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: unsafeBinding.path
+        )
+        let invalidBinding = root.appendingPathComponent("invalid-binding.json")
+        try Data("{}".utf8).write(to: invalidBinding)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: invalidBinding.path
+        )
+        let validBinding = root.appendingPathComponent("valid-binding.json")
+        try writeRoutingBinding(at: validBinding)
+
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            inspection: try nativeRemovalInspection()
+        )
+        let integrated = DiscoveryClient(responses: [
+            try discoveryResult(tier: .a, includesCandidate: true),
+        ])
+        let cases: [(URL, URL, RelayRuntimeMode, RelayIntegrationAvailability)] = [
+            (unsafeBinding, helper, .managed, .unsafe),
+            (invalidBinding, helper, .managed, .invalid),
+            (root.appendingPathComponent("preview-binding.json"), helper, .preview, .preview),
+            (
+                validBinding,
+                root.appendingPathComponent("missing-helper"),
+                .managed,
+                .helperUnavailable
+            ),
+        ]
+
+        for (binding, helperURL, runtimeMode, expectedAvailability) in cases {
+            let model = MenuBarModel(
+                client: nil,
+                discoveryClient: integrated,
+                nativeRemovalClient: native,
+                targetStore: TargetStore(DesktopTarget(url: appURL)),
+                desktopApplication: DesktopController(runningValues: []),
+                desktopTrustPolicy: trustedPolicy,
+                desktopTrustValidator: TrustValidator(),
+                desktopDiscoverer: DesktopDiscoverer(),
+                loginRegistration: LoginRegistration(),
+                bindingURL: binding,
+                helperURL: helperURL,
+                startsPolling: false,
+                runtimeMode: runtimeMode,
+                localization: englishLocalization()
+            )
+            XCTAssertEqual(model.integrationAvailability, expectedAvailability)
+            XCTAssertFalse(model.canDiscoverOpenCodex)
+            model.addLocalOpenCodexBackend()
+            XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+        }
+
+        let nativeCalls = await native.calls()
+        let integratedCalls = await integrated.calls()
+        XCTAssertEqual(nativeCalls.discoveries, 0)
+        XCTAssertEqual(integratedCalls, [])
+    }
+
+    func testExactMissingBindingUsesOnlyStandaloneNativeDiscoveryAndRemovalInspection() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            inspection: try nativeRemovalInspection()
+        )
+        let integrated = DiscoveryClient(responses: [
+            try discoveryResult(tier: .a, includesCandidate: true),
+        ])
+        let model = MenuBarModel(
+            client: nil,
+            discoveryClient: integrated,
+            nativeRemovalClient: native,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("routing-binding.json"),
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        XCTAssertEqual(model.integrationAvailability, .missing)
+        XCTAssertTrue(model.canDiscoverOpenCodex)
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+            return false
+        }
+        let integratedCalls = await integrated.calls()
+        let discoveryCalls = await native.calls()
+        XCTAssertEqual(integratedCalls, [])
+        XCTAssertEqual(discoveryCalls.discoveries, 1)
+
+        XCTAssertTrue(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        XCTAssertEqual(model.openCodexRemovalFlow?.context, .standaloneNative)
+        XCTAssertNil(model.openCodexRemovalFlow?.candidate)
+        XCTAssertNotNil(model.openCodexRemovalFlow?.nativeCandidate)
+        model.beginOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .options && !model.isBusy }
+        let removalCalls = await native.calls()
+        XCTAssertEqual(removalCalls.inspections, 1)
+        XCTAssertNil(model.status)
+        XCTAssertEqual(model.integrationAvailability, .missing)
+
+        let recoveryStore = RecoveryStore()
+        recoveryStore.session = try OpenCodexRemovalRecoverySession(
+            context: .standaloneNative,
+            selection: try OpenCodexRemovalSelection(
+                installationID: "0123456789abcdef01234567",
+                installationFingerprint: String(repeating: "a", count: 64)
+            ),
+            mode: .preserveData,
+            orderedDataItemIDs: [],
+            retiredDataItemIDs: [],
+            recoveryKind: .nativeRecoveryRequired,
+            lastCode: "native_restore_unverified",
+            expectedBoundaryRevision: String(repeating: "b", count: 64),
+            nativeRestoreFingerprint: String(repeating: "c", count: 64)
+        )
+        let blockedNative = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            inspection: try nativeRemovalInspection()
+        )
+        let recoveringModel = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: blockedNative,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("routing-binding.json"),
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+        XCTAssertTrue(recoveringModel.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertFalse(recoveringModel.canDiscoverOpenCodex)
+        recoveringModel.addLocalOpenCodexBackend()
+        XCTAssertEqual(recoveringModel.message?.code, "opencodex_recovery_context_pending")
+        let blockedCalls = await blockedNative.calls()
+        XCTAssertEqual(blockedCalls.discoveries, 0)
+    }
+
+    func testStandaloneNativeRemovalCompletesWithoutCreatingRelayIntegrationAssets() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        let binding = root.appendingPathComponent("routing-binding.json")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let events = RemovalEventRecorder()
+        let recoveryStore = RecoveryStore(eventRecorder: events)
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            terminalDiscovery: try nativeCleanDiscoveryResult(),
+            inspection: try nativeRemovalInspection(),
+            removal: try successfulNativeRemovalReceipt(),
+            eventRecorder: events
+        )
+        let integrated = DiscoveryClient(responses: [
+            try discoveryResult(tier: .a, includesCandidate: true),
+        ])
+        let desktop = DesktopController(runningValues: [], eventRecorder: events)
+        let model = MenuBarModel(
+            client: nil,
+            discoveryClient: integrated,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: desktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: binding,
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+            return false
+        }
+        XCTAssertTrue(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        model.beginOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .options && !model.isBusy }
+        model.reviewOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .confirmRemoval && !model.isBusy }
+        model.confirmOpenCodexPackageRemoval()
+        try await waitUntil(timeout: 2) {
+            model.openCodexRemovalFlow?.removalProgress?.phase == .completed && !model.isBusy
+        }
+
+        XCTAssertEqual(model.openCodexRemovalFlow?.context, .standaloneNative)
+        XCTAssertEqual(model.openCodexRemovalFlow?.phase, .result)
+        XCTAssertTrue(model.openCodexRemovalFlow?.nativeReceipt?.isSuccessful == true)
+        XCTAssertEqual(model.message?.code, "opencodex_native_removed")
+        XCTAssertEqual(desktop.quitRequests, 0)
+        XCTAssertEqual(desktop.relaunches, 1)
+        XCTAssertEqual(recoveryStore.saveCount, 2)
+        XCTAssertEqual(recoveryStore.clearCount, 1)
+        XCTAssertNil(recoveryStore.session)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: binding.path))
+        XCTAssertNil(model.status)
+        XCTAssertEqual(model.integrationAvailability, .missing)
+
+        let integratedCalls = await integrated.calls()
+        let nativeCalls = await native.calls()
+        let requests = await native.recordedRequests()
+        let acknowledgementDigests = await native.recordedAcknowledgementDigests()
+        XCTAssertEqual(integratedCalls, [])
+        XCTAssertEqual(nativeCalls.discoveries, 1)
+        XCTAssertEqual(nativeCalls.acknowledgements, 1)
+        XCTAssertEqual(nativeCalls.inspections, 2)
+        XCTAssertEqual(nativeCalls.dataInspections, 0)
+        XCTAssertEqual(nativeCalls.removals, 1)
+        XCTAssertEqual(acknowledgementDigests, [String(repeating: "f", count: 64)])
+        XCTAssertEqual(requests.first?.mode, .preserveData)
+        XCTAssertEqual(requests.first?.selection.boundaryRevision, String(repeating: "b", count: 64))
+        XCTAssertEqual(
+            events.events,
+            [
+                "native_discover_1",
+                "recovery_save_in_flight",
+                "recovery_save_terminal_ack_pending",
+                "native_ack_1",
+                "recovery_clear",
+                "desktop_relaunch",
+            ]
+        )
+    }
+
+    func testStandaloneNativeSelectiveTrashPersistsNativeInventoryBeforeRemovalRequest() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let itemID = "ocx-data-v1:" + String(repeating: "3", count: 32)
+        let inventoryRevision = String(repeating: "d", count: 64)
+        let recoveryStore = RecoveryStore()
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(dataCapability: "selective_trash_v1"),
+            inspection: try nativeRemovalInspection(dataCapability: "selective_trash_v1"),
+            inventory: try nativeDataInventoryReceipt(
+                itemID: itemID,
+                inventoryRevision: inventoryRevision
+            ),
+            removalFailuresRemaining: 1
+        )
+        let model = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("routing-binding.json"),
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+            return false
+        }
+        XCTAssertTrue(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        model.beginOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .options && !model.isBusy }
+        model.setOpenCodexRemovalMode(.trashSelected)
+        try await waitUntil {
+            model.openCodexRemovalFlow?.nativeInventory?.inventoryRevision == inventoryRevision &&
+                !model.isBusy
+        }
+        model.toggleOpenCodexDataItem(id: itemID)
+        model.reviewOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .confirmRemoval && !model.isBusy }
+        model.confirmOpenCodexPackageRemoval()
+        XCTAssertEqual(model.openCodexRemovalFlow?.phase, .confirmTrash)
+        model.confirmOpenCodexDataTrash()
+        try await waitUntil(timeout: 2) {
+            model.openCodexRemovalFlow?.phase == .rebootRequired && !model.isBusy
+        }
+
+        let requests = await native.recordedRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].mode, .trashSelected)
+        XCTAssertEqual(requests[0].dataItemIDs, [itemID])
+        XCTAssertEqual(requests[0].expectedInventoryRevision, inventoryRevision)
+        XCTAssertEqual(recoveryStore.session?.context, .standaloneNative)
+        XCTAssertEqual(recoveryStore.session?.mode, .trashSelected)
+        XCTAssertEqual(recoveryStore.session?.orderedDataItemIDs, [itemID])
+        XCTAssertEqual(recoveryStore.session?.inventoryRevision, inventoryRevision)
+        XCTAssertEqual(recoveryStore.session?.recoveryKind, .rebootRequired)
+    }
+
+    func testStandaloneNativeReceiptLossKeepsRecoveryAndReplaysStableOperation() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        let binding = root.appendingPathComponent("routing-binding.json")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let recoveryStore = RecoveryStore()
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            terminalDiscovery: try nativeCleanDiscoveryResult(),
+            inspection: try nativeRemovalInspection(),
+            removal: try successfulNativeRemovalReceipt(),
+            removalFailuresRemaining: 1
+        )
+        let desktop = DesktopController(runningValues: [])
+        let model = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: desktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: binding,
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+            return false
+        }
+        XCTAssertTrue(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        model.beginOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .options && !model.isBusy }
+        model.reviewOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .confirmRemoval && !model.isBusy }
+        model.confirmOpenCodexPackageRemoval()
+        try await waitUntil(timeout: 2) {
+            model.openCodexRemovalFlow?.phase == .rebootRequired && !model.isBusy
+        }
+
+        XCTAssertTrue(model.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertEqual(recoveryStore.session?.context, .standaloneNative)
+        XCTAssertEqual(recoveryStore.session?.recoveryKind, .rebootRequired)
+        XCTAssertEqual(recoveryStore.clearCount, 0)
+        XCTAssertFalse(model.canDiscoverOpenCodex)
+        model.addLocalOpenCodexBackend()
+        XCTAssertEqual(model.message?.code, "opencodex_recovery_context_pending")
+        var requests = await native.recordedRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertFalse(requests[0].confirmsRebootedProcessRecovery)
+
+        let restartedDesktop = DesktopController(runningValues: [])
+        let restartedModel = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: restartedDesktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: binding,
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+        XCTAssertTrue(restartedModel.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertEqual(restartedModel.openCodexRemovalFlow?.phase, .rebootRequired)
+        XCTAssertFalse(restartedModel.canDiscoverOpenCodex)
+
+        restartedModel.prepareRebootedOpenCodexRecovery()
+        try await waitUntil(timeout: 2) {
+            restartedModel.openCodexRemovalFlow?.nativeReceipt?.isSuccessful == true &&
+                !restartedModel.isBusy
+        }
+
+        requests = await native.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[1].selection, requests[0].selection)
+        XCTAssertEqual(requests[1].mode, requests[0].mode)
+        XCTAssertEqual(requests[1].dataItemIDs, requests[0].dataItemIDs)
+        XCTAssertEqual(requests[1].expectedInventoryRevision, requests[0].expectedInventoryRevision)
+        XCTAssertTrue(requests[1].confirmsRebootedProcessRecovery)
+        XCTAssertFalse(restartedModel.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertNil(recoveryStore.session)
+        XCTAssertEqual(recoveryStore.clearCount, 1)
+        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(restartedDesktop.relaunches, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: binding.path))
+        let nativeCalls = await native.calls()
+        XCTAssertEqual(nativeCalls.discoveries, 1)
+        XCTAssertEqual(nativeCalls.acknowledgements, 1)
+        XCTAssertEqual(nativeCalls.removals, 2)
+        XCTAssertEqual(restartedModel.openCodexRemovalFlow?.phase, .result)
+    }
+
+    func testStandaloneNativeRecoveryRechecksMissingBindingAfterDesktopExit() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        let binding = root.appendingPathComponent("routing-binding.json")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let recoveryStore = RecoveryStore()
+        recoveryStore.session = try OpenCodexRemovalRecoverySession(
+            context: .standaloneNative,
+            selection: try OpenCodexRemovalSelection(
+                installationID: "0123456789abcdef01234567",
+                installationFingerprint: String(repeating: "a", count: 64)
+            ),
+            mode: .preserveData,
+            orderedDataItemIDs: [],
+            retiredDataItemIDs: [],
+            recoveryKind: .nativeRecoveryRequired,
+            lastCode: "native_recovery_required",
+            expectedBoundaryRevision: String(repeating: "b", count: 64),
+            nativeRestoreFingerprint: String(repeating: "c", count: 64)
+        )
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            inspection: try nativeRemovalInspection(),
+            removal: try successfulNativeRemovalReceipt()
+        )
+        // Model initialization consumes the first process snapshot. The next
+        // two values model a running Desktop that exits after the request.
+        let desktop = DesktopController(runningValues: [true, true, false])
+        desktop.waitAction = { [weak self] in
+            try? self?.writeRoutingBinding(at: binding)
+        }
+        let model = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: desktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: binding,
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        model.checkOpenCodexNativeRecovery()
+        try await waitUntil(timeout: 2) { !model.isBusy }
+
+        XCTAssertEqual(desktop.quitRequests, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: binding.path))
+        XCTAssertEqual(model.openCodexRemovalFlow?.phase, .failed)
+        XCTAssertEqual(model.message?.code, "opencodex_native_request_invalid")
+        XCTAssertNotNil(recoveryStore.session)
+        let calls = await native.calls()
+        XCTAssertEqual(calls.removals, 0)
+    }
+
+    func testStandaloneNativeTerminalAcknowledgementSurvivesCrashBeforeLocalClear() async throws {
+        let appURL = try makeAppBundle()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        let binding = root.appendingPathComponent("routing-binding.json")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let recoveryStore = RecoveryStore(clearFailuresRemaining: 1)
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            terminalDiscovery: try nativeCleanDiscoveryResult(),
+            inspection: try nativeRemovalInspection(),
+            removal: try successfulNativeRemovalReceipt()
+        )
+        let desktop = DesktopController(runningValues: [])
+        let model = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: desktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: binding,
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates(.standaloneNative) = model.openCodexDiscoveryState { return true }
+            return false
+        }
+        XCTAssertTrue(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        model.beginOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .options && !model.isBusy }
+        model.reviewOpenCodexRemoval()
+        try await waitUntil { model.openCodexRemovalFlow?.phase == .confirmRemoval && !model.isBusy }
+        model.confirmOpenCodexPackageRemoval()
+        try await waitUntil(timeout: 2) {
+            model.openCodexRemovalFlow?.phase == .nativeTerminalCleanupPending && !model.isBusy
+        }
+
+        XCTAssertTrue(model.openCodexRemovalFlow?.nativeReceipt?.isSuccessful == true)
+        XCTAssertEqual(model.message?.code, "native_terminal_cleanup_pending")
+        XCTAssertTrue(model.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertNotNil(recoveryStore.session)
+        XCTAssertEqual(recoveryStore.session?.recoveryKind, .terminalAckPending)
+        XCTAssertEqual(
+            recoveryStore.session?.terminalReceiptDigest,
+            String(repeating: "f", count: 64)
+        )
+        XCTAssertEqual(recoveryStore.saveCount, 2)
+        XCTAssertEqual(recoveryStore.clearCount, 1)
+        XCTAssertEqual(desktop.relaunches, 0)
+        var nativeCalls = await native.calls()
+        XCTAssertEqual(nativeCalls.discoveries, 1)
+        XCTAssertEqual(nativeCalls.acknowledgements, 1)
+        XCTAssertEqual(nativeCalls.removals, 1)
+
+        let restartedDesktop = DesktopController(runningValues: [])
+        let restartedModel = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: restartedDesktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: binding,
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+        XCTAssertEqual(restartedModel.openCodexRemovalFlow?.phase, .nativeTerminalCleanupPending)
+        XCTAssertNil(restartedModel.openCodexRemovalFlow?.nativeReceipt)
+        restartedModel.checkOpenCodexNativeTerminalCleanup()
+        try await waitUntil(timeout: 2) {
+            restartedModel.openCodexRemovalFlow?.phase == .result && !restartedModel.isBusy
+        }
+
+        XCTAssertEqual(restartedModel.message?.code, "opencodex_native_removed")
+        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(restartedDesktop.relaunches, 1)
+        XCTAssertFalse(restartedModel.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertNil(recoveryStore.session)
+        XCTAssertEqual(recoveryStore.saveCount, 2)
+        XCTAssertEqual(recoveryStore.clearCount, 2)
+        nativeCalls = await native.calls()
+        XCTAssertEqual(nativeCalls.discoveries, 1)
+        XCTAssertEqual(nativeCalls.acknowledgements, 2)
+        XCTAssertEqual(nativeCalls.removals, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: binding.path))
+    }
+
+    func testStandaloneNativeDataRefreshTransitionsToNativeRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let itemID = "ocx-data-v1:" + String(repeating: "3", count: 32)
+        let recoveryStore = RecoveryStore()
+        recoveryStore.session = try OpenCodexRemovalRecoverySession(
+            context: .standaloneNative,
+            selection: try OpenCodexRemovalSelection(
+                installationID: "0123456789abcdef01234567",
+                installationFingerprint: String(repeating: "a", count: 64)
+            ),
+            mode: .trashSelected,
+            orderedDataItemIDs: [itemID],
+            retiredDataItemIDs: [],
+            recoveryKind: .dataSelectionRefreshRequired,
+            lastCode: "data_selection_refresh_required",
+            inventoryRevision: String(repeating: "d", count: 64),
+            expectedBoundaryRevision: String(repeating: "b", count: 64),
+            nativeRestoreFingerprint: String(repeating: "c", count: 64)
+        )
+        let inventorySource = Data("""
+        {"schema_version":1,"operation":"open-codex-native-data-inventory","context":"standalone_native","status":"refused","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"unavailable","native_recovery_required":true,"installation_id":"0123456789abcdef01234567","installation_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","native_restore_fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","inventory_revision":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","items":[]}
+        """.utf8)
+        let inventory = try JSONDecoder().decode(
+            OpenCodexNativeDataInventoryReceipt.self,
+            from: inventorySource
+        )
+        let native = NativeRemovalClient(
+            discovery: try nativeDiscoveryResult(),
+            inspection: try nativeRemovalInspection(),
+            inventory: inventory
+        )
+        let model = MenuBarModel(
+            client: nil,
+            nativeRemovalClient: native,
+            removalRecoveryStore: recoveryStore,
+            targetStore: TargetStore(nil),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("routing-binding.json"),
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        XCTAssertEqual(model.openCodexRemovalFlow?.phase, .dataRefreshRequired)
+        model.refreshInterruptedOpenCodexInventory()
+        try await waitUntil {
+            model.openCodexRemovalFlow?.phase == .nativeRecoveryRequired && !model.isBusy
+        }
+
+        XCTAssertEqual(recoveryStore.session?.recoveryKind, .nativeRecoveryRequired)
+        XCTAssertEqual(model.message?.code, "native_recovery_required")
+        XCTAssertTrue(model.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertFalse(model.canDiscoverOpenCodex)
+        let calls = await native.calls()
+        XCTAssertEqual(calls.dataInspections, 1)
+        XCTAssertEqual(calls.removals, 0)
     }
 
     func testBindingLossBlocksBroadApprovalAndCandidateChoice() async throws {
@@ -916,7 +1787,7 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(model.integrationAvailability, .missing)
         XCTAssertEqual(model.openCodexDiscoveryState, .idle)
         XCTAssertTrue(model.discoveredOpenCodexCandidates.isEmpty)
-        XCTAssertEqual(model.message?.code, "routing_binding_missing")
+        XCTAssertEqual(model.message?.code, "routing_binding_changed")
     }
 
     func testInteractiveSurfaceVisibilityTracksPopoverAndControlCenterIndependently() {
@@ -1233,20 +2104,117 @@ final class MenuBarModelTests: XCTestCase {
 
     func testLocalOpenCodexPrimaryActionUsesSettingsOnlyForMissingIntegration() {
         XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(.missing), .openSettings)
-        XCTAssertFalse(LocalOpenCodexPrimaryAction.showsDiscoveryControls(.missing))
+        XCTAssertTrue(LocalOpenCodexPrimaryAction.showsDiscoveryControls(.missing))
+        XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(.ready), .find)
+        XCTAssertTrue(LocalOpenCodexPrimaryAction.showsDiscoveryControls(.ready))
         for availability in [
-            RelayIntegrationAvailability.ready,
-            .preview,
+            RelayIntegrationAvailability.preview,
             .unsafe,
             .invalid,
             .helperUnavailable,
         ] {
-            XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(availability), .find)
-            XCTAssertEqual(
-                LocalOpenCodexPrimaryAction.showsDiscoveryControls(availability),
-                availability == .ready
-            )
+            XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(availability), .blocked)
+            XCTAssertFalse(LocalOpenCodexPrimaryAction.showsDiscoveryControls(availability))
         }
+    }
+
+    func testRemovalRecoveryStoreKeepsLegacyIntegratedAndRejectsSplitBrain() throws {
+        let suite = "OpenCodexRelayRecoveryStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let currentKey = "openCodexRemovalRecoverySession.v2"
+        let legacyKey = "openCodexRemovalRecoverySession.v1"
+        let store = UserDefaultsOpenCodexRemovalRecoverySessionStore(
+            defaults: defaults,
+            key: currentKey,
+            legacyKey: legacyKey
+        )
+        let selection = try OpenCodexRemovalSelection(
+            installationID: "0123456789abcdef01234567",
+            installationFingerprint: String(repeating: "a", count: 64)
+        )
+        let legacy = try OpenCodexRemovalRecoverySession(
+            schema: 2,
+            selection: selection,
+            mode: .preserveData,
+            orderedDataItemIDs: [],
+            retiredDataItemIDs: [],
+            recoveryKind: .rebootRequired,
+            lastCode: "process_cleanup_unverified"
+        )
+        let legacyData = try JSONEncoder().encode(legacy)
+        defaults.set(legacyData, forKey: legacyKey)
+        XCTAssertEqual(try store.load()?.context, .integrated)
+
+        defaults.set(legacyData, forKey: currentKey)
+        XCTAssertThrowsError(try store.load())
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("opencodex-relayctl")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        let blockedModel = MenuBarModel(
+            client: nil,
+            removalRecoveryStore: store,
+            targetStore: TargetStore(nil),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("routing-binding.json"),
+            helperURL: helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+        XCTAssertTrue(blockedModel.hasPendingOpenCodexRemovalRecovery)
+        XCTAssertFalse(blockedModel.canDiscoverOpenCodex)
+        XCTAssertEqual(blockedModel.message?.code, "opencodex_recovery_context_invalid")
+
+        defaults.removeObject(forKey: legacyKey)
+        XCTAssertThrowsError(try store.load())
+
+        let native = try OpenCodexRemovalRecoverySession(
+            context: .standaloneNative,
+            selection: selection,
+            mode: .preserveData,
+            orderedDataItemIDs: [],
+            retiredDataItemIDs: [],
+            recoveryKind: .nativeRecoveryRequired,
+            lastCode: "native_restore_unverified",
+            expectedBoundaryRevision: String(repeating: "b", count: 64),
+            nativeRestoreFingerprint: String(repeating: "c", count: 64)
+        )
+        defaults.set(legacyData, forKey: legacyKey)
+        try store.save(native)
+        XCTAssertNil(defaults.data(forKey: legacyKey))
+        XCTAssertEqual(try store.load(), native)
+    }
+
+    func testRemovalRecoveryStoreClearVerificationRejectsAStillPresentSession() throws {
+        let store = RecoveryStore(clearSucceeds: false)
+        store.session = try OpenCodexRemovalRecoverySession(
+            selection: try OpenCodexRemovalSelection(
+                installationID: "0123456789abcdef01234567",
+                installationFingerprint: String(repeating: "a", count: 64)
+            ),
+            mode: .preserveData,
+            orderedDataItemIDs: [],
+            retiredDataItemIDs: [],
+            recoveryKind: .inFlight,
+            lastCode: "native_removal_started"
+        )
+
+        XCTAssertThrowsError(try store.clearAndVerify())
+        XCTAssertNotNil(store.session)
+        XCTAssertEqual(store.clearCount, 1)
     }
 
     func testIntegrationNoticeToneWinsWhenMessageIsDeduplicated() {
@@ -4337,6 +5305,62 @@ final class MenuBarModelTests: XCTestCase {
             )
             .data(using: .utf8)!
         return try JSONDecoder().decode(OpenCodexDiscoveryResult.self, from: source).validated()
+    }
+
+    private func nativeDiscoveryResult(
+        dataCapability: String = "preserve_only"
+    ) throws -> OpenCodexNativeDiscoveryResult {
+        let source = Data("""
+        {"schema_version":1,"operation":"discover-open-codex-native","context":"standalone_native","status":"ready","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"opencodex","native_recovery_required":false,"candidates":[{"installation_id":"0123456789abcdef01234567","installation_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","native_restore_fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","version":"2.22.0","manager":"npm","removal_capability":"exact_npm","removal_authority":"automatic","data_capability":"\(dataCapability)","automatic_removal_eligible":true,"homebrew_guard_required":false}],"rejected":0,"truncated":false}
+        """.utf8)
+        return try JSONDecoder().decode(OpenCodexNativeDiscoveryResult.self, from: source).validated()
+    }
+
+    private func nativeCleanDiscoveryResult() throws -> OpenCodexNativeDiscoveryResult {
+        let source = Data("""
+        {"schema_version":1,"operation":"discover-open-codex-native","context":"standalone_native","status":"ready","boundary_revision":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","native_state":"native","native_recovery_required":false,"candidates":[],"rejected":0,"truncated":false}
+        """.utf8)
+        return try JSONDecoder().decode(OpenCodexNativeDiscoveryResult.self, from: source).validated()
+    }
+
+    private func nativeRemovalInspection(
+        dataCapability: String = "preserve_only"
+    ) throws -> OpenCodexNativeRemovalInspection {
+        let source = Data("""
+        {"schema_version":1,"operation":"inspect-open-codex-native-removal","context":"standalone_native","status":"ready","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"opencodex","native_recovery_required":false,"candidate":{"installation_id":"0123456789abcdef01234567","installation_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","native_restore_fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","version":"2.22.0","manager":"npm","removal_capability":"exact_npm","removal_authority":"automatic","data_capability":"\(dataCapability)","automatic_removal_eligible":true,"homebrew_guard_required":false}}
+        """.utf8)
+        let selection = try OpenCodexNativeRemovalSelection(
+            installationID: "0123456789abcdef01234567",
+            installationFingerprint: String(repeating: "a", count: 64),
+            nativeRestoreFingerprint: String(repeating: "c", count: 64),
+            boundaryRevision: String(repeating: "b", count: 64)
+        )
+        return try JSONDecoder().decode(OpenCodexNativeRemovalInspection.self, from: source)
+            .validated(for: selection)
+    }
+
+    private func nativeDataInventoryReceipt(
+        itemID: String,
+        inventoryRevision: String
+    ) throws -> OpenCodexNativeDataInventoryReceipt {
+        let source = Data("""
+        {"schema_version":1,"operation":"open-codex-native-data-inventory","context":"standalone_native","status":"verified","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"opencodex","native_recovery_required":false,"installation_id":"0123456789abcdef01234567","installation_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","native_restore_fingerprint":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","inventory_revision":"\(inventoryRevision)","items":[{"id":"\(itemID)","category":"logs","scope":"owned","kind":"file","relative_path":"logs/opencodex.log","exists":true,"sensitive":true,"trashable":true}]}
+        """.utf8)
+        let selection = try OpenCodexNativeRemovalSelection(
+            installationID: "0123456789abcdef01234567",
+            installationFingerprint: String(repeating: "a", count: 64),
+            nativeRestoreFingerprint: String(repeating: "c", count: 64),
+            boundaryRevision: String(repeating: "b", count: 64)
+        )
+        return try JSONDecoder().decode(OpenCodexNativeDataInventoryReceipt.self, from: source)
+            .validated(for: selection)
+    }
+
+    private func successfulNativeRemovalReceipt() throws -> OpenCodexNativeRemovalReceipt {
+        let source = Data("""
+        {"schema_version":1,"operation":"remove-open-codex-native","context":"standalone_native","status":"completed","boundary_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","native_state":"native","native_recovery_required":false,"mode":"preserve_data","installation_id":"0123456789abcdef01234567","data_scope":"preserved","selected_data_items":0,"moved_data_items":0,"package_removed":true,"data_movement_unknown":false,"permanent_delete_fallback":false,"terminal_receipt_digest":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","stages":[{"stage":"native_boundary_final_verification","status":"completed","code":"native_ownership_reverified"},{"stage":"package_verification","status":"completed","code":"package_absent","subject_id":"0123456789abcdef01234567"},{"stage":"cleanup_journal_retained","status":"completed","code":"terminal_receipt_replayable"}]}
+        """.utf8)
+        return try JSONDecoder().decode(OpenCodexNativeRemovalReceipt.self, from: source)
     }
 
     private func discoveryResult(

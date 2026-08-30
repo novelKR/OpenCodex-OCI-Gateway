@@ -145,6 +145,48 @@ func TestNativeRepairInspectionWitnessDetectsConfigAndProfileChanges(t *testing.
 	}
 }
 
+func TestNativeRepairBoundaryRevisionBindsConfigAndProfileWitnesses(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := InspectNativeRepairForOwner(path, ProductionOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialRevision, err := NativeRepairBoundaryRevision(path, ProductionOwner, initial)
+	if err != nil || len(initialRevision) != 64 {
+		t.Fatalf("initial revision=%q err=%v", initialRevision, err)
+	}
+	if err := os.WriteFile(path, []byte("model = \"gpt-test\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := InspectNativeRepairForOwner(path, ProductionOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedRevision, err := NativeRepairBoundaryRevision(path, ProductionOwner, changed)
+	if err != nil || changedRevision == initialRevision {
+		t.Fatalf("changed revision=%q initial=%q err=%v", changedRevision, initialRevision, err)
+	}
+	profile := InteractiveProfilePathForOwner(path, ProductionOwner)
+	if err := os.MkdirAll(filepath.Dir(profile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(profile, []byte("profile = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withProfile, err := InspectNativeRepairForOwner(path, ProductionOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileRevision, err := NativeRepairBoundaryRevision(path, ProductionOwner, withProfile)
+	if err != nil || profileRevision == changedRevision {
+		t.Fatalf("profile revision=%q changed=%q err=%v", profileRevision, changedRevision, err)
+	}
+}
+
 func TestCreateNativeRepairBackupPreservesExactBytesAndMode(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

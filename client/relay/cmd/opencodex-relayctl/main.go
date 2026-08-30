@@ -20,6 +20,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/integration"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/legacymigration"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/lifecyclelock"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/localopencodex"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/release"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
@@ -55,6 +56,8 @@ func main() {
 		gatewayCommand(os.Args[2:])
 	case "integration":
 		integrationCommand(os.Args[2:])
+	case "lifecycle":
+		lifecycleCommand(os.Args[2:])
 	case "release":
 		releaseCommand(os.Args[2:])
 	case "version", "--version", "-version":
@@ -102,6 +105,19 @@ func writeUsage(writer io.Writer) {
       [--expected-routing-generation N --installation-id ID --installation-fingerprint SHA256]
       [--config PATH] [--codex-config PATH] [--json]
   opencodex-relayctl mode discover-open-codex --tier a|b|c [--confirm-broad-scan] [--config PATH] --json
+  opencodex-relayctl mode discover-open-codex-native [--acknowledge-terminal-receipt-digest SHA256] --json
+  opencodex-relayctl mode inspect-open-codex-native-removal --installation-id ID
+      --installation-fingerprint SHA256 --native-restore-fingerprint SHA256
+      --expected-boundary-revision SHA256 --json
+  opencodex-relayctl mode inspect-open-codex-native-data --installation-id ID
+      --installation-fingerprint SHA256 --native-restore-fingerprint SHA256
+      --expected-boundary-revision SHA256 --json
+  opencodex-relayctl mode remove-open-codex-native --installation-id ID
+      --installation-fingerprint SHA256 --native-restore-fingerprint SHA256
+      --expected-boundary-revision SHA256 --removal-mode preserve_data|trash_selected
+      [--data-item INVENTORY_ID ...] [--expected-inventory-revision SHA256]
+      --confirm-opencodex-native-removal --confirm-desktop-exited [--confirm-data-trash]
+      [--confirm-interrupted-data-refresh] [--confirm-rebooted-process-recovery] --json
   opencodex-relayctl mode inspect-open-codex-data --installation-id ID --installation-fingerprint SHA256 [--config PATH] --json
   opencodex-relayctl mode remove-open-codex --installation-id ID --installation-fingerprint SHA256
       --removal-mode preserve_data|trash_selected --expected-routing-generation N
@@ -118,9 +134,14 @@ func writeUsage(writer io.Writer) {
   opencodex-relayctl gateway test [--config PATH] [--codex-config PATH] --json < candidate.json
   opencodex-relayctl gateway apply --expected-config-digest SHA256 --expected-routing-generation N
       [--config PATH] [--codex-config PATH] --json < candidate.json
-  opencodex-relayctl integration inspect --json
-  opencodex-relayctl integration apply --expected-state-digest SHA256 --json < candidate.json
-  opencodex-relayctl integration recover --json
+	  opencodex-relayctl integration inspect --json
+	  opencodex-relayctl integration apply --expected-state-digest SHA256 --json < candidate.json
+	  opencodex-relayctl integration recover --json
+	  opencodex-relayctl lifecycle source-install-capability --json
+	  opencodex-relayctl lifecycle reserve-source-install --scope production|local_development
+	      --recovery-file ABSOLUTE_PATH --json
+  opencodex-relayctl lifecycle release-source-install --scope production|local_development
+      --token SHA256 [--remove-created-root] --json
   opencodex-relayctl release verify --manifest PATH --signature PATH --public-key PATH
 `)
 }
@@ -265,6 +286,18 @@ func initConfig(args []string) {
 			owner = config.CatalogOwnerRelay
 		}
 	}
+	// Config initialization is a lifecycle writer: it must not create even a
+	// partial Relay asset beside an active, retained-terminal, or malformed
+	// standalone Native removal journal. Hold the same user lock through the
+	// final config write and recheck the anchor only after acquiring it.
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
+	if runtime.GOOS == "darwin" {
+		home, err := os.UserHomeDir()
+		if err != nil || requireStandaloneRemovalInactiveForInit(home) != nil {
+			fatal(handoff.ErrNativeRemovalRecoveryRequired)
+		}
+	}
 	if _, err := os.Lstat(configPath); err == nil && !*force {
 		fatal(fmt.Errorf("relay config already exists; inspect it or pass --force to replace it"))
 	} else if err != nil && !os.IsNotExist(err) {
@@ -322,6 +355,8 @@ func enable(args []string) {
 	flags.StringVar(&configPath, "config", configPath, "relay JSON path")
 	flags.StringVar(&codexPath, "codex-config", codexPath, "user Codex config.toml")
 	flags.Parse(args)
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := routingController(configPath, codexPath)
 	if err != nil {
 		fatal(err)
@@ -339,6 +374,8 @@ func disable(args []string) {
 	flags.StringVar(&configPath, "config", configPath, "relay JSON path")
 	flags.StringVar(&codexPath, "codex-config", codexPath, "user Codex config.toml")
 	flags.Parse(args)
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := routingController(configPath, codexPath)
 	if err != nil {
 		fatal(err)
@@ -368,6 +405,14 @@ func migrationCommand(args []string) {
 	if !*jsonOutput {
 		fatal(errors.New("--json is required for namespace migration"))
 	}
+	var lifecycle *lifecyclelock.Lock
+	if operation != "inspect" {
+		lifecycle = acquireUserLifecycleLock(context.Background())
+		defer lifecycle.Close()
+		if err := requireStandaloneRemovalInactiveForInit(home); err != nil {
+			fatal(err)
+		}
+	}
 	result, err := legacymigration.Run(operation, legacymigration.Options{
 		Home:        home,
 		CodexConfig: codexPath,
@@ -387,11 +432,91 @@ func migrateLegacy(args []string) {
 	flags := flag.NewFlagSet("migrate-legacy", flag.ExitOnError)
 	flags.StringVar(&codexPath, "codex-config", codexPath, "legacy Codex config.toml")
 	flags.Parse(args)
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
+	home, err := os.UserHomeDir()
+	if err != nil || requireStandaloneRemovalInactiveForInit(home) != nil {
+		fatal(handoff.ErrNativeRemovalRecoveryRequired)
+	}
 	backup, err := codexconfig.MigrateLegacy(codexPath)
 	if err != nil {
 		fatal(err)
 	}
 	fmt.Printf("legacy_codex_routing=migrated backup=%s\n", backup)
+}
+
+func lifecycleCommand(args []string) {
+	if len(args) == 0 {
+		usage()
+		os.Exit(2)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	switch args[0] {
+	case "source-install-capability":
+		flags := newModeFlagSet("lifecycle source-install-capability")
+		jsonOutput := flags.Bool("json", false, "emit JSON")
+		flags.Parse(args[1:])
+		if flags.NArg() != 0 || !*jsonOutput {
+			fatal(lifecyclelock.ErrReservationUnsafe)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema_version": 2,
+			"state":          "ready",
+		}); err != nil {
+			fatal(err)
+		}
+	case "reserve-source-install":
+		flags := newModeFlagSet("lifecycle reserve-source-install")
+		scopeValue := flags.String("scope", "", "source installation scope")
+		recoveryPath := flags.String("recovery-file", "", "durable private reservation response")
+		jsonOutput := flags.Bool("json", false, "emit JSON")
+		flags.Parse(args[1:])
+		if flags.NArg() != 0 || !*jsonOutput {
+			fatal(lifecyclelock.ErrReservationUnsafe)
+		}
+		reservation, err := lifecyclelock.ReserveSourceInstall(
+			ctx, home, lifecyclelock.SourceInstallScope(*scopeValue), *recoveryPath,
+		)
+		if err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(reservation); err != nil {
+			fatal(err)
+		}
+	case "release-source-install":
+		flags := newModeFlagSet("lifecycle release-source-install")
+		scopeValue := flags.String("scope", "", "source installation scope")
+		token := flags.String("token", "", "reservation token")
+		removeCreatedRoot := flags.Bool("remove-created-root", false, "remove a newly created empty install root")
+		jsonOutput := flags.Bool("json", false, "emit JSON")
+		flags.Parse(args[1:])
+		if flags.NArg() != 0 || !*jsonOutput {
+			fatal(lifecyclelock.ErrReservationUnsafe)
+		}
+		if err := lifecyclelock.ReleaseSourceInstall(
+			ctx,
+			home,
+			lifecyclelock.SourceInstallScope(*scopeValue),
+			*token,
+			*removeCreatedRoot,
+		); err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema_version": 1,
+			"state":          "released",
+		}); err != nil {
+			fatal(err)
+		}
+	default:
+		usage()
+		os.Exit(2)
+	}
 }
 
 func status(args []string) {
@@ -438,6 +563,14 @@ func modeCommand(args []string) {
 		modeRecover(args[1:])
 	case "discover-open-codex":
 		modeDiscoverOpenCodex(args[1:])
+	case "discover-open-codex-native":
+		modeDiscoverOpenCodexNative(args[1:])
+	case "inspect-open-codex-native-removal":
+		modeInspectOpenCodexNativeRemoval(args[1:])
+	case "inspect-open-codex-native-data":
+		modeInspectOpenCodexNativeData(args[1:])
+	case "remove-open-codex-native":
+		modeRemoveOpenCodexNative(args[1:])
 	case "inspect-open-codex-data":
 		modeInspectOpenCodexData(args[1:])
 	case "remove-open-codex":
@@ -466,6 +599,39 @@ func (f *modeFlagSet) Parse(args []string) {
 	}
 }
 
+func acquireUserLifecycleLock(parent context.Context) *lifecyclelock.Lock {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal(err)
+	}
+	lock, err := lifecyclelock.AcquireWriter(
+		ctx,
+		home,
+		os.Getenv(lifecyclelock.SourceInstallReservationEnvironment),
+	)
+	if err != nil {
+		fatal(err)
+	}
+	return lock
+}
+
+func requireStandaloneRemovalInactiveForInit(home string) error {
+	anchor, err := handoff.StandaloneRemovalAnchorPath(home)
+	if err != nil {
+		return handoff.ErrNativeRemovalRecoveryRequired
+	}
+	_, exists, err := handoff.ReadRemovalCleanup(anchor)
+	if err != nil || exists {
+		return handoff.ErrNativeRemovalRecoveryRequired
+	}
+	return nil
+}
+
 func modeSeedNative(args []string) {
 	configPath, codexPath := defaultPaths()
 	flags := newModeFlagSet("mode seed-native")
@@ -480,6 +646,8 @@ func modeSeedNative(args []string) {
 	if err != nil || cfg.Scope() != config.InstallationScopeLocalDevelopment {
 		fatal(errorsNew("mode seed-native is reserved for a local_development relay config"))
 	}
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := routingController(configPath, codexPath)
 	if err != nil {
 		fatal(err)
@@ -524,6 +692,8 @@ func modeRepairNative(args []string) {
 	if flags.NArg() != 0 || *expectedGeneration == 0 || !*confirmed {
 		fatal(routing.ErrNativeRepairUnavailable)
 	}
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := localDevelopmentRoutingController(configPath, codexPath)
 	if err != nil {
 		fatal(routing.ErrNativeRepairUnavailable)
@@ -658,6 +828,8 @@ func modeRepairNativeRouting(args []string) {
 	defer stop()
 	operationContext, cancel := context.WithTimeout(operationContext, 85*time.Second)
 	defer cancel()
+	lifecycle := acquireUserLifecycleLock(operationContext)
+	defer lifecycle.Close()
 	var inspect routing.NativeRepairOwnerInspect
 	var restore routing.NativeRepairOwnerRestore
 	if expectedOwner == codexconfig.NativeRepairOpenCodex {
@@ -805,6 +977,8 @@ func modeRequest(args []string) {
 	if flags.NArg() != 0 {
 		fatal(errorsNew("mode request accepts one mode and flags only"))
 	}
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := routingController(configPath, codexPath)
 	if err != nil {
 		fatal(err)
@@ -857,6 +1031,8 @@ func modeApply(args []string) {
 	if flags.NArg() != 0 {
 		fatal(errorsNew("mode apply accepts flags only"))
 	}
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := routingController(configPath, codexPath)
 	if err != nil {
 		fatal(err)
@@ -878,6 +1054,8 @@ func modeCancel(args []string) {
 	if flags.NArg() != 0 {
 		fatal(errorsNew("mode cancel accepts flags only"))
 	}
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	controller, err := routingController(configPath, codexPath)
 	if err != nil {
 		fatal(err)
@@ -909,6 +1087,8 @@ func modeRecover(args []string) {
 	if *rollback {
 		action = routing.RecoveryRollback
 	}
+	lifecycle := acquireUserLifecycleLock(context.Background())
+	defer lifecycle.Close()
 	preparation, err := prepareRemovalRoutingRecovery(
 		context.Background(),
 		configPath,
@@ -1365,6 +1545,17 @@ func modeHandoff(args []string) {
 	if err := preflightHandoffCodexConfig(codexPath); err != nil {
 		fatal(err)
 	}
+	lifecycleContext, cancelLifecycle := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelLifecycle()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal(err)
+	}
+	lifecycle, err := lifecyclelock.AcquireWriter(lifecycleContext, home, "")
+	if err != nil {
+		fatal(err)
+	}
+	defer lifecycle.Close()
 	// Handoff writes enrollment/configuration beside the routing state, so it
 	// participates in the same single-writer lock as request/apply/recovery.
 	// A legacy/no-state relay has no durable Codex binding to protect; require
@@ -1835,6 +2026,8 @@ func gatewayApply(args []string) {
 	defer cancel()
 	ctx, timeoutCancel := context.WithTimeout(ctx, 90*time.Second)
 	defer timeoutCancel()
+	lifecycle := acquireUserLifecycleLock(ctx)
+	defer lifecycle.Close()
 	result, err := controller.GatewayApply(ctx, candidate, *expectedDigest, *expectedGeneration)
 	if err != nil {
 		fatal(err)
@@ -2053,6 +2246,15 @@ func safeOperationError(err error) operationErrorEnvelope {
 		RecommendedAction: "refresh_status",
 	}
 	switch {
+	case errors.Is(err, lifecyclelock.ErrReservationBusy):
+		payload.Code = "lifecycle_writer_busy"
+		payload.MessageKey = payload.Code
+		payload.RecommendedAction = "retry"
+	case errors.Is(err, lifecyclelock.ErrReservationUnsafe), errors.Is(err, lifecyclelock.ErrUnsafe):
+		payload.Code = "lifecycle_state_unsafe"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "manual_remediation"
 	case errors.Is(err, handoff.ErrBroadScanConsentRequired), errors.Is(err, handoff.ErrInvalidDiscoveryTier),
 		errors.Is(err, handoff.ErrInvalidRemovalRequest), errors.Is(err, handoff.ErrInvalidRemovalSelection),
 		errors.Is(err, handoff.ErrRemovalConfirmationNeeded):
@@ -2107,6 +2309,24 @@ func safeOperationError(err error) operationErrorEnvelope {
 		payload.MessageKey = payload.Code
 		payload.Retryable = false
 		payload.RecommendedAction = "manual_remediation"
+	case errors.Is(err, handoff.ErrNativeRemovalBoundaryUnsafe):
+		payload.Code = "native_removal_boundary_unsafe"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "manual_remediation"
+	case errors.Is(err, handoff.ErrNativeRemovalBoundaryChanged):
+		payload.Code = "native_removal_boundary_changed"
+		payload.MessageKey = payload.Code
+		payload.RecommendedAction = "refresh_native_removal"
+	case errors.Is(err, handoff.ErrNativeRemovalRecoveryRequired):
+		payload.Code = "native_recovery_required"
+		payload.MessageKey = payload.Code
+		payload.RecommendedAction = "open_recovery"
+	case errors.Is(err, handoff.ErrNativeRemovalCustomCodexHome):
+		payload.Code = "custom_codex_home_unsupported"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "review_request"
 	case errors.Is(err, routing.ErrRecoveryRequired):
 		payload.Code = "routing_recovery_required"
 		payload.MessageKey = payload.Code

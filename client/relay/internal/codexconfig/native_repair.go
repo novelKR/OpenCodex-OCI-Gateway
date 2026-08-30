@@ -2,10 +2,12 @@ package codexconfig
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -152,6 +154,36 @@ func RevalidateNativeRepairInspection(path string, owner Owner, expected NativeR
 		return errors.New("Codex routing artifacts changed after native repair inspection")
 	}
 	return nil
+}
+
+// NativeRepairBoundaryRevision binds a UI decision to the exact canonical
+// Codex path, owner, bounded classification, and both private file witnesses.
+// The revision reveals no configuration content or filesystem path.
+func NativeRepairBoundaryRevision(path string, owner Owner, inspection NativeRepairInspection) (string, error) {
+	if err := validateOwner(owner); err != nil {
+		return "", err
+	}
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) || inspection.Kind == "" {
+		return "", errors.New("invalid native repair boundary")
+	}
+	hash := sha256.New()
+	for _, value := range []string{
+		"opencodex-standalone-native-boundary-v1",
+		path,
+		owner.ID,
+		string(inspection.Kind),
+		strconv.FormatBool(inspection.OpenAIBaseURL),
+		strconv.FormatBool(inspection.ModelCatalog),
+		inspection.Reason,
+		strconv.FormatBool(inspection.profileExists),
+	} {
+		_, _ = hash.Write([]byte(value))
+		_, _ = hash.Write([]byte{0})
+	}
+	_, _ = hash.Write(inspection.mainFingerprint[:])
+	_, _ = hash.Write(inspection.profileFingerprint[:])
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // CreateNativeRepairBackup writes one exact, owner-only backup beside the

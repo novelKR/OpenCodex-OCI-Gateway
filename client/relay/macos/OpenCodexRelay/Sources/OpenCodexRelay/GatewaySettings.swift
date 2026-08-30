@@ -37,6 +37,197 @@ enum GatewayCredentialStoreError: Error, Equatable {
     case accessControlUnavailable
     case keychainFailure
     case verificationFailed
+    case lifecycleConflict
+    case lifecycleUnsafe
+}
+
+struct GatewayCredentialLifecycleGate: Sendable {
+    private static let lifecycleDirectoryName = "OpenCodexRelayLifecycle"
+    private static let lockName = "lifecycle.lock"
+    private static let standaloneJournalNames = [
+        "standalone-native",
+        "standalone-native.open-codex-removal.json",
+    ]
+    private static let sourceInstallReservationName = ".source-install-reservation.json"
+
+    let homeDirectory: String
+
+    init(homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path) {
+        self.homeDirectory = homeDirectory
+    }
+
+    func withWriteAdmission<T>(_ body: () throws -> T) throws -> T {
+        let boundary = try boundaryPaths()
+        try ensureLifecycleDirectory(boundary.lifecycleDirectory)
+        let descriptor = try acquireLock(boundary.lock)
+        defer {
+            _ = flock(descriptor, LOCK_UN)
+            Darwin.close(descriptor)
+        }
+        for journal in boundary.standaloneJournals {
+            try requireAbsent(journal)
+        }
+        for reservation in boundary.sourceInstallReservations {
+            try requireAbsent(reservation)
+        }
+        return try body()
+    }
+
+    private func boundaryPaths() throws -> (
+        lifecycleDirectory: String,
+        lock: String,
+        standaloneJournals: [String],
+        sourceInstallReservations: [String]
+    ) {
+        guard homeDirectory.hasPrefix("/"), !homeDirectory.contains("\0") else {
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+        let home = URL(fileURLWithPath: homeDirectory, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
+        guard home.hasPrefix("/") else {
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+        var homeInfo = stat()
+        guard Darwin.lstat(home, &homeInfo) == 0,
+              (homeInfo.st_mode & S_IFMT) == S_IFDIR else {
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+        let lifecycleDirectory = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent(Self.lifecycleDirectoryName, isDirectory: true)
+            .path
+        let installRoot = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".local", isDirectory: true)
+            .appendingPathComponent("lib", isDirectory: true)
+            .appendingPathComponent("opencodex-relay", isDirectory: true)
+        return (
+            lifecycleDirectory,
+            URL(fileURLWithPath: lifecycleDirectory, isDirectory: true)
+                .appendingPathComponent(Self.lockName, isDirectory: false).path,
+            Self.standaloneJournalNames.map {
+                URL(fileURLWithPath: lifecycleDirectory, isDirectory: true)
+                    .appendingPathComponent($0, isDirectory: false).path
+            },
+            ["relay", "relay-dev"].map {
+                installRoot.appendingPathComponent($0, isDirectory: true)
+                    .appendingPathComponent(Self.sourceInstallReservationName, isDirectory: false)
+                    .path
+            }
+        )
+    }
+
+    private func ensureLifecycleDirectory(_ path: String) throws {
+        let parent = URL(fileURLWithPath: path, isDirectory: true).deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(
+                at: parent,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+
+        var info = stat()
+        if Darwin.lstat(path, &info) != 0 {
+            guard errno == ENOENT else {
+                throw GatewayCredentialStoreError.lifecycleUnsafe
+            }
+            guard Darwin.mkdir(path, mode_t(0o700)) == 0 || errno == EEXIST else {
+                throw GatewayCredentialStoreError.lifecycleUnsafe
+            }
+            guard Darwin.lstat(path, &info) == 0 else {
+                throw GatewayCredentialStoreError.lifecycleUnsafe
+            }
+        }
+        guard (info.st_mode & S_IFMT) == S_IFDIR,
+              info.st_uid == geteuid(),
+              info.st_mode & mode_t(0o777) == mode_t(0o700) else {
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+    }
+
+    private func acquireLock(_ path: String) throws -> Int32 {
+        var descriptor: Int32 = -1
+        while descriptor < 0 {
+            var pathInfo = stat()
+            let inspected = Darwin.lstat(path, &pathInfo)
+            var flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC
+            if inspected != 0 {
+                guard errno == ENOENT else {
+                    throw GatewayCredentialStoreError.lifecycleUnsafe
+                }
+                flags |= O_CREAT | O_EXCL
+            } else {
+                try validateLockFile(pathInfo)
+            }
+            descriptor = Darwin.open(path, flags, mode_t(0o600))
+            if descriptor < 0 {
+                if flags & O_EXCL != 0, errno == EEXIST {
+                    continue
+                }
+                throw GatewayCredentialStoreError.lifecycleUnsafe
+            }
+        }
+
+        var openedInfo = stat()
+        guard Darwin.fstat(descriptor, &openedInfo) == 0 else {
+            Darwin.close(descriptor)
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+        do {
+            try validateLockFile(openedInfo)
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+
+        while flock(descriptor, LOCK_EX) != 0 {
+            guard errno == EINTR else {
+                Darwin.close(descriptor)
+                throw GatewayCredentialStoreError.lifecycleUnsafe
+            }
+        }
+
+        var finalPathInfo = stat()
+        guard Darwin.lstat(path, &finalPathInfo) == 0 else {
+            _ = flock(descriptor, LOCK_UN)
+            Darwin.close(descriptor)
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+        do {
+            try validateLockFile(finalPathInfo)
+            guard finalPathInfo.st_dev == openedInfo.st_dev,
+                  finalPathInfo.st_ino == openedInfo.st_ino else {
+                throw GatewayCredentialStoreError.lifecycleUnsafe
+            }
+        } catch {
+            _ = flock(descriptor, LOCK_UN)
+            Darwin.close(descriptor)
+            throw error
+        }
+        return descriptor
+    }
+
+    private func validateLockFile(_ info: stat) throws {
+        guard (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == geteuid(),
+              info.st_mode & mode_t(0o777) == mode_t(0o600) else {
+            throw GatewayCredentialStoreError.lifecycleUnsafe
+        }
+    }
+
+    private func requireAbsent(_ path: String) throws {
+        var info = stat()
+        guard Darwin.lstat(path, &info) != 0 else {
+            throw GatewayCredentialStoreError.lifecycleConflict
+        }
+        guard errno == ENOENT else {
+            throw GatewayCredentialStoreError.lifecycleConflict
+        }
+    }
 }
 
 protocol GatewayCredentialStoring: Sendable {
@@ -66,15 +257,18 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
     private static let maximumSecurityCommandBytes = 4_000
     private let serviceNames: [GatewayCredentialKind: String]
     private let trustedApplicationPath: String?
+    private let lifecycleGate: GatewayCredentialLifecycleGate
 
     init(
         serviceNames: [GatewayCredentialKind: String] = [:],
-        trustedApplicationPath: String? = Bundle.main.executableURL?.path
+        trustedApplicationPath: String? = Bundle.main.executableURL?.path,
+        lifecycleHomeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path
     ) {
         self.serviceNames = Dictionary(uniqueKeysWithValues: GatewayCredentialKind.allCases.map {
             ($0, serviceNames[$0] ?? $0.service)
         })
         self.trustedApplicationPath = trustedApplicationPath
+        self.lifecycleGate = GatewayCredentialLifecycleGate(homeDirectory: lifecycleHomeDirectory)
     }
 
     func inspect(account: String) throws -> [GatewayCredentialKind: GatewayCredentialMetadata] {
@@ -113,46 +307,48 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
             throw GatewayCredentialStoreError.invalidValue
         }
 
-        let keychain = try userKeychain()
-        let service = serviceName(for: kind)
-        let query = itemQuery(kind, account: account, keychain: keychain)
-        guard let trustedApplicationPath,
-              FileManager.default.isExecutableFile(atPath: trustedApplicationPath) else {
-            throw GatewayCredentialStoreError.accessControlUnavailable
-        }
-        let keychainPath = try path(for: keychain)
-        let accessAlreadyValid = try hasExpectedAccess(
-            query: query,
-            trustedApplicationPaths: [
-                trustedApplicationPath,
-                "/usr/bin/security",
-            ]
-        )
-        let storeCommand = try makeSecurityStoreCommand(
-            service: service,
-            account: account,
-            value: data,
-            trustedApplicationPath: trustedApplicationPath,
-            keychainPath: keychainPath,
-            repairAccess: !accessAlreadyValid
-        )
-        let storeResult = runSecurityCLI(
-            arguments: ["-i"],
-            standardInput: storeCommand
-        )
-        guard storeResult.status == 0 else {
-            throw GatewayCredentialStoreError.keychainFailure
-        }
+        return try lifecycleGate.withWriteAdmission {
+            let keychain = try userKeychain()
+            let service = serviceName(for: kind)
+            let query = itemQuery(kind, account: account, keychain: keychain)
+            guard let trustedApplicationPath,
+                  FileManager.default.isExecutableFile(atPath: trustedApplicationPath) else {
+                throw GatewayCredentialStoreError.accessControlUnavailable
+            }
+            let keychainPath = try path(for: keychain)
+            let accessAlreadyValid = try hasExpectedAccess(
+                query: query,
+                trustedApplicationPaths: [
+                    trustedApplicationPath,
+                    "/usr/bin/security",
+                ]
+            )
+            let storeCommand = try makeSecurityStoreCommand(
+                service: service,
+                account: account,
+                value: data,
+                trustedApplicationPath: trustedApplicationPath,
+                keychainPath: keychainPath,
+                repairAccess: !accessAlreadyValid
+            )
+            let storeResult = runSecurityCLI(
+                arguments: ["-i"],
+                standardInput: storeCommand
+            )
+            guard storeResult.status == 0 else {
+                throw GatewayCredentialStoreError.keychainFailure
+            }
 
-        guard verifyWithSecurityCLI(
-            service: service,
-            account: account,
-            keychainPath: keychainPath,
-            expectedValue: normalized
-        ) else {
-            throw GatewayCredentialStoreError.verificationFailed
+            guard verifyWithSecurityCLI(
+                service: service,
+                account: account,
+                keychainPath: keychainPath,
+                expectedValue: normalized
+            ) else {
+                throw GatewayCredentialStoreError.verificationFailed
+            }
+            return try metadata(for: kind, account: account, keychain: keychain)
         }
-        return try metadata(for: kind, account: account, keychain: keychain)
     }
 
     private func userKeychain() throws -> SecKeychain {
@@ -1292,15 +1488,24 @@ final class GatewaySettingsController: ObservableObject {
             credentialMetadata = [:]
             credentialMetadataContext = nil
             credentialMetadataState = .failed
-            lastErrorCode = "keychain_write_failed"
-            state = .failed
+            switch error as? GatewayCredentialStoreError {
+            case .lifecycleConflict:
+                lastErrorCode = RelayctlReportedErrorCode.integrationRecoveryRequired.rawValue
+                state = .recoveryRequired
+            case .lifecycleUnsafe:
+                lastErrorCode = RelayctlReportedErrorCode.integrationStateUnsafe.rawValue
+                state = .bindingUnsafe
+            default:
+                lastErrorCode = "keychain_write_failed"
+                state = .failed
+            }
             activityLog.record(
                 .error,
                 category: .operation,
                 code: "gateway_credential_replace_finished",
                 fields: [
                     "action": kind.rawValue,
-                    "result_code": "keychain_write_failed",
+                    "result_code": lastErrorCode ?? "keychain_write_failed",
                 ]
             )
             return false
