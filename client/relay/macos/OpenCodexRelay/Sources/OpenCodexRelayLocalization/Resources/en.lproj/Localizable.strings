@@ -693,6 +693,7 @@
 "homebrew_guard.development_setup.result_hint" = "If the installer reports a diagnostic code";
 "homebrew_guard.development_setup.guidance.daemon_start" = "Retry update once.";
 "homebrew_guard.development_setup.guidance.probe" = "Check helper status, then run update.";
+"homebrew_guard.development_setup.guidance.ownership" = "Do not loosen system-directory ownership or write permissions. Update to a compatible app; if this code persists, stop and report the bounded receipt.";
 "homebrew_guard.development_setup.guidance.rollback" = "Stop repeating install or update and run recover.";
 "homebrew_guard.development_setup.command" = "Reviewed installer command";
 "homebrew_guard.development_setup.copy" = "Copy command";

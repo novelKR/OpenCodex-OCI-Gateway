@@ -749,8 +749,18 @@ public final class HelperInstallerController: @unchecked Sendable {
         do {
             try diagnosed(phase: .statePrepare, fallbackReason: .publishFailed) {
                 try updateTransactionPhase(.mutationStarted)
-                try ensureDirectory(helperURL.deletingLastPathComponent(), mode: 0o755)
-                try ensureDirectory(plistURL.deletingLastPathComponent(), mode: 0o755)
+                // Preserve a sticky bit already present on a root-owned macOS
+                // system publishing directory. App-owned state remains exact-mode.
+                try ensureDirectory(
+                    helperURL.deletingLastPathComponent(),
+                    mode: 0o755,
+                    allowExistingStickyBit: true
+                )
+                try ensureDirectory(
+                    plistURL.deletingLastPathComponent(),
+                    mode: 0o755,
+                    allowExistingStickyBit: true
+                )
             }
             try diagnosed(phase: .helperPublish, fallbackReason: .publishFailed) {
                 try atomicCopy(artifacts.sourceHelperURL, to: helperURL, mode: 0o755)
@@ -1287,12 +1297,17 @@ public final class HelperInstallerController: @unchecked Sendable {
         }
     }
 
-    private func ensureDirectory(_ url: URL, mode: mode_t) throws {
+    private func ensureDirectory(
+        _ url: URL,
+        mode: mode_t,
+        allowExistingStickyBit: Bool = false
+    ) throws {
         let parent = url.deletingLastPathComponent()
         guard secureDirectory(parent, exactMode: nil) else {
             throw HelperInstallerFailureReason.unsafeParent
         }
         var info = stat()
+        var created = false
         if lstat(url.path, &info) != 0 {
             let lookupError = errno
             guard lookupError == ENOENT else {
@@ -1312,10 +1327,15 @@ public final class HelperInstallerController: @unchecked Sendable {
             guard lstat(url.path, &info) == 0 else {
                 throw systemFailureReason(errno, fallback: .publishFailed)
             }
+            created = true
         }
+        let observedMode = info.st_mode & mode_t(0o7777)
+        let acceptedExistingMode = mode | mode_t(S_ISVTX)
+        let modeAccepted = observedMode == mode ||
+            (!created && allowExistingStickyBit && observedMode == acceptedExistingMode)
         guard (info.st_mode & S_IFMT) == S_IFDIR,
               info.st_uid == configuration.expectedOwnerUID,
-              info.st_mode & mode_t(0o7777) == mode else {
+              modeAccepted else {
             throw HelperInstallerFailureReason.ownerOrModeMismatch
         }
     }

@@ -690,6 +690,8 @@ public enum AppStringKey: String, CaseIterable, Sendable {
         "homebrew_guard.development_setup.guidance.daemon_start"
     case homebrewGuardDevelopmentGuidanceProbe =
         "homebrew_guard.development_setup.guidance.probe"
+    case homebrewGuardDevelopmentGuidanceOwnership =
+        "homebrew_guard.development_setup.guidance.ownership"
     case homebrewGuardDevelopmentGuidanceRollback =
         "homebrew_guard.development_setup.guidance.rollback"
     case homebrewGuardDevelopmentSetupCommand = "homebrew_guard.development_setup.command"

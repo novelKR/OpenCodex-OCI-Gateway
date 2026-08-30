@@ -1004,8 +1004,13 @@ final class MenuBarModelTests: XCTestCase {
             [["rollback_result=failed"]]
         )
         XCTAssertEqual(
-            HomebrewGuardDiagnosticGuidanceBlock.codeGroups(isRecovery: false).count,
-            3
+            HomebrewGuardDiagnosticGuidanceBlock.codeGroups(isRecovery: false),
+            [
+                ["daemon_start_rejected"],
+                ["probe_timeout", "xpc_rejected", "invalid_response"],
+                ["owner_or_mode_mismatch"],
+                ["rollback_result=failed"],
+            ]
         )
     }
 
