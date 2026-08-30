@@ -655,16 +655,22 @@ tag to current public `main`, requires the successful `linux`, `macos`, and
 tag that is not current public `main`. Because the job token cannot read the
 repository's administrative immutable-release setting, the operator enables
 and verifies it before tagging; the publisher then verifies the released
-version's immutable state and deletes the new release on failure.
+version's immutable state. Any failure after draft creation triggers a bounded
+deletion attempt; if GitHub has already made that release immutable and rejects
+cleanup, CI reports the unresolved public state and client enrollment must stop.
+Tags with a SemVer suffix, such as `0.3.8-rc.1`, are additionally required to
+publish and read back as GitHub pre-releases. Every new tag must add a bounded
+version-specific note at `client/relay/release-notes/VERSION.md`; CI embeds that
+reviewed fragment ahead of the common installation and verification guidance.
 
 The protected `relay-release` GitHub Environment holds the base64-encoded v2
 Ed25519 private key. The macOS job compares its derived public key with
 [`../../config/trust/opencodex-relay-release-ed25519.pub`](../../config/trust/opencodex-relay-release-ed25519.pub),
 builds and independently verifies exactly eight assets, attaches GitHub build
 provenance, and then calls `scripts/publish-github-release.sh`. The publisher
-creates a draft, verifies its exact asset set, publishes it, and removes the new
-release if immutable status cannot be confirmed. Release `0.3.6` is the first
-version using this public CI path.
+creates a draft, verifies its exact asset set and reviewed body, publishes it,
+and attempts bounded cleanup if the final immutable state cannot be confirmed.
+Release `0.3.6` is the first version using this public CI path.
 
 Do not commit the private key, its base64 representation, a generated release
 directory, credentials, or live request logs. Manifest compatibility revision 4 signs component identity,

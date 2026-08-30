@@ -110,6 +110,69 @@ final class RelayLocalizationTests: XCTestCase {
         }
     }
 
+    func testMissingBindingGuidanceUsesConsumerSetupAndStateGatedRecovery() {
+        let english = AppLocalizer(selection: .english)
+        let korean = AppLocalizer(selection: .korean)
+        let englishBindingGuidance = "Relay setup for this user is incomplete. Go to Settings > Connect a self-hosted server and choose Prepare Relay. Use Recover setup only when recovery is required."
+
+        XCTAssertEqual(english.text(.bindingMissing), englishBindingGuidance)
+        XCTAssertEqual(RoutingBindingError.missing.safeMessage, englishBindingGuidance)
+        XCTAssertEqual(
+            korean.text(.bindingMissing),
+            "현재 사용자의 Relay 설정이 완료되지 않았습니다. 설정 > 셀프 호스팅 서버 연결에서 Relay 준비를 선택하세요. 복구가 필요한 경우에만 설정 복구를 사용하세요."
+        )
+
+        XCTAssertEqual(
+            english.text(.gatewayDetailIntegrationRequired),
+            "Enter the server address and required credentials, then choose Prepare Relay. Prepare Relay creates only user-owned files and never opens Terminal or requests administrator access."
+        )
+        XCTAssertEqual(
+            korean.text(.gatewayDetailIntegrationRequired),
+            "서버 주소와 필요한 자격 증명을 입력한 뒤 Relay 준비를 선택하세요. Relay 준비는 사용자 소유 파일만 만들며 Terminal을 열거나 관리자 권한을 요청하지 않습니다."
+        )
+
+        XCTAssertEqual(
+            english.text(.codexConfigBindingMissing),
+            "The protected routing binding is unavailable. Prepare Relay in Settings, or use Recover setup there when recovery is required, before reviewing the Codex configuration."
+        )
+        XCTAssertEqual(
+            korean.text(.codexConfigBindingMissing),
+            "보호된 라우팅 binding을 사용할 수 없습니다. Codex 설정을 확인하기 전에 설정에서 Relay 준비를 진행하거나 복구가 필요한 경우 설정 복구를 사용하세요."
+        )
+
+        XCTAssertEqual(
+            english.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
+            "Complete Relay setup for this user before finding or selecting Local OpenCodex."
+        )
+        XCTAssertEqual(
+            korean.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
+            "Local OpenCodex를 탐색하거나 선택하기 전에 현재 사용자의 Relay 설정을 완료하세요."
+        )
+        XCTAssertEqual(
+            english.text(.controlCenterLocalOpenCodexOpenSettings),
+            "Open self-hosted server settings"
+        )
+        XCTAssertEqual(
+            korean.text(.controlCenterLocalOpenCodexOpenSettings),
+            "셀프 호스팅 서버 설정 열기"
+        )
+        XCTAssertEqual(
+            english.text(.controlCenterLocalOpenCodexOpenSettingsHint),
+            "Opens Settings > Connect a self-hosted server, where you can prepare Relay or recover setup when required."
+        )
+        XCTAssertEqual(
+            korean.text(.controlCenterLocalOpenCodexOpenSettingsHint),
+            "설정 > 셀프 호스팅 서버 연결을 열어 Relay를 준비하거나 필요한 경우 설정을 복구합니다."
+        )
+
+        XCTAssertFalse(english.text(.bindingMissing).localizedCaseInsensitiveContains("reinstall"))
+        XCTAssertFalse(korean.text(.bindingMissing).contains("다시 설치"))
+        XCTAssertFalse(english.text(.codexConfigBindingMissing).localizedCaseInsensitiveContains("reinstall"))
+        XCTAssertFalse(korean.text(.codexConfigBindingMissing).contains("다시 설치"))
+        XCTAssertFalse(english.text(.appInformationVersionMismatch).localizedCaseInsensitiveContains("reinstall"))
+        XCTAssertFalse(korean.text(.appInformationVersionMismatch).contains("다시 설치"))
+    }
+
     func testRelocationSourceFailuresHaveDistinctEnglishAndKoreanGuidance() {
         for selection in [AppLanguageSelection.english, .korean] {
             let localizer = AppLocalizer(selection: selection)

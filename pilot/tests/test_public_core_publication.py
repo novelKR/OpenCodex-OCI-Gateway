@@ -147,6 +147,10 @@ class PublicCorePublicationTests(unittest.TestCase):
         self.assertIn("current public main commit", workflow)
         self.assertIn("build-release.sh \"$version\"", workflow)
         self.assertIn("publish-github-release.sh \"$version\"", workflow)
+        self.assertIn(
+            '--release-notes-fragment "client/relay/release-notes/${version}.md"',
+            workflow,
+        )
         self.assertIn("release output is not the exact eight-asset set", workflow)
         self.assertIn("gatekeeper_approval=manual expected_for=adhoc", workflow)
         self.assertIn("Signature=adhoc", workflow)

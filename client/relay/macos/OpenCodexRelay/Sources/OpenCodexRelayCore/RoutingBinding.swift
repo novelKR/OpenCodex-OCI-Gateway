@@ -47,7 +47,7 @@ public enum RoutingBindingError: LocalizedError, Equatable, Sendable {
     public var safeMessage: String {
         switch self {
         case .missing:
-            return "Routing binding is unavailable. Reinstall or repair the MenuBar integration."
+            return "Relay setup for this user is incomplete. Go to Settings > Connect a self-hosted server and choose Prepare Relay. Use Recover setup only when recovery is required."
         case .unsafeFile:
             return "Routing binding failed its local security checks. Routing is unavailable."
         case .malformed:

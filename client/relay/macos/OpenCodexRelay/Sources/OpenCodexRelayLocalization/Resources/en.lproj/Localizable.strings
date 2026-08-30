@@ -75,7 +75,7 @@
 "presentation.local_unavailable.accessibility" = "PW OpenCodex Relay: local OpenCodex is unavailable; only external gateway or native Codex may be selected";
 "presentation.relay_unavailable.accessibility" = "PW OpenCodex Relay: local relay is unavailable";
 
-"binding.missing" = "Routing binding is unavailable. Reinstall or repair the MenuBar integration.";
+"binding.missing" = "Relay setup for this user is incomplete. Go to Settings > Connect a self-hosted server and choose Prepare Relay. Use Recover setup only when recovery is required.";
 "binding.unsafe" = "Routing binding failed its local security checks. Routing is unavailable.";
 "binding.invalid" = "Routing binding is invalid. Routing is unavailable.";
 "integration.preview" = "Preview mode displays the Desktop UX without using an installed Relay. Open Settings for the separate local-development integration guide.";
@@ -147,6 +147,9 @@
 "control_center.connection" = "Connection & Routing";
 "control_center.desktop" = "Codex Desktop";
 "control_center.local_opencodex" = "Local OpenCodex";
+"control_center.local_opencodex.setup_required.detail" = "Complete Relay setup for this user before finding or selecting Local OpenCodex.";
+"control_center.local_opencodex.open_settings" = "Open self-hosted server settings";
+"control_center.local_opencodex.open_settings.hint" = "Opens Settings > Connect a self-hosted server, where you can prepare Relay or recover setup when required.";
 "control_center.maintenance" = "Maintenance & Recovery";
 "control_center.activity_log" = "Activity Log";
 "activity_log.about" = "Log information";
@@ -197,7 +200,7 @@
 "app_information.version_match" = "Matches app version";
 "app_information.version_match.matched" = "Matched";
 "app_information.version_match.different" = "Different";
-"app_information.version_mismatch" = "This component reports a different version from the app bundle. Rebuild or reinstall the complete app bundle.";
+"app_information.version_mismatch" = "This component reports a different version from the app bundle. Replace the complete app bundle with one reviewed build before continuing.";
 "app_information.privacy" = "Versions are read locally from fixed executables inside this app with a short timeout and bounded output. Paths, raw output, and errors are not displayed or recorded.";
 "control_center.recovery_needed" = "Recovery is required. Open Control Center for details.";
 "control_center.refresh.hint" = "Immediately refreshes the current relay and selected app status.";
@@ -277,7 +280,7 @@
 "gateway.detail.authentication_mismatch" = "The gateway rejected the current address and credential combination.";
 "gateway.detail.unreachable" = "The gateway could not be reached within the bounded connection test.";
 "gateway.detail.catalog_invalid" = "The gateway response was not a valid Codex model catalog.";
-"gateway.detail.integration_required" = "Move this app to Applications and allow it in macOS Privacy & Security, then enter your server details. Prepare Relay creates only user-owned files and never opens Terminal or requests administrator access.";
+"gateway.detail.integration_required" = "Enter the server address and required credentials, then choose Prepare Relay. Prepare Relay creates only user-owned files and never opens Terminal or requests administrator access.";
 "gateway.detail.recovery_required" = "An interrupted setup could not prove rollback. Recover the user-owned setup before trying again.";
 "gateway.detail.app_location_invalid" = "Move the actual app bundle to /Applications or your Applications folder, open it there, and allow it in macOS Privacy & Security. Aliases and symlinks are not accepted.";
 "relocation.title" = "Move to Applications";
@@ -665,7 +668,7 @@
 "codex_config.preview.title" = "Codex TOML Preview";
 "codex_config.preview.close" = "Close";
 "codex_config.preview.session_detail" = "The complete text is kept only for this preview and is cleared from Relay memory when the sheet closes.";
-"codex_config.error.binding_missing" = "The protected routing binding is missing. Reinstall or repair the local Relay integration.";
+"codex_config.error.binding_missing" = "The protected routing binding is unavailable. Prepare Relay in Settings, or use Recover setup there when recovery is required, before reviewing the Codex configuration.";
 "codex_config.error.preview_mode" = "Preview mode does not read Codex config.toml. Complete the separate local-development integration, then use read-only preview or external editing.";
 "codex_config.error.binding_unsafe" = "The protected routing binding failed its local file checks. No configuration path is shown.";
 "codex_config.error.binding_invalid" = "The protected routing binding is invalid. No configuration path is shown.";

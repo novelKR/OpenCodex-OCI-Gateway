@@ -75,7 +75,7 @@
 "presentation.local_unavailable.accessibility" = "PW OpenCodex Relay: 로컬 OpenCodex를 사용할 수 없으며 외부 게이트웨이 또는 기본 Codex만 선택할 수 있습니다";
 "presentation.relay_unavailable.accessibility" = "PW OpenCodex Relay: 로컬 Relay를 사용할 수 없습니다";
 
-"binding.missing" = "라우팅 binding을 사용할 수 없습니다. MenuBar 통합을 다시 설치하거나 복구하세요.";
+"binding.missing" = "현재 사용자의 Relay 설정이 완료되지 않았습니다. 설정 > 셀프 호스팅 서버 연결에서 Relay 준비를 선택하세요. 복구가 필요한 경우에만 설정 복구를 사용하세요.";
 "binding.unsafe" = "라우팅 binding이 로컬 보안 검사를 통과하지 못했습니다. 라우팅을 사용할 수 없습니다.";
 "binding.invalid" = "라우팅 binding이 유효하지 않습니다. 라우팅을 사용할 수 없습니다.";
 "integration.preview" = "Preview 모드는 설치된 Relay를 사용하지 않고 Desktop UX만 표시합니다. 별도 로컬 개발 통합 안내는 설정에서 확인하세요.";
@@ -147,6 +147,9 @@
 "control_center.connection" = "연결 및 라우팅";
 "control_center.desktop" = "Codex Desktop";
 "control_center.local_opencodex" = "Local OpenCodex";
+"control_center.local_opencodex.setup_required.detail" = "Local OpenCodex를 탐색하거나 선택하기 전에 현재 사용자의 Relay 설정을 완료하세요.";
+"control_center.local_opencodex.open_settings" = "셀프 호스팅 서버 설정 열기";
+"control_center.local_opencodex.open_settings.hint" = "설정 > 셀프 호스팅 서버 연결을 열어 Relay를 준비하거나 필요한 경우 설정을 복구합니다.";
 "control_center.maintenance" = "유지보수 및 복구";
 "control_center.activity_log" = "활동 로그";
 "activity_log.about" = "로그 정보";
@@ -197,7 +200,7 @@
 "app_information.version_match" = "앱 버전 일치";
 "app_information.version_match.matched" = "일치";
 "app_information.version_match.different" = "불일치";
-"app_information.version_mismatch" = "이 구성요소가 앱 번들과 다른 버전을 보고했습니다. 전체 앱 번들을 다시 빌드하거나 설치하세요.";
+"app_information.version_mismatch" = "이 구성요소가 앱 번들과 다른 버전을 보고했습니다. 계속하기 전에 전체 앱 번들을 검토된 동일 빌드로 교체하세요.";
 "app_information.privacy" = "이 앱 내부의 고정 실행 파일에서 짧은 제한 시간과 출력 상한으로 버전만 읽습니다. 경로·원시 출력·오류는 표시하거나 기록하지 않습니다.";
 "control_center.recovery_needed" = "복구가 필요합니다. Control Center를 확인하세요.";
 "control_center.refresh.hint" = "현재 Relay 및 선택 앱 상태를 즉시 다시 확인합니다.";
@@ -277,7 +280,7 @@
 "gateway.detail.authentication_mismatch" = "게이트웨이가 현재 주소와 자격 증명 조합을 거부했습니다.";
 "gateway.detail.unreachable" = "제한된 연결 테스트 시간 안에 게이트웨이에 연결하지 못했습니다.";
 "gateway.detail.catalog_invalid" = "게이트웨이 응답이 올바른 Codex 모델 카탈로그가 아닙니다.";
-"gateway.detail.integration_required" = "이 앱을 응용 프로그램 폴더로 옮기고 macOS 개인정보 보호 및 보안에서 허용한 뒤 서버 정보를 입력하세요. Relay 준비는 사용자 소유 파일만 만들며 Terminal이나 관리자 권한을 사용하지 않습니다.";
+"gateway.detail.integration_required" = "서버 주소와 필요한 자격 증명을 입력한 뒤 Relay 준비를 선택하세요. Relay 준비는 사용자 소유 파일만 만들며 Terminal을 열거나 관리자 권한을 요청하지 않습니다.";
 "gateway.detail.recovery_required" = "중단된 설정의 복구 완료를 입증하지 못했습니다. 다시 시도하기 전에 사용자 영역 설정을 복구하세요.";
 "gateway.detail.app_location_invalid" = "실제 앱 번들을 /Applications 또는 사용자 응용 프로그램 폴더로 옮겨 그 위치에서 실행하고 macOS 개인정보 보호 및 보안에서 허용하세요. 별칭과 심볼릭 링크는 허용하지 않습니다.";
 "relocation.title" = "응용 프로그램으로 이동";
@@ -665,7 +668,7 @@
 "codex_config.preview.title" = "Codex TOML 미리보기";
 "codex_config.preview.close" = "닫기";
 "codex_config.preview.session_detail" = "전체 원문은 이 미리보기 동안만 메모리에 유지되며 sheet를 닫으면 Relay 메모리에서 제거됩니다.";
-"codex_config.error.binding_missing" = "보호된 라우팅 binding이 없습니다. 로컬 Relay 통합을 다시 설치하거나 복구하세요.";
+"codex_config.error.binding_missing" = "보호된 라우팅 binding을 사용할 수 없습니다. Codex 설정을 확인하기 전에 설정에서 Relay 준비를 진행하거나 복구가 필요한 경우 설정 복구를 사용하세요.";
 "codex_config.error.preview_mode" = "Preview 모드는 Codex config.toml을 읽지 않습니다. 별도 로컬 개발 통합을 완료한 뒤 읽기 전용 미리보기 또는 외부 편집을 사용하세요.";
 "codex_config.error.binding_unsafe" = "보호된 라우팅 binding이 로컬 파일 검사를 통과하지 못했습니다. 설정 경로를 표시하지 않습니다.";
 "codex_config.error.binding_invalid" = "보호된 라우팅 binding이 유효하지 않습니다. 설정 경로를 표시하지 않습니다.";

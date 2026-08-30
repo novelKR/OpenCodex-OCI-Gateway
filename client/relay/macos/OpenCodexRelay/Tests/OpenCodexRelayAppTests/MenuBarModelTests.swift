@@ -357,6 +357,48 @@ final class MenuBarModelTests: XCTestCase {
         func calls() -> [Call] { recorded }
     }
 
+    private actor DelayedDiscoveryClient: OpenCodexDiscovering {
+        private let response: OpenCodexDiscoveryResult
+        private var recordedCount = 0
+        private var started = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var responseContinuation: CheckedContinuation<Void, Never>?
+
+        init(response: OpenCodexDiscoveryResult) {
+            self.response = response
+        }
+
+        func discover(
+            tier _: OpenCodexDiscoveryTier,
+            broadScanApproved _: Bool
+        ) async throws -> OpenCodexDiscoveryResult {
+            recordedCount += 1
+            started = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { continuation in
+                precondition(responseContinuation == nil)
+                responseContinuation = continuation
+            }
+            return response
+        }
+
+        func waitForStart() async {
+            guard !started else { return }
+            await withCheckedContinuation { continuation in
+                startWaiters.append(continuation)
+            }
+        }
+
+        func resume() {
+            responseContinuation?.resume()
+            responseContinuation = nil
+        }
+
+        func callCount() -> Int { recordedCount }
+    }
+
     private actor RemovalClient: OpenCodexRemovalExecuting {
         private let inventory: OpenCodexDataInventoryReceipt
         private let removal: OpenCodexRemovalReceipt?
@@ -728,6 +770,155 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertTrue(model.shouldOpenSelfHostedOnboarding)
     }
 
+    func testMissingBindingBlocksInjectedDiscoveryAndManualSelection() async throws {
+        let appURL = try makeAppBundle()
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: root)
+        }
+        let discovery = DiscoveryClient(responses: [
+            try discoveryResult(tier: .a, includesCandidate: true),
+        ])
+        let model = MenuBarModel(
+            client: nil,
+            discoveryClient: discovery,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: root.appendingPathComponent("missing-routing-binding.json"),
+            helperURL: root.appendingPathComponent("missing-relayctl"),
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        XCTAssertEqual(model.integrationAvailability, .missing)
+        XCTAssertFalse(
+            LocalOpenCodexPrimaryAction.showsDiscoveryControls(model.integrationAvailability)
+        )
+
+        model.addLocalOpenCodexBackend()
+        XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+        XCTAssertEqual(model.message?.code, "routing_binding_missing")
+
+        XCTAssertFalse(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        model.selectOpenCodexExecutableManually()
+
+        let blockedCalls = await discovery.calls()
+        XCTAssertEqual(blockedCalls, [])
+        XCTAssertNil(model.openCodexRemovalFlow)
+        XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+    }
+
+    func testBindingLossBlocksBroadApprovalAndCandidateChoice() async throws {
+        let appURL = try makeAppBundle()
+        let fixture = try makeManagedIntegrationFixture(status: externalStatus())
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let discovery = DiscoveryClient(responses: [
+            try discoveryResult(tier: .a, includesCandidate: false),
+            try discoveryResult(tier: .b, includesCandidate: false),
+            try discoveryResult(tier: .a, includesCandidate: true),
+        ])
+        let model = MenuBarModel(
+            client: nil,
+            discoveryClient: discovery,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: fixture.binding,
+            helperURL: fixture.helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        await model.refreshStatusNow()
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .broadScanApprovalRequired = model.openCodexDiscoveryState { return true }
+            return false
+        }
+
+        try FileManager.default.removeItem(at: fixture.binding)
+        model.approveBroadOpenCodexDiscovery()
+
+        XCTAssertEqual(model.integrationAvailability, .missing)
+        XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+        let callsBeforeBroadApproval = await discovery.calls()
+        XCTAssertEqual(callsBeforeBroadApproval.count, 2)
+
+        try writeRoutingBinding(at: fixture.binding)
+        await model.refreshStatusNow()
+        model.addLocalOpenCodexBackend()
+        try await waitUntil {
+            if case .candidates = model.openCodexDiscoveryState { return true }
+            return false
+        }
+
+        try FileManager.default.removeItem(at: fixture.binding)
+        XCTAssertFalse(model.chooseDiscoveredOpenCodexCandidate(id: "0123456789abcdef01234567"))
+        model.selectOpenCodexExecutableManually()
+
+        XCTAssertEqual(model.integrationAvailability, .missing)
+        XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+        XCTAssertNil(model.openCodexRemovalFlow)
+        let callsAfterCandidateBlock = await discovery.calls()
+        XCTAssertEqual(callsAfterCandidateBlock.count, 3)
+    }
+
+    func testBindingLossWhileDiscoveryIsInFlightDiscardsTheResult() async throws {
+        let appURL = try makeAppBundle()
+        let fixture = try makeManagedIntegrationFixture(status: externalStatus())
+        defer {
+            try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let discovery = DelayedDiscoveryClient(
+            response: try discoveryResult(tier: .a, includesCandidate: true)
+        )
+        let model = MenuBarModel(
+            client: nil,
+            discoveryClient: discovery,
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: DesktopController(runningValues: []),
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            bindingURL: fixture.binding,
+            helperURL: fixture.helper,
+            startsPolling: false,
+            runtimeMode: .managed,
+            localization: englishLocalization()
+        )
+
+        await model.refreshStatusNow()
+        model.addLocalOpenCodexBackend()
+        await discovery.waitForStart()
+        try FileManager.default.removeItem(at: fixture.binding)
+        await discovery.resume()
+        try await waitUntil { !model.isBusy }
+
+        let callCount = await discovery.callCount()
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(model.integrationAvailability, .missing)
+        XCTAssertEqual(model.openCodexDiscoveryState, .idle)
+        XCTAssertTrue(model.discoveredOpenCodexCandidates.isEmpty)
+        XCTAssertEqual(model.message?.code, "routing_binding_missing")
+    }
+
     func testInteractiveSurfaceVisibilityTracksPopoverAndControlCenterIndependently() {
         let model = MenuBarModel(
             client: RelayctlClient(response: externalStatus()),
@@ -902,6 +1093,23 @@ final class MenuBarModelTests: XCTestCase {
                 distributionFlavor: .localDevelopment,
                 localization: localization
             )
+            let missingIntegrationModel = MenuBarModel(
+                client: nil,
+                targetStore: TargetStore(nil),
+                desktopApplication: DesktopController(runningValues: []),
+                desktopTrustPolicy: trustedPolicy,
+                desktopTrustValidator: TrustValidator(),
+                desktopDiscoverer: DesktopDiscoverer(),
+                loginRegistration: LoginRegistration(),
+                bindingURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString)
+                    .appendingPathComponent("routing-binding.json"),
+                startsPolling: false,
+                distributionFlavor: .localDevelopment,
+                runtimeMode: .managed,
+                localization: localization
+            )
+            XCTAssertEqual(missingIntegrationModel.integrationAvailability, .missing)
             let localizer = localization.localizer
             let controller = model.makeCodexConfigurationController()
             let pages: [AnyView] = [
@@ -932,7 +1140,16 @@ final class MenuBarModelTests: XCTestCase {
                     localizer: localizer,
                     title: localizer.text(.controlCenterLocalOpenCodex),
                     systemImage: "shippingbox",
-                    openMaintenance: {}
+                    openMaintenance: {},
+                    openSettings: {}
+                )),
+                AnyView(LocalOpenCodexControlCenterPage(
+                    model: missingIntegrationModel,
+                    localizer: localizer,
+                    title: localizer.text(.controlCenterLocalOpenCodex),
+                    systemImage: "shippingbox",
+                    openMaintenance: {},
+                    openSettings: {}
                 )),
                 AnyView(MaintenanceControlCenterPage(
                     model: model,
@@ -1014,6 +1231,56 @@ final class MenuBarModelTests: XCTestCase {
         )
     }
 
+    func testLocalOpenCodexPrimaryActionUsesSettingsOnlyForMissingIntegration() {
+        XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(.missing), .openSettings)
+        XCTAssertFalse(LocalOpenCodexPrimaryAction.showsDiscoveryControls(.missing))
+        for availability in [
+            RelayIntegrationAvailability.ready,
+            .preview,
+            .unsafe,
+            .invalid,
+            .helperUnavailable,
+        ] {
+            XCTAssertEqual(LocalOpenCodexPrimaryAction.resolve(availability), .find)
+            XCTAssertEqual(
+                LocalOpenCodexPrimaryAction.showsDiscoveryControls(availability),
+                availability == .ready
+            )
+        }
+    }
+
+    func testIntegrationNoticeToneWinsWhenMessageIsDeduplicated() {
+        let cases: [(RelayIntegrationAvailability, ControlCenterStatusTone)] = [
+            (.ready, .neutral),
+            (.missing, .warning),
+            (.preview, .info),
+            (.unsafe, .error),
+            (.invalid, .error),
+            (.helperUnavailable, .error),
+        ]
+
+        for (availability, expectedTone) in cases {
+            XCTAssertEqual(
+                ControlCenterStatusTone.integrationTone(for: availability),
+                expectedTone
+            )
+        }
+
+        let missingMessage = SafeStatusMessage(
+            code: RelayIntegrationAvailability.missing.safeCode,
+            key: .bindingMissing
+        )
+        XCTAssertEqual(
+            ControlCenterStatusTone.messageTone(
+                for: missingMessage,
+                statusError: missingMessage,
+                integrationMessage: missingMessage,
+                integrationAvailability: .missing
+            ),
+            .warning
+        )
+    }
+
     func testLongDiagnosticGuidanceFitsCommonDetailWidths() {
         for selection in [AppLanguageSelection.english, .korean] {
             let localization = LocalizationStore()
@@ -1090,6 +1357,7 @@ final class MenuBarModelTests: XCTestCase {
             startsPolling: false,
             localization: englishLocalization()
         )
+        await tierBModel.refreshStatusNow()
         tierBModel.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = tierBModel.openCodexDiscoveryState { return true }
@@ -1119,6 +1387,7 @@ final class MenuBarModelTests: XCTestCase {
             startsPolling: false,
             localization: englishLocalization()
         )
+        await tierCModel.refreshStatusNow()
         tierCModel.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .broadScanApprovalRequired = tierCModel.openCodexDiscoveryState { return true }
@@ -1324,7 +1593,10 @@ final class MenuBarModelTests: XCTestCase {
         )
         let installationID = try XCTUnwrap(candidateResult.candidates.first?.id)
         let desktop = DesktopController(runningValues: [])
-        let client = RelayctlClient(response: orphanRecoveryStatus(generation: 3))
+        let client = RelayctlClient(responses: [
+            externalStatus(generation: 2),
+            orphanRecoveryStatus(generation: 3),
+        ])
         let activityLog = RelayActivityLogStore(subsystem: "test.relay.activity")
         let model = MenuBarModel(
             client: client,
@@ -1346,7 +1618,8 @@ final class MenuBarModelTests: XCTestCase {
             if case .candidates = model.openCodexDiscoveryState { return true }
             return false
         }
-        model.chooseDiscoveredOpenCodexCandidate(id: installationID)
+        XCTAssertTrue(model.chooseDiscoveredOpenCodexCandidate(id: installationID))
+        await model.refreshStatusNow()
         model.chooseOpenCodexHandoffAction(.retainProxyRemoveShim)
 
         XCTAssertEqual(model.openCodexRemovalFlow?.handoffProgress?.phase, .failed)
@@ -1354,7 +1627,7 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(model.openCodexRemovalFlow?.handoffProgress?.result?.code, "routing_recovery_required")
         XCTAssertEqual(desktop.quitRequests, 0)
         let blockedCommands = await client.commands()
-        XCTAssertEqual(blockedCommands, [.status])
+        XCTAssertEqual(blockedCommands, [.status, .status])
         XCTAssertTrue(activityLog.events.contains {
             $0.code == "handoff_blocked" &&
                 $0.fields["failure_code"] == "routing_recovery_required" &&
@@ -2079,6 +2352,7 @@ final class MenuBarModelTests: XCTestCase {
             localization: englishLocalization()
         )
 
+        await model.refreshStatusNow()
         model.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = model.openCodexDiscoveryState { return true }
@@ -2364,6 +2638,7 @@ final class MenuBarModelTests: XCTestCase {
             localization: englishLocalization()
         )
 
+        await model.refreshStatusNow()
         model.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = model.openCodexDiscoveryState { return true }
@@ -2475,6 +2750,7 @@ final class MenuBarModelTests: XCTestCase {
             localization: englishLocalization()
         )
 
+        await model.refreshStatusNow()
         model.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = model.openCodexDiscoveryState { return true }
@@ -2579,6 +2855,7 @@ final class MenuBarModelTests: XCTestCase {
             localization: englishLocalization()
         )
 
+        await model.refreshStatusNow()
         model.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = model.openCodexDiscoveryState { return true }
@@ -2637,18 +2914,11 @@ final class MenuBarModelTests: XCTestCase {
             startsPolling: false,
             localization: englishLocalization()
         )
+        await recoveryModel.refreshStatusNow()
         recoveryModel.addLocalOpenCodexBackend()
-        try await waitUntil {
-            if case .candidates = recoveryModel.openCodexDiscoveryState { return true }
-            return false
-        }
-        recoveryModel.chooseDiscoveredOpenCodexCandidate(id: installationID)
-        XCTAssertEqual(recoveryModel.openCodexRemovalFlow?.candidate?.id, installationID)
-        XCTAssertTrue(recoveryModel.openCodexRemovalFlow?.automaticRemovalEligible == true)
-
-        recoveryModel.beginOpenCodexRemoval()
-        try await waitUntil { recoveryModel.openCodexRemovalFlow?.phase == .failed }
-        XCTAssertEqual(recoveryModel.message?.code, "opencodex_removal_route_unsafe")
+        XCTAssertEqual(recoveryModel.openCodexDiscoveryState, .idle)
+        XCTAssertNil(recoveryModel.openCodexRemovalFlow)
+        XCTAssertEqual(recoveryModel.message?.code, "routing_recovery_required")
         let blockedInspectCount = await blockedRemoval.inspectCount()
         XCTAssertEqual(blockedInspectCount, 0)
 
@@ -2666,6 +2936,7 @@ final class MenuBarModelTests: XCTestCase {
             startsPolling: false,
             localization: englishLocalization()
         )
+        await stableModel.refreshStatusNow()
         stableModel.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = stableModel.openCodexDiscoveryState { return true }
@@ -3084,6 +3355,7 @@ final class MenuBarModelTests: XCTestCase {
         let relay = RelayctlClient(responses: [
             externalStatus(generation: 1),
             externalStatus(generation: 1),
+            externalStatus(generation: 1),
             recoveryStatus(generation: 2),
             recoveryStatus(generation: 2),
             externalStatus(generation: 3),
@@ -3104,6 +3376,7 @@ final class MenuBarModelTests: XCTestCase {
             localization: englishLocalization()
         )
 
+        await model.refreshStatusNow()
         model.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = model.openCodexDiscoveryState { return true }
@@ -3429,6 +3702,7 @@ final class MenuBarModelTests: XCTestCase {
             localization: englishLocalization()
         )
 
+        await model.refreshStatusNow()
         model.addLocalOpenCodexBackend()
         try await waitUntil {
             if case .candidates = model.openCodexDiscoveryState { return true }
@@ -3696,6 +3970,41 @@ final class MenuBarModelTests: XCTestCase {
         let bundle = directory.appendingPathComponent("Codex Desktop.app", isDirectory: true)
         try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
         return bundle
+    }
+
+    private func makeManagedIntegrationFixture(
+        status: RoutingStatus
+    ) throws -> (root: URL, binding: URL, helper: URL) {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let binding = root.appendingPathComponent("routing-binding.json", isDirectory: false)
+        try writeRoutingBinding(at: binding)
+
+        let helper = root.appendingPathComponent("opencodex-relayctl", isDirectory: false)
+        let encodedStatus = try JSONEncoder().encode(status).base64EncodedString()
+        try Data("""
+        #!/bin/sh
+        printf '%s' '\(encodedStatus)' | /usr/bin/base64 -D
+        """.utf8).write(to: helper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: helper.path
+        )
+        return (root, binding, helper)
+    }
+
+    private func writeRoutingBinding(at url: URL) throws {
+        let binding = RoutingBinding(
+            relayConfig: "/tmp/opencodex-relay-tests-relay.json",
+            codexConfig: "/tmp/opencodex-relay-tests-codex.toml"
+        )
+        try JSONEncoder().encode(binding).write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 
     private func externalStatus(

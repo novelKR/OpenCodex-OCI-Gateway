@@ -8,10 +8,16 @@ import OpenCodexRelayCore
 final class GatewaySettingsTests: XCTestCase {
     private actor IntegrationClient: SelfHostedIntegrationManaging {
         private var state: SelfHostedIntegrationState
+        private let applyError: RelayctlError?
         private(set) var applications: [(GatewayCandidate, String)] = []
+        private(set) var recoveries = 0
 
-        init(state: SelfHostedIntegrationState = .integrationRequired) {
+        init(
+            state: SelfHostedIntegrationState = .integrationRequired,
+            applyError: RelayctlError? = nil
+        ) {
             self.state = state
+            self.applyError = applyError
         }
 
         func inspect() async throws -> SelfHostedIntegrationInspection {
@@ -28,6 +34,12 @@ final class GatewaySettingsTests: XCTestCase {
             expectedStateDigest: String
         ) async throws -> SelfHostedIntegrationReceipt {
             applications.append((candidate, expectedStateDigest))
+            if let applyError {
+                if applyError == .reported(.integrationRecoveryRequired) {
+                    state = .recoveryRequired
+                }
+                throw applyError
+            }
             state = .ready
             return SelfHostedIntegrationReceipt(
                 schemaVersion: 1,
@@ -39,6 +51,7 @@ final class GatewaySettingsTests: XCTestCase {
         }
 
         func recover() async throws -> SelfHostedIntegrationReceipt {
+            recoveries += 1
             state = .integrationRequired
             return SelfHostedIntegrationReceipt(
                 schemaVersion: 1,
@@ -105,6 +118,79 @@ final class GatewaySettingsTests: XCTestCase {
             inspection = postApplyInspection
             onApply?()
             return applyReceipt
+        }
+    }
+
+    func testActionModeKeepsSetupAndRecoveryActionsExclusive() {
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: .integrationRequired,
+                integrationState: .integrationRequired
+            ),
+            .prepare
+        )
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: .recoveryRequired,
+                integrationState: .integrationRequired
+            ),
+            .recover
+        )
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: .bindingUnsafe,
+                integrationState: .integrationRequired
+            ),
+            .testAndApply
+        )
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: .bindingUnsafe,
+                integrationState: .recoveryRequired
+            ),
+            .testAndApply
+        )
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: .applying,
+                integrationState: .recoveryRequired
+            ),
+            .recover
+        )
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: .applying,
+                integrationState: nil
+            ),
+            .testAndApply
+        )
+
+        let standardStates: [GatewaySettingsState] = [
+            .loading,
+            .needsValidation,
+            .testing,
+            .applying,
+            .connected,
+            .authenticationMismatch,
+            .unreachable,
+            .catalogInvalid,
+            .appLocationInvalid,
+            .integrationArtifactInvalid,
+            .bindingUnsafe,
+            .bindingInvalid,
+            .helperUnavailable,
+            .unsupported,
+            .failed,
+        ]
+        for state in standardStates {
+            XCTAssertEqual(
+                GatewaySettingsActionMode.resolve(
+                    state: state,
+                    integrationState: nil
+                ),
+                .testAndApply,
+                "unexpected action mode for \(state)"
+            )
         }
     }
 
@@ -448,6 +534,53 @@ final class GatewaySettingsTests: XCTestCase {
         XCTAssertEqual(applications.first?.1, String(repeating: "d", count: 64))
         XCTAssertFalse(activityLog.jsonLines().contains(privateURL))
         XCTAssertTrue(activityLog.jsonLines().contains("self_hosted_integration_finished"))
+    }
+
+    func testPrepareRecoveryRequiredSynchronizesInspectionAndExposesOnlyRecovery() async {
+        let integration = IntegrationClient(
+            applyError: .reported(.integrationRecoveryRequired)
+        )
+        let controller = GatewaySettingsController(
+            client: nil,
+            unavailability: .bindingMissing,
+            integrationClient: integration,
+            credentialStore: CredentialStore(),
+            receiptStore: ReceiptStore(),
+            activityLog: RelayActivityLogStore(),
+            onRoutingRefreshRequested: {}
+        )
+
+        await controller.refresh()
+        controller.draftURL = "https://recovery.example.test/v1"
+        controller.authenticationProfile = .gatewayAPIKey
+        controller.authenticationProfileDidChange()
+        await waitUntil { controller.credentialMetadataState == .ready }
+        XCTAssertTrue(controller.canPrepareIntegration)
+
+        controller.prepareIntegration()
+        await waitUntil { !controller.isBusy }
+
+        XCTAssertEqual(controller.state, .recoveryRequired)
+        XCTAssertEqual(controller.integrationInspection?.state, .recoveryRequired)
+        XCTAssertFalse(controller.canPrepareIntegration)
+        XCTAssertTrue(controller.canRecoverIntegration)
+        XCTAssertEqual(
+            GatewaySettingsActionMode.resolve(
+                state: controller.state,
+                integrationState: controller.integrationInspection?.state
+            ),
+            .recover
+        )
+
+        controller.prepareIntegration()
+        let applicationCount = await integration.applications.count
+        XCTAssertEqual(applicationCount, 1)
+
+        controller.recoverIntegration()
+        await waitUntil { !controller.isBusy }
+        let recoveryCount = await integration.recoveries
+        XCTAssertEqual(recoveryCount, 1)
+        XCTAssertEqual(controller.state, .integrationRequired)
     }
 
     func testResolverBlocksActionsWhenBindingChangesImmediatelyBeforeStart() async {

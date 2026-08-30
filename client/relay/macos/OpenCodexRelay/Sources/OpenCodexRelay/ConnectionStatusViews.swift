@@ -325,7 +325,8 @@ struct RelayControlCenterView: View {
                 localizer: localizer,
                 title: localizer.text(section.titleKey),
                 systemImage: section.systemImage,
-                openMaintenance: { selection = .maintenance }
+                openMaintenance: { selection = .maintenance },
+                openSettings: { selection = .settings }
             )
         case .maintenance:
             MaintenanceControlCenterPage(
@@ -419,8 +420,9 @@ struct OpenCodexDiscoveryControls: View {
                         candidate.version,
                         candidate.tier.rawValue.uppercased()
                     )) {
-                        model.chooseDiscoveredOpenCodexCandidate(id: candidate.id)
-                        onRemovalFlowPresented()
+                        if model.chooseDiscoveredOpenCodexCandidate(id: candidate.id) {
+                            onRemovalFlowPresented()
+                        }
                     }
                     .disabled(model.isBusy)
                     .help(candidate.packageRoot)

@@ -1,5 +1,19 @@
 import SwiftUI
+import OpenCodexRelayCore
 import OpenCodexRelayLocalization
+
+enum LocalOpenCodexPrimaryAction: Equatable {
+    case find
+    case openSettings
+
+    static func resolve(_ availability: RelayIntegrationAvailability) -> Self {
+        availability == .missing ? .openSettings : .find
+    }
+
+    static func showsDiscoveryControls(_ availability: RelayIntegrationAvailability) -> Bool {
+        availability == .ready
+    }
+}
 
 struct OverviewControlCenterPage: View {
     @ObservedObject var model: MenuBarModel
@@ -220,6 +234,7 @@ struct LocalOpenCodexControlCenterPage: View {
     let title: String
     let systemImage: String
     let openMaintenance: () -> Void
+    let openSettings: () -> Void
 
     var body: some View {
         ControlCenterPage(title: title, systemImage: systemImage, model: model, localizer: localizer) {
@@ -233,27 +248,60 @@ struct LocalOpenCodexControlCenterPage: View {
                     )
                     Divider()
 
-                    ControlCenterActionFooter {
-                        EmptyView()
-                    } primary: {
-                        Button {
-                            model.addLocalOpenCodexBackend()
-                        } label: {
-                            Label(localizer.text(.menuAddLocal), systemImage: "plus.circle")
-                        }
-                        .buttonStyle(.glassProminent)
-                        .disabled(model.isBusy || !model.desktopTargetState.canControl || !model.canRequestRouting)
-                        .accessibilityHint(localizer.text(.menuAddLocalHint))
-                    }
+                    localOpenCodexPrimaryAction
 
-                    OpenCodexDiscoveryControls(
-                        model: model,
-                        localizer: localizer,
-                        onRemovalFlowPresented: openMaintenance
-                    )
+                    if LocalOpenCodexPrimaryAction.showsDiscoveryControls(
+                        model.integrationAvailability
+                    ) {
+                        OpenCodexDiscoveryControls(
+                            model: model,
+                            localizer: localizer,
+                            onRemovalFlowPresented: openMaintenance
+                        )
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 4)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var localOpenCodexPrimaryAction: some View {
+        switch LocalOpenCodexPrimaryAction.resolve(model.integrationAvailability) {
+        case .openSettings:
+            ControlCenterSupportingText(
+                localizer.text(.controlCenterLocalOpenCodexSetupRequiredDetail),
+                systemImage: "gearshape"
+            )
+            ControlCenterActionFooter {
+                EmptyView()
+            } primary: {
+                Button(action: openSettings) {
+                    Label(
+                        localizer.text(.controlCenterLocalOpenCodexOpenSettings),
+                        systemImage: "gearshape"
+                    )
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(model.isBusy)
+                .accessibilityHint(
+                    localizer.text(.controlCenterLocalOpenCodexOpenSettingsHint)
+                )
+            }
+
+        case .find:
+            ControlCenterActionFooter {
+                EmptyView()
+            } primary: {
+                Button {
+                    model.addLocalOpenCodexBackend()
+                } label: {
+                    Label(localizer.text(.menuAddLocal), systemImage: "plus.circle")
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(model.isBusy || !model.desktopTargetState.canControl || !model.canRequestRouting)
+                .accessibilityHint(localizer.text(.menuAddLocalHint))
             }
         }
     }
