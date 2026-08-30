@@ -1,5 +1,7 @@
 {
   "architecture": "arm64",
+  "npm_install_strategy": "global_ignore_scripts_v1",
+  "npm_resolution_before": "2026-08-17T00:00:00.000Z",
   "packages": [
     {
       "integrity": "sha512-YFWwTrHEgCEeBOsRBuFltLUdmmhf48xEQM4oaIDO9mEiWBor0wAqE0uIvj6eJpyZY0xd/Mhz8O77q9Nflp/y7A==",
@@ -712,7 +714,7 @@
     "adapter_id": "opencodex_npm_2_22_0_preserve_v1",
     "architecture": "arm64",
     "artifact_variant": "npm_2_22_0_darwin_arm64_v3",
-    "closure_sha256": "9f11a0612349a286546f8a2be07b30baca8db541b79a0f2de3f8b42e14d52249",
+    "closure_sha256": "f5f80363694b4d3dce4375acc93097ffc8f3ae1cd3b03df8450e3c3fd26b09f4",
     "critical_modules": {
       "package.json": "23d58fd93c12138baca76f044899d82aea45768aa38f5f78c86e957e080be06b",
       "src/codex/desired-state.ts": "6f9f526d81f9f93013ed0c43eca0514b54e5eab77a72054d3d8ca84d0f04ce08",

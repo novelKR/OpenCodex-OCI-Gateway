@@ -100,7 +100,7 @@ func TestProductionTeardownRegistryUsesExactStableProfiles(t *testing.T) {
 			break
 		}
 	}
-	if v3 == nil || v3.reviewedClosureSHA256 != "9f11a0612349a286546f8a2be07b30baca8db541b79a0f2de3f8b42e14d52249" {
+	if v3 == nil || v3.reviewedClosureSHA256 != "f5f80363694b4d3dce4375acc93097ffc8f3ae1cd3b03df8450e3c3fd26b09f4" {
 		t.Fatalf("2.22.0 v3 profile = %#v", v3)
 	}
 	if got := teardownAdapterIDForVersion("2.33.0"); got != "opencodex_npm_2_33_0_preserve_v1" {

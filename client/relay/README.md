@@ -318,11 +318,14 @@ sanitized diagnostic containing only version, manager, and reason code.
 New automatic-removal profiles require a review manifest under
 `internal/handoff/review-manifests`. The manifest pins every transitive package
 path, version, official npm tarball integrity, required-module digest, complete
-closure digest, symlink, and approved install transform. Run
+closure digest, symlink, approved install transform, and registry publish-time
+cutoff for the reviewed dependency resolution. Run
 `scripts/review-teardown-profiles.py --check` on darwin/arm64 to fetch official
-registry artifacts, reconstruct two isolated roots, compare both complete
-closures, and run the teardown adapter dry-run preflight. CI enforces this for
-profile changes. A weekly read-only audit repeats registered-manifest checks
+registry artifacts, verify their exact integrity, perform two isolated real npm
+global installs with scripts disabled and private caches, compare their complete
+closures with both the artifact reconstruction and the Go runtime digest, and
+run the teardown adapter dry-run preflight. CI enforces this for profile
+changes. A weekly read-only audit repeats registered-manifest checks
 and reports a new stable upstream version as `unsupported`; it does not modify
 profiles or open an issue automatically. Historical profiles through `2.33.0`
 (including the original `2.22.0` v1/v2 variants) are a closed pre-manifest

@@ -88,7 +88,7 @@ var teardownAdapterProfiles = []teardownAdapterProfile{
 	reviewedTeardownProfile(
 		"2.22.0", "npm_2_22_0_darwin_arm64_v3",
 		"sha512-YFWwTrHEgCEeBOsRBuFltLUdmmhf48xEQM4oaIDO9mEiWBor0wAqE0uIvj6eJpyZY0xd/Mhz8O77q9Nflp/y7A==",
-		"9f11a0612349a286546f8a2be07b30baca8db541b79a0f2de3f8b42e14d52249",
+		"f5f80363694b4d3dce4375acc93097ffc8f3ae1cd3b03df8450e3c3fd26b09f4",
 		teardownModuleHashes(
 			"23d58fd93c12138baca76f044899d82aea45768aa38f5f78c86e957e080be06b", moduleDesired222, moduleInject222, moduleShimLegacy,
 			"299b6ebd1a6d89bc34352ac5e2fcf446e4fb7fd08da7bbd178123c85a6a8162d", moduleGrokLegacy, moduleRegistry222, moduleStateLegacy,
