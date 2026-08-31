@@ -190,6 +190,7 @@ one manifest with an off-repository Ed25519 private key:
 ./client/relay/scripts/build-release.sh REPLACE_WITH_VERSION \
   --base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
   --signing-key /secure/off-repo/opencodex-relay-release-ed25519.pem \
+  --previous-build-number REPLACE_WITH_GREATEST_PUBLISHED_CF_BUNDLE_VERSION \
   --output /secure/release-staging/REPLACE_WITH_VERSION
 ```
 
@@ -221,6 +222,17 @@ failed first enrollment restores absence of the new JSON, routing block, and
 service artifact; the verified version directory may remain on disk but is not
 selected or enabled.
 
+The distribution app keeps the complete SemVer in `CFBundleShortVersionString`
+and takes its independently increasing `CFBundleVersion` from
+`client/relay/RELEASE_BUILD_NUMBER`. The builder accepts only `1...9999` and
+requires it to be greater than `--previous-build-number`. The production app
+contains the tracked Ed25519 public key with byte-for-byte and fingerprint
+verification under `Contents/Resources/ReleaseTrust`. Revision 5 verifiers
+strictly bind the channel, minimum updater/macOS versions, trust key ID, and
+integration/helper protocols. The first updater bootstrap, `0.3.8-rc.6`, stays
+on revision 4 so existing manual installers can consume it; existing users must
+install that bootstrap release manually.
+
 ### Public GitHub Release distribution
 
 Publish official artifacts from the public Core repository. Enable
@@ -235,12 +247,14 @@ repository; the signing private key remains off-repository and off-client.
 ./client/relay/scripts/build-release.sh 1.2.3 \
   --github-repo OWNER/opencodex-relay-releases \
   --signing-key /secure/off-repo/opencodex-relay-release-ed25519.pem \
+  --previous-build-number REPLACE_WITH_GREATEST_PUBLISHED_CF_BUNDLE_VERSION \
   --output /secure/release-staging/1.2.3
 
 ./client/relay/scripts/publish-github-release.sh 1.2.3 \
   --repo OWNER/opencodex-relay-releases \
   --input /secure/release-staging/1.2.3 \
-  --public-key /secure/off-repo/opencodex-relay-release-ed25519.pub
+  --public-key /secure/off-repo/opencodex-relay-release-ed25519.pub \
+  --release-notes-fragment client/relay/release-notes/1.2.3.md
 ```
 
 The publisher checks public visibility, an absent version, the manifest
@@ -250,6 +264,11 @@ eight-asset set before publishing and again after
 publication. It fails if GitHub does not report an immutable release; do not enroll
 clients against such a release. GitHub attestations are supplemental evidence;
 the out-of-band public PEM and signed manifest remain the client trust root.
+
+Stable tags publish with `prerelease=false` and `latest=true`; prerelease tags
+publish with `prerelease=true` and `latest=false`. The publisher reads back the
+exact tag, draft/prerelease/immutable state, eight asset names, and GitHub API
+digests. Release API ordering is never treated as SemVer ordering.
 
 Public release downloads require no credential. A separate expiring, read-only
 token may be supplied only to avoid anonymous GitHub API rate limits. It is not

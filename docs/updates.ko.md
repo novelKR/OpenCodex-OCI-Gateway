@@ -47,6 +47,14 @@ immutable asset으로 함께 publish하고, 각 client는
 `current`를 바꾸기 전에 manifest signature, 선택 component checksum, signed notice checksum을
 모두 검증합니다. revision 1/2는 rollback artifact로 남지만 새 build는
 `signing_mode: "adhoc"`을 포함하는 component-aware compatibility revision 4를 사용합니다.
+배포 app은 tracked release public key를 포함하며, `CFBundleVersion`은
+`client/relay/RELEASE_BUILD_NUMBER`의 단조 증가 정수입니다. stable은 GitHub latest이고
+preview prerelease는 latest가 아니며, API 표시 순서는 버전 순서로 사용하지 않습니다.
+revision 5 verifier는 M0부터 호환되지만 첫 updater bootstrap인 `0.3.8-rc.6`은 revision 4로
+게시하고 기존 사용자는 이를 수동 설치해야 합니다. 이후 release부터 signed update
+compatibility metadata를 사용합니다. updater는 bounded pagination 결과를 strict SemVer로
+비교하며, stable channel은 non-prerelease만, preview channel은 stable과 prerelease를 함께
+고려해 최댓값을 고릅니다. 어느 channel도 현재 버전보다 낮은 release를 선택하지 않습니다.
 
 ### public GitHub Release를 사용하는 경우
 

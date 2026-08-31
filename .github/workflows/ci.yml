@@ -62,3 +62,80 @@ jobs:
         run: |
           swift test
           swift build -c release
+      - name: Dry-run the production release package
+        run: |
+          set -euo pipefail
+          release_root="${RUNNER_TEMP}/relay-release-dry-run"
+          extract_root="${RUNNER_TEMP}/relay-release-dry-run-extract"
+          signing_key="${RUNNER_TEMP}/relay-release-dry-run.pem"
+          signing_public_key="${RUNNER_TEMP}/relay-release-dry-run.pub"
+          signature_bin="${RUNNER_TEMP}/relay-release-dry-run.sig"
+          cleanup() {
+            rm -rf -- "$release_root" "$extract_root"
+            rm -f -- "$signing_key" "$signing_public_key" "$signature_bin"
+          }
+          trap cleanup EXIT
+          openssl genpkey -algorithm ED25519 -out "$signing_key"
+          openssl pkey -in "$signing_key" -pubout -out "$signing_public_key"
+          release_build_number="$(sed -n '1p' client/relay/RELEASE_BUILD_NUMBER)"
+          ./client/relay/scripts/build-release.sh 0.3.8-rc.6 \
+            --github-repo novelKR/OpenCodex-OCI-Gateway \
+            --signing-key "$signing_key" \
+            --previous-build-number 0.3.8 \
+            --output "$release_root"
+          manifest="${release_root}/manifest-0.3.8-rc.6.json"
+          base64 -D < "${release_root}/manifest-0.3.8-rc.6.sig" > "$signature_bin"
+          openssl pkeyutl -verify -pubin -inkey "$signing_public_key" -rawin \
+            -in "$manifest" -sigfile "$signature_bin"
+          python3 - "$release_root" "$manifest" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          release_root = pathlib.Path(sys.argv[1])
+          manifest = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          if manifest.get("compatibility_revision") != 4:
+              raise SystemExit("dry-run manifest is not revision 4")
+          matches = [
+              artifact for artifact in manifest.get("artifacts", [])
+              if artifact.get("component") == "macos_menu_bar_bundle"
+          ]
+          if len(matches) != 1:
+              raise SystemExit("dry-run manifest has no unique app artifact")
+          app_artifact = matches[0]
+          archive = release_root / "OpenCodexRelay.app.zip"
+          if app_artifact.get("file") != archive.name:
+              raise SystemExit("dry-run manifest app filename mismatch")
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != app_artifact.get("sha256"):
+              raise SystemExit("dry-run app archive hash mismatch")
+          PY
+          ditto -x -k "${release_root}/OpenCodexRelay.app.zip" "$extract_root"
+          app="${extract_root}/OpenCodexRelay.app"
+          plist="${app}/Contents/Info.plist"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "$release_build_number" ]]
+          tracked_key="config/trust/opencodex-relay-release-ed25519.pub"
+          bundled_key="${app}/Contents/Resources/ReleaseTrust/opencodex-relay-release-ed25519.pub"
+          tracked_der="${RUNNER_TEMP}/relay-release-dry-run-tracked.der"
+          bundled_der="${RUNNER_TEMP}/relay-release-dry-run-bundled.der"
+          cmp -s "$tracked_key" "$bundled_key"
+          openssl pkey -pubin -in "$tracked_key" -outform DER > "$tracked_der"
+          openssl pkey -pubin -in "$bundled_key" -outform DER > "$bundled_der"
+          [[ "$(shasum -a 256 "$tracked_der" | awk '{print $1}')" == \
+             "$(shasum -a 256 "$bundled_der" | awk '{print $1}')" ]]
+          codesign --verify --deep --strict --verbose=2 "$app"
+          for component in \
+            "$app" \
+            "${app}/Contents/MacOS/OpenCodexRelay" \
+            "${app}/Contents/Library/Helpers/opencodex-relay" \
+            "${app}/Contents/Library/Helpers/opencodex-relayctl" \
+            "${app}/Contents/Library/Helpers/OpenCodexRelayHelperInstaller" \
+            "${app}/Contents/Library/HelperTools/OpenCodexRelayPrivilegedHelper"; do
+            details="$(codesign -dvvv --verbose=4 "$component" 2>&1)"
+            grep -Fx 'Signature=adhoc' <<<"$details" >/dev/null
+            grep -Fx 'TeamIdentifier=not set' <<<"$details" >/dev/null
+            grep -E '^CodeDirectory .*flags=.*\(.*runtime.*\)' <<<"$details" >/dev/null
+            if [[ -f "$component" ]]; then
+              [[ "$(lipo -archs "$component")" == arm64 ]]
+            fi
+          done

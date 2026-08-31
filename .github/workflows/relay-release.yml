@@ -8,7 +8,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: relay-release-${{ github.ref }}
+  group: relay-release
   cancel-in-progress: false
 
 env:
@@ -22,6 +22,8 @@ jobs:
     permissions:
       checks: read
       contents: read
+    outputs:
+      previous_build_number: ${{ steps.previous-build.outputs.previous_build_number }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -108,6 +110,76 @@ jobs:
             cat "$release_error" >&2
             exit 1
           }
+      - name: Resolve the greatest previous public app build
+        id: previous-build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_json="${RUNNER_TEMP}/relay-releases.json"
+          app_assets="${RUNNER_TEMP}/relay-app-assets.tsv"
+          builds="${RUNNER_TEMP}/relay-app-builds.txt"
+          gh api "repos/${RELEASE_REPOSITORY}/releases?per_page=100&page=1" > "$release_json"
+          release_count="$(jq 'length' "$release_json")"
+          [[ "$release_count" -lt 100 ]] || {
+            printf 'ERROR: previous public release scan exceeded its one-page bound\n' >&2
+            exit 1
+          }
+          jq -r '
+            [.[] | select(.draft == false) | .assets[]
+               | select(.name == "OpenCodexRelay.app.zip" and .state == "uploaded")
+               | [.id, .size]]
+            | .[] | @tsv
+          ' "$release_json" > "$app_assets"
+          asset_count="$(wc -l < "$app_assets" | tr -d ' ')"
+          [[ "$asset_count" -ge 1 && "$asset_count" -lt 100 ]] || {
+            printf 'ERROR: expected 1 through 99 previous public macOS app assets, found %s\n' "$asset_count" >&2
+            exit 1
+          }
+          : > "$builds"
+          index=0
+          while IFS=$'\t' read -r asset_id asset_size; do
+            [[ "$asset_id" =~ ^[0-9]+$ && "$asset_size" =~ ^[0-9]+$ && "$asset_size" -le 134217728 ]] || {
+              printf 'ERROR: previous public macOS app asset metadata is invalid\n' >&2
+              exit 1
+            }
+            archive="${RUNNER_TEMP}/previous-relay-app-${index}.zip"
+            plist="${RUNNER_TEMP}/previous-relay-info-${index}.plist"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${RELEASE_REPOSITORY}/releases/assets/${asset_id}" > "$archive"
+            [[ "$(wc -c < "$archive" | tr -d ' ')" == "$asset_size" ]] || {
+              printf 'ERROR: previous public macOS app download size mismatch\n' >&2
+              exit 1
+            }
+            unzip -p "$archive" 'OpenCodexRelay.app/Contents/Info.plist' > "$plist"
+            python3 - "$plist" >> "$builds" <<'PY'
+          import plistlib
+          import re
+          import sys
+
+          with open(sys.argv[1], "rb") as stream:
+              value = plistlib.load(stream).get("CFBundleVersion")
+          if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", value):
+              raise SystemExit("invalid previous CFBundleVersion")
+          print(value)
+          PY
+            index=$((index + 1))
+          done < "$app_assets"
+          previous_build_number="$(python3 - "$builds" <<'PY'
+          import pathlib
+          import sys
+
+          def parsed(value: str) -> tuple[int, int, int]:
+              parts = [int(part) for part in value.split(".")]
+              return tuple((parts + [0, 0])[:3])
+
+          values = [line.strip() for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          if not values:
+              raise SystemExit("no previous build numbers")
+          print(max(values, key=parsed))
+          PY
+          )"
+          printf 'previous_build_number=%s\n' "$previous_build_number" >> "$GITHUB_OUTPUT"
       - name: Validate the public checkout and release contracts
         run: |
           set -euo pipefail
@@ -173,6 +245,7 @@ jobs:
           ./client/relay/scripts/build-release.sh "$version" \
             --github-repo "$RELEASE_REPOSITORY" \
             --signing-key "$key_path" \
+            --previous-build-number "${{ needs.preflight.outputs.previous_build_number }}" \
             --output "$release_root"
           printf 'artifact_dir=%s\n' "$release_root" >> "$GITHUB_OUTPUT"
       - name: Independently verify the release bundle
@@ -199,6 +272,7 @@ jobs:
             diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$actual_assets") >&2 || true
             exit 1
           }
+          release_build_number="$(sed -n '1p' client/relay/RELEASE_BUILD_NUMBER)"
 
           signature_bin="${RUNNER_TEMP}/manifest-${version}.sig.bin"
           trap 'rm -f -- "$signature_bin"' EXIT
@@ -251,7 +325,7 @@ jobs:
           }
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" == io.github.novelkr.opencodex-relay ]]
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" == "$version" ]]
-          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "${version%%-*}" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "$release_build_number" ]]
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexBundleIdentifier' "$plist")" == com.openai.codex ]]
           [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexTeamIdentifier' "$plist")" == 2DC432GLL2 ]]
           codesign --verify --deep --strict --verbose=2 "$app"
@@ -261,6 +335,14 @@ jobs:
           app_binary="${app}/Contents/MacOS/OpenCodexRelay"
           relay="${app}/Contents/Library/Helpers/opencodex-relay"
           relayctl="${app}/Contents/Library/Helpers/opencodex-relayctl"
+          bundled_release_key="${app}/Contents/Resources/ReleaseTrust/opencodex-relay-release-ed25519.pub"
+          [[ -f "$bundled_release_key" && ! -L "$bundled_release_key" ]]
+          cmp -s "$RELEASE_PUBLIC_KEY" "$bundled_release_key"
+          tracked_key_der="${RUNNER_TEMP}/tracked-release-key.der"
+          bundled_key_der="${RUNNER_TEMP}/bundled-release-key.der"
+          openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY" -outform DER > "$tracked_key_der"
+          openssl pkey -pubin -in "$bundled_release_key" -outform DER > "$bundled_key_der"
+          cmp -s "$tracked_key_der" "$bundled_key_der"
           for component in "$app" "$app_binary" "$helper" "$installer" "$relay" "$relayctl"; do
             details="$(codesign -dvvv --verbose=4 "$component" 2>&1)"
             grep -Fx 'Signature=adhoc' <<<"$details" >/dev/null
