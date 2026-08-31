@@ -53,6 +53,16 @@ signature, selected component checksums, and signed notice checksum before it
 updates `current`.
 Revision 1 and 2 releases remain available for rollback; new builds use
 component-aware compatibility revision 4 with `signing_mode: "adhoc"`.
+The distribution app embeds the tracked release public key and uses the
+monotonically increasing integer in `client/relay/RELEASE_BUILD_NUMBER` as its
+`CFBundleVersion`. Stable releases are GitHub latest; preview prereleases are
+not, and API display order is never used as version order. Revision 5 verifier
+support begins in M0, while the first updater bootstrap `0.3.8-rc.6` remains a
+revision 4 release that existing users must install manually. Later releases add
+signed update compatibility data. The updater compares bounded pagination
+results by strict SemVer: stable considers only non-prereleases, while preview
+considers both stable and prerelease versions and selects the maximum. Neither
+channel selects a version below the installed version.
 
 ### Public GitHub Release option
 

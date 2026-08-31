@@ -138,6 +138,58 @@ func TestVerifyRevisionFourRejectsUnknownAndAppleSigningFields(t *testing.T) {
 	}
 }
 
+func TestVerifyRevisionFiveUpdaterMetadata(t *testing.T) {
+	manifest := []byte(`{"version":"1.2.4-rc.1","compatibility_revision":5,"artifacts":[{"os":"darwin","arch":"arm64","component":"macos_menu_bar_bundle","file":"OpenCodexRelay.app.zip","url":"https://example.test/OpenCodexRelay.app.zip","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bundle_id":"com.example.relay","signing_mode":"adhoc","minimum_macos_version":"26.0","integration_protocol":1,"helper_protocol":1},{"os":"linux","arch":"amd64","component":"relay","file":"relay-amd64","url":"https://example.test/relay-amd64","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"os":"linux","arch":"amd64","component":"relayctl","file":"relayctl-amd64","url":"https://example.test/relayctl-amd64","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"os":"linux","arch":"arm64","component":"relay","file":"relay-arm64","url":"https://example.test/relay-arm64","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"os":"linux","arch":"arm64","component":"relayctl","file":"relayctl-arm64","url":"https://example.test/relayctl-arm64","sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}],"documents":[{"file":"THIRD_PARTY_NOTICES.md","url":"https://example.test/THIRD_PARTY_NOTICES.md","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}],"channel":"preview","minimum_updater_version":"1.2.3","trust_key_id":"1111111111111111111111111111111111111111111111111111111111111111"}`)
+	signature, key := signManifestForTest(t, manifest)
+
+	verified, err := Verify(manifest, signature, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Channel != ChannelPreview || verified.MinimumUpdaterVersion != "1.2.3" {
+		t.Fatalf("verified updater manifest = %#v", verified)
+	}
+	artifact, err := verified.SelectComponent("darwin", "arm64", ComponentMacOSMenuBarBundle)
+	if err != nil || artifact.IntegrationProtocol != 1 || artifact.HelperProtocol != 1 {
+		t.Fatalf("macOS updater artifact = %#v, err = %v", artifact, err)
+	}
+}
+
+func TestVerifyRevisionFiveRejectsInvalidUpdaterMetadata(t *testing.T) {
+	base := `{"version":"1.2.4-rc.1","compatibility_revision":5,"artifacts":[{"os":"darwin","arch":"arm64","component":"macos_menu_bar_bundle","file":"OpenCodexRelay.app.zip","url":"https://example.test/OpenCodexRelay.app.zip","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bundle_id":"com.example.relay","signing_mode":"adhoc","minimum_macos_version":"26.0","integration_protocol":1,"helper_protocol":1},{"os":"linux","arch":"amd64","component":"relay","file":"relay-amd64","url":"https://example.test/relay-amd64","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"os":"linux","arch":"amd64","component":"relayctl","file":"relayctl-amd64","url":"https://example.test/relayctl-amd64","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"os":"linux","arch":"arm64","component":"relay","file":"relay-arm64","url":"https://example.test/relay-arm64","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"os":"linux","arch":"arm64","component":"relayctl","file":"relayctl-arm64","url":"https://example.test/relayctl-arm64","sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}],"documents":[{"file":"THIRD_PARTY_NOTICES.md","url":"https://example.test/THIRD_PARTY_NOTICES.md","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}],%s}`
+	tests := map[string]string{
+		"channel mismatch":        `"channel":"stable","minimum_updater_version":"1.2.3","trust_key_id":"1111111111111111111111111111111111111111111111111111111111111111"`,
+		"invalid minimum updater": `"channel":"preview","minimum_updater_version":"1.2.03","trust_key_id":"1111111111111111111111111111111111111111111111111111111111111111"`,
+		"invalid trust key":       `"channel":"preview","minimum_updater_version":"1.2.3","trust_key_id":"AAAA"`,
+		"unknown field":           `"channel":"preview","minimum_updater_version":"1.2.3","trust_key_id":"1111111111111111111111111111111111111111111111111111111111111111","unexpected":true`,
+	}
+	for name, fields := range tests {
+		t.Run(name, func(t *testing.T) {
+			manifest := []byte(fmt.Sprintf(base, fields))
+			signature, key := signManifestForTest(t, manifest)
+			if _, err := Verify(manifest, signature, key); err == nil {
+				t.Fatal("invalid updater manifest was accepted")
+			}
+		})
+	}
+}
+
+func TestVerifyRevisionFiveRequiresMacOSCompatibilityMetadata(t *testing.T) {
+	manifest := []byte(`{"version":"1.2.4-rc.1","compatibility_revision":5,"artifacts":[{"os":"darwin","arch":"arm64","component":"macos_menu_bar_bundle","file":"OpenCodexRelay.app.zip","url":"https://example.test/OpenCodexRelay.app.zip","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bundle_id":"com.example.relay","signing_mode":"adhoc","minimum_macos_version":"26.0","helper_protocol":1},{"os":"linux","arch":"amd64","component":"relay","file":"relay-amd64","url":"https://example.test/relay-amd64","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"os":"linux","arch":"amd64","component":"relayctl","file":"relayctl-amd64","url":"https://example.test/relayctl-amd64","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"os":"linux","arch":"arm64","component":"relay","file":"relay-arm64","url":"https://example.test/relay-arm64","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"os":"linux","arch":"arm64","component":"relayctl","file":"relayctl-arm64","url":"https://example.test/relayctl-arm64","sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}],"documents":[{"file":"THIRD_PARTY_NOTICES.md","url":"https://example.test/THIRD_PARTY_NOTICES.md","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}],"channel":"preview","minimum_updater_version":"1.2.3","trust_key_id":"1111111111111111111111111111111111111111111111111111111111111111"}`)
+	signature, key := signManifestForTest(t, manifest)
+	if _, err := Verify(manifest, signature, key); err == nil {
+		t.Fatal("revision 5 manifest without integration protocol was accepted")
+	}
+}
+
+func TestVerifyRejectsDuplicateJSONKeys(t *testing.T) {
+	manifest := []byte(`{"version":"1.2.3","version":"1.2.4","compatibility_revision":1,"artifacts":[{"os":"linux","arch":"arm64","file":"relay","url":"https://example.test/relay","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`)
+	signature, key := signManifestForTest(t, manifest)
+	if _, err := Verify(manifest, signature, key); err == nil {
+		t.Fatal("duplicate manifest key was accepted")
+	}
+}
+
 func signManifestForTest(t *testing.T, manifest []byte) ([]byte, []byte) {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)

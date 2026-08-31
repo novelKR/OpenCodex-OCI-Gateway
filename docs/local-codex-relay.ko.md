@@ -183,6 +183,7 @@ manifest를 서명하고, manifest에 각 binary의 HTTPS URL과 SHA-256을 기�
 ./client/relay/scripts/build-release.sh REPLACE_WITH_VERSION \
   --base-url https://REPLACE_WITH_RELEASE_HOST/opencodex-relay \
   --signing-key /secure/off-repo/opencodex-relay-release-ed25519.pem \
+  --previous-build-number REPLACE_WITH_GREATEST_PUBLISHED_CF_BUNDLE_VERSION \
   --output /secure/release-staging/REPLACE_WITH_VERSION
 ```
 
@@ -220,6 +221,15 @@ Codex config, `current` target, launchd plist/systemd unit 및 manager 상태를
 최초 enrollment 실패에서는 새 JSON·routing block·service artifact를 없던 상태로 되돌립니다.
 검증된 version directory는 disk에 남을 수 있지만 선택·enable되지 않습니다.
 
+배포용 앱의 `CFBundleShortVersionString`은 전체 SemVer이고 `CFBundleVersion`은
+`client/relay/RELEASE_BUILD_NUMBER`의 단일 증가 정수입니다. builder는 이 값이 `1...9999`
+범위이며 `--previous-build-number`보다 큰 경우에만 진행합니다. production app에는 tracked
+Ed25519 public key의 정확한 byte와 fingerprint가 `Contents/Resources/ReleaseTrust` 아래에
+포함됩니다. revision 5 verifier는 `channel`, minimum updater/macOS version, trust key ID 및
+integration/helper protocol을 엄격히 검증하지만, 첫 updater bootstrap release인
+`0.3.8-rc.6`은 기존 수동 installer 호환을 위해 revision 4로 게시하며 기존 사용자가 직접
+설치해야 합니다.
+
 ### public GitHub Release 배포 채널
 
 official artifact는 public Core 저장소에 게시합니다. repository settings에서
@@ -233,12 +243,14 @@ private signing key는 계속 workstation 밖으로 내보내지 않습니다.
 ./client/relay/scripts/build-release.sh 1.2.3 \
   --github-repo OWNER/opencodex-relay-releases \
   --signing-key /secure/off-repo/opencodex-relay-release-ed25519.pem \
+  --previous-build-number REPLACE_WITH_GREATEST_PUBLISHED_CF_BUNDLE_VERSION \
   --output /secure/release-staging/1.2.3
 
 ./client/relay/scripts/publish-github-release.sh 1.2.3 \
   --repo OWNER/opencodex-relay-releases \
   --input /secure/release-staging/1.2.3 \
-  --public-key /secure/off-repo/opencodex-relay-release-ed25519.pub
+  --public-key /secure/off-repo/opencodex-relay-release-ed25519.pub \
+  --release-notes-fragment client/relay/release-notes/1.2.3.md
 ```
 
 publisher는 public repository, 기존 version 부재, manifest signature, Linux helper 네 개와
@@ -247,6 +259,11 @@ signed macOS bundle component, notice URL/hash를 검증한 뒤 draft로 asset�
 보고하지 않으면 실패로 끝내며, 그런 release에는 client를 enrollment하지 않습니다. GitHub
 자체 attestation은 보조 증거이고, client의 out-of-band public PEM 및 manifest signature가
 계속 신뢰 기준입니다.
+
+stable tag는 `prerelease=false`, `latest=true`로 게시하고 prerelease tag는
+`prerelease=true`, `latest=false`로 게시합니다. publisher는 exact tag, draft/prerelease,
+immutable 상태, 8개 asset 이름과 GitHub API digest를 read-back합니다. API 목록 순서는
+SemVer 순서로 간주하지 않습니다.
 
 public release 다운로드에는 credential이 필요하지 않습니다. 익명 GitHub API rate limit이
 부족할 때만 read-only 만료형 token을 선택적으로 사용할 수 있으며, relay service와 Codex

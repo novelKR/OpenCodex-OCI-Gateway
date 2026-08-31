@@ -238,6 +238,42 @@ verify_release_assets() {
     die 'GitHub release asset set is incomplete or unexpected'
 }
 
+verify_release_asset_digests() {
+  local assets_json="${tmp}/release-assets.json"
+  local file
+  local expected
+  local actual
+  GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release view "$version" --repo "$repo" \
+    --json assets > "$assets_json" || die 'unable to read back GitHub release asset digests'
+  for file in "${release_files[@]}"; do
+    expected="sha256:$(sha256 "$file")"
+    actual="$(jq -er --arg name "$(basename -- "$file")" '
+      [.assets[] | select(.name == $name and .state == "uploaded") | .digest]
+      | if length == 1 then .[0] else empty end
+    ' "$assets_json")" || die "GitHub release asset digest is unavailable: $(basename -- "$file")"
+    [[ "$actual" == "$expected" ]] || \
+      die "GitHub release asset digest differs from the uploaded file: $(basename -- "$file")"
+  done
+}
+
+verify_latest_policy() {
+  local latest_error="${tmp}/latest-release.error"
+  local latest_tag
+  if latest_tag="$(GH_PROMPT_DISABLED=1 GH_HOST=github.com gh api \
+    "repos/${repo}/releases/latest" --jq .tag_name 2>"$latest_error")"; then
+    if [[ "$release_is_prerelease" == true ]]; then
+      [[ "$latest_tag" != "$version" ]] || die 'published prerelease unexpectedly became GitHub latest'
+    else
+      [[ "$latest_tag" == "$version" ]] || die 'published stable release is not GitHub latest'
+    fi
+    return
+  fi
+  if [[ "$release_is_prerelease" == true ]] && grep -F 'HTTP 404' "$latest_error" >/dev/null; then
+    return
+  fi
+  die 'unable to read back the GitHub latest release policy'
+}
+
 verify_release_body() {
   local actual_body="${tmp}/actual-release-body.md"
   local body_json="${tmp}/actual-release-body.json"
@@ -316,12 +352,13 @@ sed -e "s|__VERSION__|${version}|g" -e "s|__REPOSITORY__|${repo}|g" \
 release_create_flags=(
   --repo "$repo"
   --draft
-  --latest=false
   --title "OpenCodex Relay ${version}"
   --notes-file "$release_notes"
 )
 if [[ "$release_is_prerelease" == true ]]; then
-  release_create_flags+=(--prerelease)
+  release_create_flags+=(--prerelease --latest=false)
+else
+  release_create_flags+=(--latest)
 fi
 GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release create "$version" "${release_files[@]}" \
   "${release_create_flags[@]}" >/dev/null || \
@@ -329,17 +366,25 @@ GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release create "$version" "${release_
 release_created=true
 verify_release_assets true
 verify_release_body
-GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release edit "$version" --repo "$repo" \
-  --draft=false --latest=false >/dev/null || die 'unable to publish GitHub release'
+release_edit_flags=(--repo "$repo" --draft=false)
+if [[ "$release_is_prerelease" == true ]]; then
+  release_edit_flags+=(--prerelease --latest=false)
+else
+  release_edit_flags+=(--prerelease=false --latest)
+fi
+GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release edit "$version" \
+  "${release_edit_flags[@]}" >/dev/null || die 'unable to publish GitHub release'
 release_published=true
 verify_release_assets false
-expected_final_state="false"$'\t'"${release_is_prerelease}"$'\t'"true"
+verify_release_asset_digests
+expected_final_state="${version}"$'\t'"false"$'\t'"${release_is_prerelease}"$'\t'"true"
 final_state="$(GH_PROMPT_DISABLED=1 GH_HOST=github.com gh release view "$version" --repo "$repo" \
-  --json isDraft,isPrerelease,isImmutable --jq '[.isDraft, .isPrerelease, .isImmutable] | @tsv')" || \
+  --json tagName,isDraft,isPrerelease,isImmutable --jq '[.tagName, .isDraft, .isPrerelease, .isImmutable] | @tsv')" || \
   die 'unable to read back final GitHub release state'
 [[ "$final_state" == "$expected_final_state" ]] || \
-  die 'published GitHub release is not the expected immutable draft/prerelease state'
+  die 'published GitHub release is not the expected immutable tag/draft/prerelease state'
+verify_latest_policy
 release_complete=true
 
-printf 'github_release=%s tag=%s prerelease=%s immutable=true\n' \
-  "$repo" "$version" "$release_is_prerelease"
+printf 'github_release=%s tag=%s prerelease=%s latest=%s immutable=true\n' \
+  "$repo" "$version" "$release_is_prerelease" "$([[ "$release_is_prerelease" == false ]] && printf true || printf false)"

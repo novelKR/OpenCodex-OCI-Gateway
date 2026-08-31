@@ -690,6 +690,11 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", service)
         self.assertIn("--github-repo OWNER/REPO", builder)
         self.assertIn("github_release_repo", builder)
+        self.assertIn("--previous-build-number NUMERIC_VERSION", builder)
+        self.assertIn("RELEASE_BUILD_NUMBER", builder)
+        self.assertIn("Contents/Resources/ReleaseTrust", builder)
+        self.assertIn("bundled release public key bytes differ", builder)
+        self.assertIn("bundled release public key fingerprint differs", builder)
         self.assertIn("--signing-key-keychain-service SERVICE", builder)
         self.assertIn('swift "$KEYCHAIN_HELPER" read', builder)
         keychain_helper = RELAY / "scripts" / "keychain-signing-key.swift"
@@ -710,7 +715,11 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("--draft=false", publisher)
         self.assertIn("isImmutable", publisher)
         self.assertIn("isPrerelease", publisher)
-        self.assertIn("release_create_flags+=(--prerelease)", publisher)
+        self.assertIn("release_create_flags+=(--prerelease --latest=false)", publisher)
+        self.assertIn("release_create_flags+=(--latest)", publisher)
+        self.assertIn("verify_release_asset_digests", publisher)
+        self.assertIn("--json tagName,isDraft,isPrerelease,isImmutable", publisher)
+        self.assertIn('"repos/${repo}/releases/latest" --jq .tag_name', publisher)
         self.assertIn("--release-notes-fragment FILE", publisher)
         self.assertIn("--json body", publisher)
         self.assertIn("GitHub release body differs from the reviewed release notes", publisher)
@@ -939,15 +948,59 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
+            release_build_number = (
+                RELAY / "RELEASE_BUILD_NUMBER"
+            ).read_text(encoding="ascii").strip()
+            self.assertRegex(release_build_number, r"^[1-9][0-9]{0,3}$")
+            self.assertLessEqual(int(release_build_number), 9999)
+            validator = RELAY / "scripts" / "validate-release-build-number.py"
+            for invalid_value in (b"0\n", b"10000\n", b"1\n2\n", b"build\n"):
+                invalid_source = root / "invalid-build-number"
+                invalid_source.write_bytes(invalid_value)
+                invalid_build_number = subprocess.run(
+                    ["python3", str(validator), str(invalid_source), "0.3.8"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(invalid_build_number.returncode, 0)
+                self.assertIn("one integer from 1 through 9999", invalid_build_number.stderr)
+            build_prefix = [
+                "bash",
+                str(RELAY / "scripts" / "build-release.sh"),
+                "1.2.3",
+                "--github-repo",
+                "owner/private-release",
+                "--signing-key",
+                str(private_key),
+            ]
+            missing_previous = subprocess.run(
+                [*build_prefix, "--output", str(output)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_previous.returncode, 0)
+            self.assertIn("--previous-build-number is required", missing_previous.stderr)
+            non_increasing = subprocess.run(
+                [
+                    *build_prefix,
+                    "--previous-build-number",
+                    release_build_number,
+                    "--output",
+                    str(output),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(non_increasing.returncode, 0)
+            self.assertIn("must be greater", non_increasing.stderr)
             result = subprocess.run(
                 [
-                    "bash",
-                    str(RELAY / "scripts" / "build-release.sh"),
-                    "1.2.3",
-                    "--github-repo",
-                    "owner/private-release",
-                    "--signing-key",
-                    str(private_key),
+                    *build_prefix,
+                    "--previous-build-number",
+                    "0.3.8",
                     "--output",
                     str(output),
                 ],
@@ -994,6 +1047,11 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             self.assertIn(
                 "OpenCodexRelay.app/Contents/Library/Helpers/"
                 "OpenCodexRelayHelperInstaller",
+                archive_entries,
+            )
+            self.assertIn(
+                "OpenCodexRelay.app/Contents/Resources/ReleaseTrust/"
+                "opencodex-relay-release-ed25519.pub",
                 archive_entries,
             )
             self.assertNotIn(
@@ -1061,16 +1119,19 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 "printf '%s\\n' \"$*\" >> \"$FAKE_GH_LOG\"\n"
+                "if [[ ${1:-} == api && ${2:-} == repos/*/releases/latest ]]; then if [[ -n ${FAKE_LATEST_TAG:-} ]]; then printf '%s\\n' \"$FAKE_LATEST_TAG\"; else cat \"$FAKE_GH_STATE/tag\"; fi; exit 0; fi\n"
                 "if [[ ${1:-} == api && ${2:-} == repos/* ]]; then printf 'public\\n'; exit 0; fi\n"
                 "if [[ ${1:-} == release && ${2:-} == view ]]; then\n"
                 "  [[ -f $FAKE_GH_STATE/created ]] || exit 1\n"
-                "  if [[ \" $* \" == *\" --json isDraft,isPrerelease,isImmutable \"* ]]; then printf '%s\\t%s\\ttrue\\n' \"$(cat \"$FAKE_GH_STATE/draft\")\" \"$(cat \"$FAKE_GH_STATE/prerelease\")\"; exit 0; fi\n"
+                "  if [[ \" $* \" == *\" --json tagName,isDraft,isPrerelease,isImmutable \"* ]]; then immutable=true; [[ ${FAKE_GH_MUTABLE:-0} != 1 ]] || immutable=false; printf '%s\\t%s\\t%s\\t%s\\n' \"$(cat \"$FAKE_GH_STATE/tag\")\" \"$(cat \"$FAKE_GH_STATE/draft\")\" \"$(cat \"$FAKE_GH_STATE/prerelease\")\" \"$immutable\"; exit 0; fi\n"
                 "  if [[ \" $* \" == *\" --json isDraft,isPrerelease \"* ]]; then printf '%s\\t%s\\n' \"$(cat \"$FAKE_GH_STATE/draft\")\" \"$(cat \"$FAKE_GH_STATE/prerelease\")\"; exit 0; fi\n"
                 "  if [[ \" $* \" == *\" --json body \"* ]]; then if [[ ${FAKE_GH_CORRUPT_BODY:-0} == 1 ]]; then printf 'corrupted body\\n' | jq -Rs '{body:.}'; else jq -Rs '{body:.}' \"$FAKE_GH_STATE/notes\"; fi; exit 0; fi\n"
-                "  if [[ \" $* \" == *\" --json assets \"* ]]; then cat \"$FAKE_GH_STATE/assets\"; exit 0; fi\n"
+                "  if [[ \" $* \" == *\" --json assets \"* && \" $* \" == *\" --jq \"* ]]; then cat \"$FAKE_GH_STATE/assets\"; exit 0; fi\n"
+                "  if [[ \" $* \" == *\" --json assets \"* ]]; then first=true; printf '{\"assets\":['; while IFS= read -r name; do $first || printf ','; first=false; digest=$(shasum -a 256 \"$FAKE_ASSET_DIR/$name\" | awk '{print $1}'); [[ ${FAKE_GH_CORRUPT_DIGEST:-0} != 1 ]] || digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; jq -jn --arg name \"$name\" --arg digest \"sha256:$digest\" '{name:$name,state:\"uploaded\",digest:$digest}'; done < \"$FAKE_GH_STATE/assets\"; printf ']}\\n'; exit 0; fi\n"
                 "  exit 0\n"
                 "fi\n"
                 "if [[ ${1:-} == release && ${2:-} == create ]]; then\n"
+                "  printf '%s\\n' \"$3\" > \"$FAKE_GH_STATE/tag\"\n"
                 "  shift 3\n"
                 "  : > \"$FAKE_GH_STATE/assets\"\n"
                 "  printf 'false\\n' > \"$FAKE_GH_STATE/prerelease\"\n"
@@ -1078,16 +1139,16 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "    case $1 in\n"
                 "      --repo|--title) shift 2 ;;\n"
                 "      --notes-file) cp \"$2\" \"$FAKE_GH_STATE/notes\"; shift 2 ;;\n"
-                "      --draft|--latest=false) shift ;;\n"
+                "      --draft|--latest|--latest=false) shift ;;\n"
                 "      --prerelease) printf 'true\\n' > \"$FAKE_GH_STATE/prerelease\"; shift ;;\n"
-                "      *) basename -- \"$1\" >> \"$FAKE_GH_STATE/assets\"; shift ;;\n"
+                "      *) name=$(basename -- \"$1\"); if [[ ${FAKE_GH_MISSING_ASSET:-0} != 1 || $name != OpenCodexRelay.app.zip ]]; then printf '%s\\n' \"$name\" >> \"$FAKE_GH_STATE/assets\"; fi; if [[ ${FAKE_GH_DUPLICATE_ASSET:-0} == 1 && $name == OpenCodexRelay.app.zip ]]; then printf '%s\\n' \"$name\" >> \"$FAKE_GH_STATE/assets\"; fi; shift ;;\n"
                 "    esac\n"
                 "  done\n"
                 "  : > \"$FAKE_GH_STATE/created\"\n"
                 "  printf 'true\\n' > \"$FAKE_GH_STATE/draft\"\n"
                 "  exit 0\n"
                 "fi\n"
-                "if [[ ${1:-} == release && ${2:-} == edit ]]; then printf 'false\\n' > \"$FAKE_GH_STATE/draft\"; if [[ ${FAKE_GH_CORRUPT_AFTER_EDIT:-0} == 1 ]]; then printf 'true\\n' > \"$FAKE_GH_STATE/prerelease\"; fi; exit 0; fi\n"
+                "if [[ ${1:-} == release && ${2:-} == edit ]]; then printf 'false\\n' > \"$FAKE_GH_STATE/draft\"; [[ \" $* \" != *\" --prerelease=false \"* ]] || printf 'false\\n' > \"$FAKE_GH_STATE/prerelease\"; if [[ ${FAKE_GH_CORRUPT_AFTER_EDIT:-0} == 1 ]]; then printf 'true\\n' > \"$FAKE_GH_STATE/prerelease\"; fi; if [[ ${FAKE_GH_CORRUPT_TAG:-0} == 1 ]]; then printf '9.9.9\\n' > \"$FAKE_GH_STATE/tag\"; fi; exit 0; fi\n"
                 "if [[ ${1:-} == release && ${2:-} == delete ]]; then : > \"$FAKE_GH_STATE/deleted\"; rm -f \"$FAKE_GH_STATE/created\"; exit 0; fi\n"
                 "exit 2\n",
                 encoding="utf-8",
@@ -1110,6 +1171,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
                 "FAKE_GH_LOG": str(gh_log),
                 "FAKE_GH_STATE": str(gh_state),
+                "FAKE_ASSET_DIR": str(output),
             }
             built_notices = output / "THIRD_PARTY_NOTICES.md"
             original_notices = built_notices.read_bytes()
@@ -1147,6 +1209,29 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 )
                 self.assertNotEqual(invalid_publish.returncode, 0)
                 self.assertIn("strict SemVer", invalid_publish.stderr)
+
+            for variable, label in (
+                ("FAKE_GH_MISSING_ASSET", "missing"),
+                ("FAKE_GH_DUPLICATE_ASSET", "duplicate"),
+            ):
+                invalid_assets_state = root / f"gh-{label}-asset-state"
+                invalid_assets_state.mkdir()
+                invalid_assets_log = invalid_assets_state / "calls.log"
+                invalid_assets_publish = subprocess.run(
+                    publish_command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=publish_environment
+                    | {
+                        "FAKE_GH_LOG": str(invalid_assets_log),
+                        "FAKE_GH_STATE": str(invalid_assets_state),
+                        variable: "1",
+                    },
+                )
+                self.assertNotEqual(invalid_assets_publish.returncode, 0)
+                self.assertIn("asset set is incomplete or unexpected", invalid_assets_publish.stderr)
+                self.assertTrue((invalid_assets_state / "deleted").is_file())
 
             corrupt_body_state = root / "gh-corrupt-body-state"
             corrupt_body_state.mkdir()
@@ -1196,6 +1281,42 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             )
             self.assertTrue((corrupt_final_state / "deleted").is_file())
 
+            for variable, label, expected_error in (
+                (
+                    "FAKE_GH_CORRUPT_DIGEST",
+                    "corrupt-digest",
+                    "asset digest differs from the uploaded file",
+                ),
+                (
+                    "FAKE_GH_MUTABLE",
+                    "mutable",
+                    "not the expected immutable tag/draft/prerelease state",
+                ),
+                (
+                    "FAKE_GH_CORRUPT_TAG",
+                    "wrong-tag",
+                    "not the expected immutable tag/draft/prerelease state",
+                ),
+            ):
+                invalid_final_state = root / f"gh-{label}-state"
+                invalid_final_state.mkdir()
+                invalid_final_log = invalid_final_state / "calls.log"
+                invalid_final_publish = subprocess.run(
+                    publish_command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=publish_environment
+                    | {
+                        "FAKE_GH_LOG": str(invalid_final_log),
+                        "FAKE_GH_STATE": str(invalid_final_state),
+                        variable: "1",
+                    },
+                )
+                self.assertNotEqual(invalid_final_publish.returncode, 0)
+                self.assertIn(expected_error, invalid_final_publish.stderr)
+                self.assertTrue((invalid_final_state / "deleted").is_file())
+
             published = subprocess.run(
                 publish_command,
                 check=False,
@@ -1205,6 +1326,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             )
             self.assertEqual(published.returncode, 0, published.stderr)
             self.assertIn("prerelease=false", published.stdout)
+            self.assertIn("latest=true", published.stdout)
             self.assertIn("immutable=true", published.stdout)
             self.assertEqual(
                 set((gh_state / "assets").read_text(encoding="utf-8").splitlines()),
@@ -1233,7 +1355,9 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             self.assertNotIn("__REPOSITORY__", release_notes)
             gh_calls = gh_log.read_text(encoding="utf-8")
             self.assertLess(gh_calls.index("release create"), gh_calls.index("release edit"))
-            self.assertNotIn("--prerelease", gh_calls)
+            self.assertIn("--prerelease=false", gh_calls)
+            self.assertIn("--latest", gh_calls)
+            self.assertNotIn("--latest=false", gh_calls)
 
             prerelease_version = "1.2.4-rc.1"
             prerelease_output = root / "prerelease-output"
@@ -1290,6 +1414,8 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             prerelease_environment = publish_environment | {
                 "FAKE_GH_LOG": str(prerelease_log),
                 "FAKE_GH_STATE": str(prerelease_state),
+                "FAKE_ASSET_DIR": str(prerelease_output),
+                "FAKE_LATEST_TAG": "1.2.3",
             }
             prerelease_publish = subprocess.run(
                 [
@@ -1316,6 +1442,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 prerelease_publish.stderr,
             )
             self.assertIn("prerelease=true", prerelease_publish.stdout)
+            self.assertIn("latest=false", prerelease_publish.stdout)
             self.assertEqual(
                 (prerelease_state / "prerelease").read_text(encoding="utf-8"),
                 "true\n",

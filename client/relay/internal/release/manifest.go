@@ -19,11 +19,14 @@ const (
 	CompatibilityRevisionLegacy    = 1
 	CompatibilityRevisionDocuments = 2
 	CompatibilityRevisionAdHocApp  = 4
+	CompatibilityRevisionUpdater   = 5
 	ThirdPartyNoticesFile          = "THIRD_PARTY_NOTICES.md"
 	ComponentRelay                 = "relay"
 	ComponentRelayctl              = "relayctl"
 	ComponentMacOSMenuBarBundle    = "macos_menu_bar_bundle"
 	SigningModeAdHoc               = "adhoc"
+	ChannelStable                  = "stable"
+	ChannelPreview                 = "preview"
 )
 
 type Manifest struct {
@@ -31,17 +34,23 @@ type Manifest struct {
 	CompatibilityRevision int        `json:"compatibility_revision"`
 	Artifacts             []Artifact `json:"artifacts"`
 	Documents             []Document `json:"documents,omitempty"`
+	Channel               string     `json:"channel,omitempty"`
+	MinimumUpdaterVersion string     `json:"minimum_updater_version,omitempty"`
+	TrustKeyID            string     `json:"trust_key_id,omitempty"`
 }
 
 type Artifact struct {
-	OS          string `json:"os"`
-	Arch        string `json:"arch"`
-	Component   string `json:"component,omitempty"`
-	File        string `json:"file"`
-	URL         string `json:"url"`
-	SHA256      string `json:"sha256"`
-	BundleID    string `json:"bundle_id,omitempty"`
-	SigningMode string `json:"signing_mode,omitempty"`
+	OS                  string `json:"os"`
+	Arch                string `json:"arch"`
+	Component           string `json:"component,omitempty"`
+	File                string `json:"file"`
+	URL                 string `json:"url"`
+	SHA256              string `json:"sha256"`
+	BundleID            string `json:"bundle_id,omitempty"`
+	SigningMode         string `json:"signing_mode,omitempty"`
+	MinimumMacOSVersion string `json:"minimum_macos_version,omitempty"`
+	IntegrationProtocol int    `json:"integration_protocol,omitempty"`
+	HelperProtocol      int    `json:"helper_protocol,omitempty"`
 }
 
 type Document struct {
@@ -62,6 +71,9 @@ func Verify(manifestBytes, signatureBytes, publicKeyPEM []byte) (Manifest, error
 	if !ed25519.Verify(key, manifestBytes, signature) {
 		return Manifest{}, errors.New("release manifest signature is invalid")
 	}
+	if err := rejectDuplicateJSONKeys(manifestBytes); err != nil {
+		return Manifest{}, err
+	}
 	decoder := json.NewDecoder(strings.NewReader(string(manifestBytes)))
 	decoder.DisallowUnknownFields()
 	var manifest Manifest
@@ -76,8 +88,18 @@ func Verify(manifestBytes, signatureBytes, publicKeyPEM []byte) (Manifest, error
 	}
 	if manifest.CompatibilityRevision != CompatibilityRevisionLegacy &&
 		manifest.CompatibilityRevision != CompatibilityRevisionDocuments &&
-		manifest.CompatibilityRevision != CompatibilityRevisionAdHocApp {
+		manifest.CompatibilityRevision != CompatibilityRevisionAdHocApp &&
+		manifest.CompatibilityRevision != CompatibilityRevisionUpdater {
 		return Manifest{}, fmt.Errorf("unsupported release manifest compatibility revision: %d", manifest.CompatibilityRevision)
+	}
+	if manifest.CompatibilityRevision == CompatibilityRevisionUpdater {
+		expectedChannel, ok := channelForVersion(manifest.Version)
+		if !ok || manifest.Channel != expectedChannel || !validStrictSemVer(manifest.MinimumUpdaterVersion) ||
+			!isLowerHexSHA256(manifest.TrustKeyID) {
+			return Manifest{}, errors.New("release updater manifest metadata is invalid")
+		}
+	} else if manifest.Channel != "" || manifest.MinimumUpdaterVersion != "" || manifest.TrustKeyID != "" {
+		return Manifest{}, errors.New("legacy release manifest must not contain updater metadata")
 	}
 	seenArtifacts := make(map[string]struct{}, len(manifest.Artifacts))
 	for _, artifact := range manifest.Artifacts {
@@ -85,8 +107,9 @@ func Verify(manifestBytes, signatureBytes, publicKeyPEM []byte) (Manifest, error
 			!validHTTPSURL(artifact.URL) || !isLowerHexSHA256(artifact.SHA256) {
 			return Manifest{}, errors.New("release manifest contains an incomplete artifact")
 		}
-		if manifest.CompatibilityRevision == CompatibilityRevisionAdHocApp {
-			if err := validateMenuBarArtifact(artifact); err != nil {
+		if manifest.CompatibilityRevision == CompatibilityRevisionAdHocApp ||
+			manifest.CompatibilityRevision == CompatibilityRevisionUpdater {
+			if err := validateMenuBarArtifact(artifact, manifest.CompatibilityRevision); err != nil {
 				return Manifest{}, err
 			}
 			key := artifact.OS + "/" + artifact.Arch + "/" + artifact.Component
@@ -94,7 +117,8 @@ func Verify(manifestBytes, signatureBytes, publicKeyPEM []byte) (Manifest, error
 				return Manifest{}, errors.New("release manifest contains a duplicate artifact component")
 			}
 			seenArtifacts[key] = struct{}{}
-		} else if artifact.Component != "" || artifact.BundleID != "" || artifact.SigningMode != "" {
+		} else if artifact.Component != "" || artifact.BundleID != "" || artifact.SigningMode != "" ||
+			artifact.MinimumMacOSVersion != "" || artifact.IntegrationProtocol != 0 || artifact.HelperProtocol != 0 {
 			return Manifest{}, errors.New("legacy release manifest must not contain menu bar component metadata")
 		}
 	}
@@ -113,7 +137,8 @@ func Verify(manifestBytes, signatureBytes, publicKeyPEM []byte) (Manifest, error
 			return Manifest{}, errors.New("release manifest requires the third-party notices document")
 		}
 	}
-	if manifest.CompatibilityRevision == CompatibilityRevisionAdHocApp {
+	if manifest.CompatibilityRevision == CompatibilityRevisionAdHocApp ||
+		manifest.CompatibilityRevision == CompatibilityRevisionUpdater {
 		if err := validateMenuBarArtifactSet(manifest.Artifacts); err != nil {
 			return Manifest{}, err
 		}
@@ -138,7 +163,8 @@ func VerifyFiles(manifestPath, signaturePath, publicKeyPath string) (Manifest, e
 }
 
 func (m Manifest) Select(goos, goarch string) (Artifact, error) {
-	if m.CompatibilityRevision == CompatibilityRevisionAdHocApp {
+	if m.CompatibilityRevision == CompatibilityRevisionAdHocApp ||
+		m.CompatibilityRevision == CompatibilityRevisionUpdater {
 		return Artifact{}, fmt.Errorf("release %s uses component-aware artifacts; select an explicit component", m.Version)
 	}
 	for _, artifact := range m.Artifacts {
@@ -153,7 +179,8 @@ func (m Manifest) Select(goos, goarch string) (Artifact, error) {
 // component in the signed tuple prevents a menu-bar bundle from being selected
 // where a loopback relay binary is required.
 func (m Manifest) SelectComponent(goos, goarch, component string) (Artifact, error) {
-	if m.CompatibilityRevision != CompatibilityRevisionAdHocApp {
+	if m.CompatibilityRevision != CompatibilityRevisionAdHocApp &&
+		m.CompatibilityRevision != CompatibilityRevisionUpdater {
 		return Artifact{}, fmt.Errorf("release %s does not use component-aware artifacts", m.Version)
 	}
 	for _, artifact := range m.Artifacts {
@@ -164,11 +191,12 @@ func (m Manifest) SelectComponent(goos, goarch, component string) (Artifact, err
 	return Artifact{}, fmt.Errorf("release %s has no %s artifact for %s/%s", m.Version, component, goos, goarch)
 }
 
-func validateMenuBarArtifact(artifact Artifact) error {
+func validateMenuBarArtifact(artifact Artifact, revision int) error {
 	switch artifact.Component {
 	case ComponentRelay, ComponentRelayctl:
 		if artifact.OS != "linux" || (artifact.Arch != "amd64" && artifact.Arch != "arm64") ||
-			artifact.BundleID != "" || artifact.SigningMode != "" {
+			artifact.BundleID != "" || artifact.SigningMode != "" || artifact.MinimumMacOSVersion != "" ||
+			artifact.IntegrationProtocol != 0 || artifact.HelperProtocol != 0 {
 			return errors.New("relay binary artifact must not contain app signing metadata")
 		}
 	case ComponentMacOSMenuBarBundle:
@@ -176,6 +204,14 @@ func validateMenuBarArtifact(artifact Artifact) error {
 			!hasSuffix(artifact.File, ".app.zip") || !validBundleID(artifact.BundleID) ||
 			artifact.SigningMode != SigningModeAdHoc {
 			return errors.New("release manifest contains an invalid macOS menu bar bundle")
+		}
+		if revision == CompatibilityRevisionUpdater {
+			if !validNumericVersion(artifact.MinimumMacOSVersion) ||
+				artifact.IntegrationProtocol <= 0 || artifact.HelperProtocol <= 0 {
+				return errors.New("release updater manifest contains invalid macOS compatibility metadata")
+			}
+		} else if artifact.MinimumMacOSVersion != "" || artifact.IntegrationProtocol != 0 || artifact.HelperProtocol != 0 {
+			return errors.New("revision 4 release must not contain updater compatibility metadata")
 		}
 	default:
 		return errors.New("release manifest contains an unsupported artifact component")
@@ -194,14 +230,150 @@ func validateMenuBarArtifactSet(artifacts []Artifact) error {
 	for _, artifact := range artifacts {
 		key := artifact.OS + "/" + artifact.Arch + "/" + artifact.Component
 		if _, wanted := required[key]; !wanted {
-			return errors.New("release manifest contains an unexpected revision-4 artifact component")
+			return errors.New("release manifest contains an unexpected component-aware artifact")
 		}
 		delete(required, key)
 	}
 	if len(required) != 0 {
-		return errors.New("release manifest is missing a required revision-4 artifact component")
+		return errors.New("release manifest is missing a required component-aware artifact")
 	}
 	return nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	if err := scanJSONValue(decoder); err != nil {
+		return fmt.Errorf("decode release manifest: %w", err)
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("release manifest contains trailing JSON")
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := map[string]struct{}{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("release manifest object key is not a string")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("release manifest contains duplicate JSON key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return errors.New("release manifest object is not terminated")
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return errors.New("release manifest array is not terminated")
+		}
+	default:
+		return errors.New("release manifest contains an unexpected delimiter")
+	}
+	return nil
+}
+
+func channelForVersion(value string) (string, bool) {
+	if !validStrictSemVer(value) {
+		return "", false
+	}
+	if strings.Contains(value, "-") {
+		return ChannelPreview, true
+	}
+	return ChannelStable, true
+}
+
+func validStrictSemVer(value string) bool {
+	if value == "" || strings.Contains(value, "+") {
+		return false
+	}
+	core, prerelease, hasPrerelease := strings.Cut(value, "-")
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if !validNumericIdentifier(part) {
+			return false
+		}
+	}
+	if !hasPrerelease {
+		return true
+	}
+	if prerelease == "" {
+		return false
+	}
+	for _, identifier := range strings.Split(prerelease, ".") {
+		if identifier == "" {
+			return false
+		}
+		numeric := true
+		for _, char := range identifier {
+			if (char < '0' || char > '9') && (char < 'A' || char > 'Z') &&
+				(char < 'a' || char > 'z') && char != '-' {
+				return false
+			}
+			if char < '0' || char > '9' {
+				numeric = false
+			}
+		}
+		if numeric && len(identifier) > 1 && identifier[0] == '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func validNumericVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) < 1 || len(parts) > 3 {
+		return false
+	}
+	for _, part := range parts {
+		if !validNumericIdentifier(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func validNumericIdentifier(value string) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func parsePublicKey(data []byte) (ed25519.PublicKey, error) {

@@ -124,6 +124,8 @@ class PublicCorePublicationTests(unittest.TestCase):
 
         self.assertIn('- "[0-9]*.[0-9]*.[0-9]*"', workflow)
         self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("group: relay-release\n", workflow)
+        self.assertNotIn("group: relay-release-${{ github.ref }}", workflow)
         self.assertEqual(
             workflow.count(
                 "if: github.repository == 'novelKR/OpenCodex-OCI-Gateway' "
@@ -146,6 +148,13 @@ class PublicCorePublicationTests(unittest.TestCase):
         self.assertIn("Relay release tag must be lightweight", workflow)
         self.assertIn("current public main commit", workflow)
         self.assertIn("build-release.sh \"$version\"", workflow)
+        self.assertIn("Resolve the greatest previous public app build", workflow)
+        self.assertIn("releases?per_page=100&page=1", workflow)
+        self.assertIn("previous public release scan exceeded its one-page bound", workflow)
+        self.assertNotIn("gh api --paginate --slurp", workflow)
+        self.assertIn("--previous-build-number", workflow)
+        self.assertIn("client/relay/RELEASE_BUILD_NUMBER", workflow)
+        self.assertIn("ReleaseTrust/opencodex-relay-release-ed25519.pub", workflow)
         self.assertIn("publish-github-release.sh \"$version\"", workflow)
         self.assertIn(
             '--release-notes-fragment "client/relay/release-notes/${version}.md"',

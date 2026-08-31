@@ -5,8 +5,11 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly RELAY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly KEYCHAIN_HELPER="${SCRIPT_DIR}/keychain-signing-key.swift"
+readonly BUILD_NUMBER_VALIDATOR="${SCRIPT_DIR}/validate-release-build-number.py"
 readonly THIRD_PARTY_NOTICES_FILE="THIRD_PARTY_NOTICES.md"
 readonly THIRD_PARTY_NOTICES_SOURCE="${RELAY_ROOT}/${THIRD_PARTY_NOTICES_FILE}"
+readonly RELEASE_BUILD_NUMBER_SOURCE="${RELAY_ROOT}/RELEASE_BUILD_NUMBER"
+readonly RELEASE_PUBLIC_KEY_SOURCE="${RELAY_ROOT}/../../config/trust/opencodex-relay-release-ed25519.pub"
 readonly MACOS_APP_ROOT="${RELAY_ROOT}/macos/OpenCodexRelay"
 readonly MACOS_INFO_TEMPLATE="${MACOS_APP_ROOT}/Resources/Info.plist"
 readonly MACOS_APP_ICON="${MACOS_APP_ROOT}/Resources/AppIcon.icns"
@@ -25,14 +28,16 @@ usage() {
   cat <<'USAGE'
 Usage:
   build-release.sh VERSION (--base-url HTTPS_URL | --github-repo OWNER/REPO) \\
-    (--signing-key PEM | --signing-key-keychain-service SERVICE) --output DIR
+    (--signing-key PEM | --signing-key-keychain-service SERVICE) \\
+    --previous-build-number NUMERIC_VERSION --output DIR
 
 Builds Linux amd64/arm64 relay and relayctl binaries plus a self-contained,
 ad-hoc-signed darwin/arm64 OpenCodexRelay.app.zip. The macOS bundle uses the
-Hardened Runtime, contains the two Go helpers and the manual privileged-helper
-installer, and is the only darwin artifact in revision 4. No Apple developer
-account or notarization credential is used. The Ed25519 private key remains an
-off-repository release-workstation input.
+Hardened Runtime, contains the two Go helpers, the manual privileged-helper
+installer, and the tracked release trust key, and is the only darwin artifact in
+revision 4. RELEASE_BUILD_NUMBER supplies the monotonically increasing numeric
+CFBundleVersion. No Apple developer account or notarization credential is used.
+The Ed25519 private key remains an off-repository release-workstation input.
 USAGE
 }
 
@@ -77,28 +82,36 @@ require_ed25519_private_key() {
 version="$1"
 shift
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die 'VERSION must be explicit semver'
-# CFBundleVersion accepts a numeric dotted build identifier only. Preserve the
-# full semver for the user-facing marketing version and strip its prerelease
-# label only for the internal bundle build version.
+# CFBundleVersion is an independently increasing distribution build identifier.
+# Keep the full SemVer for the user-facing marketing version so prereleases remain
+# distinguishable while every distributed app gets a unique numeric build value.
 bundle_short_version="$version"
-bundle_build_version="${version%%-*}"
-[[ "$bundle_build_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'VERSION has no valid numeric bundle build version'
 
 base_url=""
 github_repo=""
 signing_key=""
 signing_key_keychain_service=""
 output_dir=""
+previous_build_number=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-url) base_url="${2:-}"; shift 2 ;;
     --github-repo) github_repo="${2:-}"; shift 2 ;;
     --signing-key) signing_key="${2:-}"; shift 2 ;;
     --signing-key-keychain-service) signing_key_keychain_service="${2:-}"; shift 2 ;;
+    --previous-build-number) previous_build_number="${2:-}"; shift 2 ;;
     --output) output_dir="${2:-}"; shift 2 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
 done
+
+[[ -n "$previous_build_number" ]] || die '--previous-build-number is required'
+command -v python3 >/dev/null || die 'python3 is required for release build-number comparison'
+[[ -f "$BUILD_NUMBER_VALIDATOR" && ! -L "$BUILD_NUMBER_VALIDATOR" ]] || \
+  die 'release build-number validator is unavailable'
+bundle_build_version="$(python3 "$BUILD_NUMBER_VALIDATOR" \
+  "$RELEASE_BUILD_NUMBER_SOURCE" "$previous_build_number")" || \
+  die 'release build-number validation failed'
 
 if [[ -n "$base_url" && -n "$github_repo" ]]; then
   die '--base-url and --github-repo are mutually exclusive'
@@ -150,6 +163,10 @@ command -v openssl >/dev/null || die 'openssl is required for Ed25519 signing'
 command -v shasum >/dev/null || command -v sha256sum >/dev/null || die 'sha256 tool is required'
 [[ -f "$THIRD_PARTY_NOTICES_SOURCE" && ! -L "$THIRD_PARTY_NOTICES_SOURCE" ]] || \
   die 'THIRD_PARTY_NOTICES.md must be a regular repository file'
+[[ -f "$RELEASE_PUBLIC_KEY_SOURCE" && ! -L "$RELEASE_PUBLIC_KEY_SOURCE" ]] || \
+  die 'tracked release public key must be a regular file'
+openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY_SOURCE" -text -noout 2>/dev/null | grep -Eq '^ED25519 Public-Key:' || \
+  die 'tracked release public key must be an Ed25519 public PEM'
 [[ -f "$MACOS_INFO_TEMPLATE" && ! -L "$MACOS_INFO_TEMPLATE" ]] || \
   die 'macOS Info.plist template is unavailable'
 [[ -f "$MACOS_APP_ICON" && ! -L "$MACOS_APP_ICON" ]] || die 'macOS app icon is unavailable'
@@ -247,9 +264,21 @@ release_tmp="$(mktemp -d "${TMPDIR:-/tmp}/opencodex-relay-macos-release.XXXXXX")
 app_dir="${release_tmp}/${MACOS_BUNDLE_NAME}"
 helpers_dir="${app_dir}/Contents/Library/Helpers"
 guard_helpers_dir="${app_dir}/Contents/Library/HelperTools"
+release_trust_dir="${app_dir}/Contents/Resources/ReleaseTrust"
+bundled_release_public_key="${release_trust_dir}/opencodex-relay-release-ed25519.pub"
 mkdir -p "${app_dir}/Contents/MacOS" "$helpers_dir" "$guard_helpers_dir" \
-  "${app_dir}/Contents/Resources"
+  "${app_dir}/Contents/Resources" "$release_trust_dir"
 install -m 0644 "$MACOS_APP_ICON" "${app_dir}/Contents/Resources/AppIcon.icns"
+install -m 0644 "$RELEASE_PUBLIC_KEY_SOURCE" "$bundled_release_public_key"
+cmp -s "$RELEASE_PUBLIC_KEY_SOURCE" "$bundled_release_public_key" || \
+  die 'bundled release public key bytes differ from the tracked trust root'
+trusted_public_der="${release_tmp}/tracked-release-public-key.der"
+bundled_public_der="${release_tmp}/bundled-release-public-key.der"
+openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY_SOURCE" -outform DER > "$trusted_public_der"
+openssl pkey -pubin -in "$bundled_release_public_key" -outform DER > "$bundled_public_der"
+cmp -s "$trusted_public_der" "$bundled_public_der" || \
+  die 'bundled release public key fingerprint differs from the tracked trust root'
+release_trust_key_id="$(sha256 "$trusted_public_der")"
 build_go_binary darwin arm64 opencodex-relay "${helpers_dir}/opencodex-relay"
 build_go_binary darwin arm64 opencodex-relayctl "${helpers_dir}/opencodex-relayctl"
 
@@ -338,7 +367,8 @@ printf '{"version":"%s","compatibility_revision":4,"artifacts":[%s],"documents":
 openssl pkeyutl -sign -rawin -inkey "$signing_key" -in "$manifest" | base64 | tr -d '\n' > "$signature"
 printf '\n' >> "$signature"
 chmod 0644 "$manifest" "$signature"
-printf 'release_manifest=%s\nrelease_signature=%s\nmacos_bundle=%s\n' "$manifest" "$signature" "$bundle_path"
+printf 'release_manifest=%s\nrelease_signature=%s\nmacos_bundle=%s\nrelease_build_number=%s\nrelease_trust_key_id=%s\n' \
+  "$manifest" "$signature" "$bundle_path" "$bundle_build_version" "$release_trust_key_id"
 if [[ -n "$github_repo" ]]; then
   printf 'github_release_repo=%s github_release_tag=%s\n' "$github_repo" "$version"
 fi
