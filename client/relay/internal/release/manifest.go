@@ -301,54 +301,19 @@ func scanJSONValue(decoder *json.Decoder) error {
 }
 
 func channelForVersion(value string) (string, bool) {
-	if !validStrictSemVer(value) {
+	version, err := ParseSemanticVersion(value)
+	if err != nil {
 		return "", false
 	}
-	if strings.Contains(value, "-") {
+	if version.IsPrerelease() {
 		return ChannelPreview, true
 	}
 	return ChannelStable, true
 }
 
 func validStrictSemVer(value string) bool {
-	if value == "" || strings.Contains(value, "+") {
-		return false
-	}
-	core, prerelease, hasPrerelease := strings.Cut(value, "-")
-	parts := strings.Split(core, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	for _, part := range parts {
-		if !validNumericIdentifier(part) {
-			return false
-		}
-	}
-	if !hasPrerelease {
-		return true
-	}
-	if prerelease == "" {
-		return false
-	}
-	for _, identifier := range strings.Split(prerelease, ".") {
-		if identifier == "" {
-			return false
-		}
-		numeric := true
-		for _, char := range identifier {
-			if (char < '0' || char > '9') && (char < 'A' || char > 'Z') &&
-				(char < 'a' || char > 'z') && char != '-' {
-				return false
-			}
-			if char < '0' || char > '9' {
-				numeric = false
-			}
-		}
-		if numeric && len(identifier) > 1 && identifier[0] == '0' {
-			return false
-		}
-	}
-	return true
+	_, err := ParseSemanticVersion(value)
+	return err == nil
 }
 
 func validNumericVersion(value string) bool {
@@ -377,8 +342,8 @@ func validNumericIdentifier(value string) bool {
 }
 
 func parsePublicKey(data []byte) (ed25519.PublicKey, error) {
-	block, _ := pem.Decode(data)
-	if block == nil {
+	block, rest := pem.Decode(data)
+	if block == nil || block.Type != "PUBLIC KEY" || len(trimSpace(rest)) != 0 {
 		return nil, errors.New("release public key is not PEM")
 	}
 	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)

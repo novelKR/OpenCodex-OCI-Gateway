@@ -5,16 +5,19 @@ import OpenCodexRelayLocalization
 
 struct AppInformationView: View {
     @ObservedObject var model: MenuBarModel
+    @ObservedObject var updates: ReleaseUpdateController
     let localizer: AppLocalizer
     private let reader: AppInformationReader
     @State private var information: AppInformationSnapshot
 
     init(
         model: MenuBarModel,
+        updates: ReleaseUpdateController,
         localizer: AppLocalizer,
         reader: AppInformationReader = AppInformationReader()
     ) {
         self.model = model
+        self.updates = updates
         self.localizer = localizer
         self.reader = reader
         _information = State(initialValue: reader.loadingSnapshot)
@@ -103,6 +106,8 @@ struct AppInformationView: View {
                 .padding(.vertical, 4)
             }
 
+            updateCard
+
             ControlCenterSupportingText(
                 localizer.text(.appInformationAdHocDistributionNotice),
                 systemImage: "checkmark.shield"
@@ -120,6 +125,93 @@ struct AppInformationView: View {
         }
         .task {
             information = await reader.load()
+        }
+    }
+
+    @ViewBuilder
+    private var updateCard: some View {
+        ControlCenterSectionCard(
+            localizer.text(.updateTitle),
+            systemImage: "arrow.triangle.2.circlepath"
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(updateStatusTitle)
+                        .font(.headline)
+                    if updates.isUpdateBadgeVisible, let version = updates.candidateVersion {
+                        ControlCenterStatusBadge(
+                            text: localizer.text(.updateAvailableBadge, version),
+                            tone: .info
+                        )
+                    }
+                    Spacer(minLength: 12)
+                    if updates.isChecking {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                StatusRow(
+                    localizer.text(.updateChannel),
+                    value: updates.channel == .stable
+                        ? localizer.text(.updateChannelStable)
+                        : localizer.text(.updateChannelPreview),
+                    showsDivider: true
+                )
+                StatusRow(
+                    localizer.text(.updateLastChecked),
+                    value: updates.lastCheckedAt?.formatted(date: .abbreviated, time: .shortened)
+                        ?? localizer.text(.genericNever),
+                    showsDivider: updates.candidateVersion != nil
+                )
+                if let candidateVersion = updates.candidateVersion {
+                    StatusRow(
+                        localizer.text(.updateSelectedVersion),
+                        value: candidateVersion
+                    )
+                }
+
+                AdaptiveActionRow {
+                    Button {
+                        updates.checkNow()
+                    } label: {
+                        Label(localizer.text(.updateCheckNow), systemImage: "arrow.clockwise")
+                    }
+                    .disabled(updates.isChecking)
+                    .accessibilityHint(localizer.text(.updateCheckNowHint))
+
+                    if let releaseURL = updates.releaseURL {
+                        Button {
+                            NSWorkspace.shared.open(releaseURL)
+                        } label: {
+                            Label(localizer.text(.updateOpenRelease), systemImage: "safari")
+                        }
+                        .accessibilityHint(localizer.text(.updateOpenReleaseHint))
+                    }
+
+                    if updates.isUpdateBadgeVisible {
+                        Button(localizer.text(.updateDismissBadge)) {
+                            updates.dismissBadge()
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var updateStatusTitle: String {
+        if updates.lastCheckFailed { return localizer.text(.updateStatusFailed) }
+        guard let status = updates.status else { return localizer.text(.updateStatusNotChecked) }
+        switch status {
+        case .current: return localizer.text(.updateStatusCurrent)
+        case .newerThanSelectedChannel: return localizer.text(.updateStatusNewerThanChannel)
+        case .updateAvailable: return localizer.text(.updateStatusAvailable)
+        case .offline: return localizer.text(.updateStatusOffline)
+        case .rateLimited: return localizer.text(.updateStatusRateLimited)
+        case .invalidRelease: return localizer.text(.updateStatusInvalidRelease)
+        case .updaterTooOld: return localizer.text(.updateStatusUpdaterTooOld)
+        case .unsupportedSystem: return localizer.text(.updateStatusUnsupportedSystem)
         }
     }
 

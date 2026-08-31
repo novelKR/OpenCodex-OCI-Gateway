@@ -1,11 +1,14 @@
 import AppKit
 import Combine
 import SwiftUI
+import OpenCodexRelayCore
 import OpenCodexRelayLocalization
 
 enum RelayQuickMenuAction: String, CaseIterable, Sendable {
     case openControlCenter
     case refresh
+    case checkForUpdates
+    case openUpdateRelease
     case openLoginItemsSettings
     case quit
 }
@@ -25,6 +28,7 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
     private let localization: LocalizationStore
     private let windowCoordinator: ControlCenterWindowCoordinator
     private let relocation: ApplicationRelocationController
+    private let updates: ReleaseUpdateController
     private let statusBar: NSStatusBar
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
@@ -35,12 +39,14 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
         localization: LocalizationStore,
         windowCoordinator: ControlCenterWindowCoordinator,
         relocation: ApplicationRelocationController,
+        updates: ReleaseUpdateController,
         statusBar: NSStatusBar = .system
     ) {
         self.model = model
         self.localization = localization
         self.windowCoordinator = windowCoordinator
         self.relocation = relocation
+        self.updates = updates
         self.statusBar = statusBar
         self.statusItem = statusBar.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
@@ -78,6 +84,15 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
             string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
         ) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func checkForUpdates() {
+        updates.checkNow()
+    }
+
+    @objc private func openUpdateRelease() {
+        guard let releaseURL = updates.releaseURL else { return }
+        NSWorkspace.shared.open(releaseURL)
     }
 
     @objc private func quit() {
@@ -125,6 +140,12 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
                 }
             }
             .store(in: &observations)
+        updates.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] (_: Void) in
+                Task { @MainActor in self?.updateStatusItem() }
+            }
+            .store(in: &observations)
     }
 
     private func updateStatusItem() {
@@ -132,9 +153,12 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
         let image = NSImage(systemSymbolName: model.menuSymbolName, accessibilityDescription: nil)
         image?.isTemplate = true
         button.image = image
-        button.title = model.menuBarLabel
-        button.toolTip = model.menuAccessibilityLabel
-        button.setAccessibilityLabel(model.menuAccessibilityLabel)
+        button.title = model.menuBarLabel + (updates.isUpdateBadgeVisible ? " •" : "")
+        let accessibilityLabel = updates.isUpdateBadgeVisible
+            ? model.menuAccessibilityLabel + ". " + model.localizer.text(.updateStatusAvailable)
+            : model.menuAccessibilityLabel
+        button.toolTip = accessibilityLabel
+        button.setAccessibilityLabel(accessibilityLabel)
     }
 
     private func togglePopover(from button: NSStatusBarButton) {
@@ -149,7 +173,12 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
     private func showQuickMenu(from button: NSStatusBarButton) {
         popover.performClose(nil)
         let menu = NSMenu()
+        addUpdateSummary(to: menu)
+        menu.addItem(.separator())
         for action in RelayQuickMenuAction.allCases {
+            if action == .openUpdateRelease, updates.releaseURL == nil {
+                continue
+            }
             if action == .openLoginItemsSettings || action == .quit {
                 menu.addItem(.separator())
             }
@@ -169,6 +198,10 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
             descriptor = (.menuOpenControlCenter, #selector(openControlCenter), "")
         case .refresh:
             descriptor = (.menuRefresh, #selector(refresh), "r")
+        case .checkForUpdates:
+            descriptor = (.updateCheckNow, #selector(checkForUpdates), "")
+        case .openUpdateRelease:
+            descriptor = (.updateOpenRelease, #selector(openUpdateRelease), "")
         case .openLoginItemsSettings:
             descriptor = (.menuOpenLoginItemsSettings, #selector(openLoginItemsSettings), "")
         case .quit:
@@ -180,14 +213,50 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
             keyEquivalent: descriptor.2
         )
         item.target = self
+        if action == .checkForUpdates {
+            item.isEnabled = !updates.isChecking
+        }
         menu.addItem(item)
+    }
+
+    private func addUpdateSummary(to menu: NSMenu) {
+        let channel = updates.channel == .stable
+            ? model.localizer.text(.updateChannelStable)
+            : model.localizer.text(.updateChannelPreview)
+        let checkedAt = updates.lastCheckedAt?.formatted(date: .abbreviated, time: .shortened)
+            ?? model.localizer.text(.genericNever)
+        for title in [
+            model.localizer.text(.updateMenuChannel, channel),
+            model.localizer.text(.updateMenuLastChecked, checkedAt),
+            model.localizer.text(.updateMenuStatus, updateStatusTitle),
+        ] {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+    }
+
+    private var updateStatusTitle: String {
+        if updates.lastCheckFailed { return model.localizer.text(.updateStatusFailed) }
+        guard let status = updates.status else { return model.localizer.text(.updateStatusNotChecked) }
+        switch status {
+        case .current: return model.localizer.text(.updateStatusCurrent)
+        case .newerThanSelectedChannel: return model.localizer.text(.updateStatusNewerThanChannel)
+        case .updateAvailable: return model.localizer.text(.updateStatusAvailable)
+        case .offline: return model.localizer.text(.updateStatusOffline)
+        case .rateLimited: return model.localizer.text(.updateStatusRateLimited)
+        case .invalidRelease: return model.localizer.text(.updateStatusInvalidRelease)
+        case .updaterTooOld: return model.localizer.text(.updateStatusUpdaterTooOld)
+        case .unsupportedSystem: return model.localizer.text(.updateStatusUnsupportedSystem)
+        }
     }
 
     private func presentControlCenter() {
         windowCoordinator.present(
             model: model,
             localization: localization,
-            relocation: relocation
+            relocation: relocation,
+            updates: updates
         )
     }
 }

@@ -233,6 +233,16 @@ integration/helper protocols. The first updater bootstrap, `0.3.8-rc.6`, stays
 on revision 4 so existing manual installers can consume it; existing users must
 install that bootstrap release manually.
 
+`0.3.8-rc.6` adds notification-only update checking. Its production helper
+uses bounded GitHub pagination, strict SemVer channel selection, an owner-only
+ETag cache, and an exact-release read-back. GitHub metadata only discovers a
+candidate: the embedded tracked key must verify the manifest, and the signed
+app digest must match the GitHub asset digest before the app reports an update.
+The menu and App Information page show the channel, last check, status, and a
+candidate-specific dismissible badge. Automatic checking defaults on for
+production and is prohibited at the network boundary for local development.
+This release does not download, stage, replace, relaunch, or restart anything.
+
 ### Public GitHub Release distribution
 
 Publish official artifacts from the public Core repository. Enable

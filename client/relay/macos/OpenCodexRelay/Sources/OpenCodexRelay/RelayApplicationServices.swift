@@ -11,6 +11,7 @@ final class RelayApplicationServices: ObservableObject {
     let model: MenuBarModel
     let windowCoordinator: ControlCenterWindowCoordinator
     let relocation: ApplicationRelocationController
+    let updates: ReleaseUpdateController
 
     private let launchRequest: ApplicationRelocationLaunchRequest?
     private var statusItemCoordinator: RelayStatusItemCoordinator?
@@ -22,8 +23,10 @@ final class RelayApplicationServices: ObservableObject {
         let launchRequest = ApplicationRelocationLaunchRequest.parse(arguments)
         let localization = LocalizationStore()
         let model = MenuBarModel(localization: localization)
+        let updates = ReleaseUpdateController()
         self.localization = localization
         self.model = model
+        self.updates = updates
         self.windowCoordinator = ControlCenterWindowCoordinator(activityLog: model.activityLog)
         self.relocation = ApplicationRelocationController(
             runtimeMode: RelayRuntimeMode.current,
@@ -37,11 +40,13 @@ final class RelayApplicationServices: ObservableObject {
         guard !started else { return }
         started = true
         model.start()
+        updates.start()
         statusItemCoordinator = RelayStatusItemCoordinator(
             model: model,
             localization: localization,
             windowCoordinator: windowCoordinator,
-            relocation: relocation
+            relocation: relocation,
+            updates: updates
         )
         relocationStateObservation = relocation.$state
             .removeDuplicates()
@@ -68,6 +73,7 @@ final class RelayApplicationServices: ObservableObject {
             model: model,
             localization: localization,
             relocation: relocation,
+            updates: updates,
             section: section
         )
     }

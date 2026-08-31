@@ -2148,6 +2148,10 @@ final class MenuBarModelTests: XCTestCase {
             XCTAssertEqual(missingIntegrationModel.integrationAvailability, .missing)
             let localizer = localization.localizer
             let controller = model.makeCodexConfigurationController()
+            let updates = ReleaseUpdateController(
+                distributionFlavor: .localDevelopment,
+                currentVersion: "0.3.8"
+            )
             let pages: [AnyView] = [
                 AnyView(OverviewControlCenterPage(
                     model: model,
@@ -2205,6 +2209,7 @@ final class MenuBarModelTests: XCTestCase {
                     model: model,
                     gatewaySettings: model.makeGatewaySettingsController(),
                     relocation: ApplicationRelocationController(runtimeMode: .preview),
+                    updates: updates,
                     languageSelection: .constant(selection),
                     languageDescriptors: localization.registry.descriptors,
                     localizer: localizer,
@@ -2213,6 +2218,7 @@ final class MenuBarModelTests: XCTestCase {
                 )),
                 AnyView(AppInformationControlCenterPage(
                     model: model,
+                    updates: updates,
                     localizer: localizer,
                     title: localizer.text(.controlCenterAppInformation),
                     systemImage: "info.circle"

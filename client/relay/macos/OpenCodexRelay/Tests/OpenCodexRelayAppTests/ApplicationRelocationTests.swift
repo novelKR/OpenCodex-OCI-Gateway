@@ -966,7 +966,7 @@ final class ApplicationRelocationTests: XCTestCase {
     func testQuickMenuContainsOnlyStandardNonDestructiveActions() {
         XCTAssertEqual(
             RelayQuickMenuAction.allCases,
-            [.openControlCenter, .refresh, .openLoginItemsSettings, .quit]
+            [.openControlCenter, .refresh, .checkForUpdates, .openUpdateRelease, .openLoginItemsSettings, .quit]
         )
         XCTAssertEqual(RelayStatusItemActivation.resolve(eventType: .rightMouseUp), .quickMenu)
         XCTAssertEqual(RelayStatusItemActivation.resolve(eventType: .leftMouseUp), .popover)

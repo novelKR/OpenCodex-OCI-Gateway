@@ -230,6 +230,15 @@ integration/helper protocol을 엄격히 검증하지만, 첫 updater bootstrap 
 `0.3.8-rc.6`은 기존 수동 installer 호환을 위해 revision 4로 게시하며 기존 사용자가 직접
 설치해야 합니다.
 
+`0.3.8-rc.6`은 알림 전용 update check를 추가합니다. production helper는 bounded GitHub
+pagination, strict SemVer channel 선택, owner-only ETag cache와 exact-release read-back을
+사용합니다. GitHub metadata는 candidate 발견에만 쓰며 앱에 포함된 tracked key로 manifest를
+검증하고 signed app digest가 GitHub asset digest와 일치해야만 update를 보고합니다. 메뉴와
+앱 정보 화면에는 channel, 마지막 확인, 상태 및 candidate별로 닫을 수 있는 badge가 표시됩니다.
+자동 확인은 production에서 기본으로 켜지지만 local development에서는 network boundary에서
+금지됩니다. 이 release는 어떤 항목도 download, stage, replace, relaunch 또는 restart하지
+않습니다.
+
 ### public GitHub Release 배포 채널
 
 official artifact는 public Core 저장소에 게시합니다. repository settings에서
