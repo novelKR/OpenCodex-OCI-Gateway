@@ -64,6 +64,38 @@ results by strict SemVer: stable considers only non-prereleases, while preview
 considers both stable and prerelease versions and selects the maximum. Neither
 channel selects a version below the installed version.
 
+Starting with the manually installed `0.3.8-rc.6` bootstrap, the production
+menu-bar app checks this public repository directly. Stable is the default;
+preview is an explicit opt-in. Automatic checks are enabled by default, begin
+with a randomized 5–15 minute launch delay, and then run at most once every 24
+hours. They can be disabled in Settings. Local-development bundles never make
+automatic update requests. **Check for Updates…** always performs an immediate
+check while reusing the bounded ETag cache. The app does not request Notification
+Center permission and does not download or install an update in this milestone.
+
+The bundled control helper exposes the same read-only result as schema-versioned
+JSON. Production fixes both the GitHub API and repository; there is deliberately
+no repository or API override:
+
+```bash
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  release check \
+  --channel stable \
+  --current-version 0.3.8-rc.6 \
+  --public-key /Applications/OpenCodexRelay.app/Contents/Resources/ReleaseTrust/opencodex-relay-release-ed25519.pub \
+  --json
+```
+
+Expected remote conditions return one of `current`,
+`newer_than_selected_channel`, `update_available`, `offline`, `rate_limited`,
+`invalid_release`, `updater_too_old`, or `unsupported_system` in JSON without
+making the current app or resident Relay unavailable. Invalid arguments, an
+unsafe local trust-key path, and an invalid local JSON contract fail the
+command. Candidate metadata is not trusted until the exact immutable release,
+eight-asset set, manifest signature, and signed app ZIP digest all verify.
+Release notes are opened only as the canonical GitHub tag URL in the external
+browser; release-body HTML is never rendered in the app.
+
 ### Public GitHub Release option
 
 Use a lightweight strict-SemVer tag without a `v` prefix. Before approving the

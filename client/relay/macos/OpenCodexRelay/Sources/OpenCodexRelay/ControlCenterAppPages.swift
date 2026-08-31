@@ -1,10 +1,12 @@
 import SwiftUI
+import OpenCodexRelayCore
 import OpenCodexRelayLocalization
 
 struct SettingsControlCenterPage: View {
     @ObservedObject var model: MenuBarModel
     @ObservedObject var gatewaySettings: GatewaySettingsController
     @ObservedObject var relocation: ApplicationRelocationController
+    @ObservedObject var updates: ReleaseUpdateController
     @Binding var languageSelection: AppLanguageSelection
     let languageDescriptors: [AppLanguageDescriptor]
     let localizer: AppLocalizer
@@ -45,6 +47,42 @@ struct SettingsControlCenterPage: View {
                 .padding(.vertical, 4)
             }
 
+            ControlCenterSectionCard(localizer.text(.updateSettingsTitle), systemImage: "arrow.triangle.2.circlepath") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle(
+                        localizer.text(.updateAutomaticChecks),
+                        isOn: Binding(
+                            get: { updates.automaticChecksEnabled },
+                            set: { updates.setAutomaticChecksEnabled($0) }
+                        )
+                    )
+                    .disabled(model.isLocalDevelopmentBuild)
+                    .accessibilityHint(localizer.text(.updateAutomaticChecksHint))
+
+                    Picker(
+                        localizer.text(.updateChannel),
+                        selection: Binding(
+                            get: { updates.channel },
+                            set: { updates.setChannel($0) }
+                        )
+                    ) {
+                        Text(localizer.text(.updateChannelStable)).tag(ReleaseUpdateChannel.stable)
+                        Text(localizer.text(.updateChannelPreview)).tag(ReleaseUpdateChannel.preview)
+                    }
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: 280, alignment: .leading)
+
+                    ControlCenterSupportingText(
+                        model.isLocalDevelopmentBuild
+                            ? localizer.text(.updateLocalDevelopmentAutomaticDisabled)
+                            : localizer.text(.updateAutomaticChecksDetail),
+                        systemImage: model.isLocalDevelopmentBuild ? "network.slash" : "clock"
+                    )
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+            }
+
             ControlCenterSectionCard(localizer.text(.controlCenterLoginItem), systemImage: "power") {
                 VStack(alignment: .leading, spacing: 10) {
                     if let loginItemMessage = model.loginItemMessage {
@@ -74,13 +112,14 @@ struct SettingsControlCenterPage: View {
 
 struct AppInformationControlCenterPage: View {
     @ObservedObject var model: MenuBarModel
+    @ObservedObject var updates: ReleaseUpdateController
     let localizer: AppLocalizer
     let title: String
     let systemImage: String
 
     var body: some View {
         ControlCenterPage(title: title, systemImage: systemImage, model: model, localizer: localizer) {
-            AppInformationView(model: model, localizer: localizer)
+            AppInformationView(model: model, updates: updates, localizer: localizer)
         }
     }
 }

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "status": "update_available",
+  "channel": "preview",
+  "current_version": "0.3.8-rc.5",
+  "checked_at": "2026-09-01T00:00:00Z",
+  "etag_cache_state": "refreshed",
+  "release_id": 42,
+  "tag": "0.3.8-rc.6",
+  "version": "0.3.8-rc.6",
+  "release_url": "https://github.com/novelKR/OpenCodex-OCI-Gateway/releases/tag/0.3.8-rc.6",
+  "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "app_asset_id": 102,
+  "app_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

@@ -25,6 +25,7 @@ final class ControlCenterWindowCoordinator: NSObject, ObservableObject, NSWindow
         model: MenuBarModel,
         localization: LocalizationStore,
         relocation: ApplicationRelocationController,
+        updates: ReleaseUpdateController,
         section: RelayControlCenterSection? = nil
     ) {
         logger.info("Control Center presentation requested")
@@ -33,7 +34,8 @@ final class ControlCenterWindowCoordinator: NSObject, ObservableObject, NSWindow
         let window = window ?? makeWindow(
             model: model,
             localization: localization,
-            relocation: relocation
+            relocation: relocation,
+            updates: updates
         )
         window.title = model.localizer.text(.viewControlCenter)
         configure(window)
@@ -51,12 +53,14 @@ final class ControlCenterWindowCoordinator: NSObject, ObservableObject, NSWindow
     private func makeWindow(
         model: MenuBarModel,
         localization: LocalizationStore,
-        relocation: ApplicationRelocationController
+        relocation: ApplicationRelocationController,
+        updates: ReleaseUpdateController
     ) -> NSWindow {
         let root = RelayControlCenterView(
             model: model,
             windowCoordinator: self,
-            relocation: relocation
+            relocation: relocation,
+            updates: updates
         )
         .environmentObject(localization)
         .environment(\.locale, localization.locale)

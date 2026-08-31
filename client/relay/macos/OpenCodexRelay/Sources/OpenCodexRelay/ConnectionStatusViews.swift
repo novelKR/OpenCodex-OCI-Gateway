@@ -137,6 +137,7 @@ struct RelayControlCenterView: View {
     @ObservedObject var model: MenuBarModel
     @ObservedObject var windowCoordinator: ControlCenterWindowCoordinator
     @ObservedObject var relocation: ApplicationRelocationController
+    @ObservedObject var updates: ReleaseUpdateController
     @EnvironmentObject private var localization: LocalizationStore
     @StateObject private var codexConfiguration: CodexConfigurationController
     @StateObject private var gatewaySettings: GatewaySettingsController
@@ -150,11 +151,13 @@ struct RelayControlCenterView: View {
     init(
         model: MenuBarModel,
         windowCoordinator: ControlCenterWindowCoordinator,
-        relocation: ApplicationRelocationController
+        relocation: ApplicationRelocationController,
+        updates: ReleaseUpdateController
     ) {
         self.model = model
         self.windowCoordinator = windowCoordinator
         self.relocation = relocation
+        self.updates = updates
         _codexConfiguration = StateObject(
             wrappedValue: model.makeCodexConfigurationController()
         )
@@ -349,6 +352,7 @@ struct RelayControlCenterView: View {
                 model: model,
                 gatewaySettings: gatewaySettings,
                 relocation: relocation,
+                updates: updates,
                 languageSelection: $localization.selection,
                 languageDescriptors: localization.registry.descriptors,
                 localizer: localizer,
@@ -358,6 +362,7 @@ struct RelayControlCenterView: View {
         case .appInformation:
             AppInformationControlCenterPage(
                 model: model,
+                updates: updates,
                 localizer: localizer,
                 title: localizer.text(section.titleKey),
                 systemImage: section.systemImage

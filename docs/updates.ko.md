@@ -56,6 +56,35 @@ compatibility metadata를 사용합니다. updater는 bounded pagination 결과�
 비교하며, stable channel은 non-prerelease만, preview channel은 stable과 prerelease를 함께
 고려해 최댓값을 고릅니다. 어느 channel도 현재 버전보다 낮은 release를 선택하지 않습니다.
 
+수동 설치하는 첫 bootstrap `0.3.8-rc.6`부터 production 메뉴 막대 앱이 이 public 저장소를
+직접 확인합니다. 기본값은 stable이며 preview는 명시적으로 opt-in해야 합니다. 자동 확인은
+기본으로 켜져 있고 앱 실행 5–15분 사이의 무작위 지연 후 시작해 이후 최대 24시간마다
+실행하며 설정에서 끌 수 있습니다. local-development bundle은 자동 update network request를
+절대 만들지 않습니다. **업데이트 확인…**은 bounded ETag cache를 재사용하면서 항상 즉시
+수동 확인합니다. 이 milestone에서는 Notification Center 권한을 요청하지 않으며 update를
+다운로드하거나 설치하지 않습니다.
+
+bundle에 포함된 control helper도 같은 read-only 결과를 schema-versioned JSON으로 제공합니다.
+production에서는 GitHub API와 repository가 고정되며 repository/API override는 의도적으로
+제공하지 않습니다.
+
+```bash
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  release check \
+  --channel stable \
+  --current-version 0.3.8-rc.6 \
+  --public-key /Applications/OpenCodexRelay.app/Contents/Resources/ReleaseTrust/opencodex-relay-release-ed25519.pub \
+  --json
+```
+
+예상 가능한 원격 상태는 현재 app이나 resident Relay를 중단하지 않고 JSON의 `current`,
+`newer_than_selected_channel`, `update_available`, `offline`, `rate_limited`,
+`invalid_release`, `updater_too_old`, `unsupported_system` 중 하나로 반환합니다. 잘못된 인자,
+unsafe local trust-key path 및 invalid local JSON contract는 명령 실패입니다. exact immutable
+release, 8개 asset 집합, manifest signature 및 signed app ZIP digest를 모두 검증하기 전에는
+candidate metadata를 신뢰하지 않습니다. release note는 canonical GitHub tag URL만 외부
+browser에서 열고 app 내부에서 release-body HTML을 렌더링하지 않습니다.
+
 ### public GitHub Release를 사용하는 경우
 
 `v` 접두사가 없는 lightweight strict-SemVer tag를 사용합니다. 보호된 Environment 배포를

@@ -143,6 +143,8 @@ func writeUsage(writer io.Writer) {
   opencodex-relayctl lifecycle release-source-install --scope production|local_development
       --token SHA256 [--remove-created-root] --json
   opencodex-relayctl release verify --manifest PATH --signature PATH --public-key PATH
+  opencodex-relayctl release check --channel stable|preview --current-version VERSION
+      --public-key ABSOLUTE_PATH --json
 `)
 }
 
@@ -2177,16 +2179,28 @@ func parseIntegrationCandidate(reader io.Reader) (integration.Candidate, error) 
 }
 
 func releaseCommand(args []string) {
-	if len(args) == 0 || args[0] != "verify" {
+	if len(args) == 0 {
 		usage()
 		os.Exit(2)
 	}
+	switch args[0] {
+	case "verify":
+		releaseVerifyCommand(args[1:])
+	case "check":
+		releaseCheckCommand(args[1:])
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+func releaseVerifyCommand(args []string) {
 	flags := flag.NewFlagSet("release verify", flag.ExitOnError)
 	manifest := flags.String("manifest", "", "manifest JSON")
 	signature := flags.String("signature", "", "base64 Ed25519 signature")
 	publicKey := flags.String("public-key", "", "trusted PEM public key")
-	flags.Parse(args[1:])
-	if *manifest == "" || *signature == "" || *publicKey == "" {
+	flags.Parse(args)
+	if flags.NArg() != 0 || *manifest == "" || *signature == "" || *publicKey == "" {
 		fatal(fmt.Errorf("--manifest, --signature, and --public-key are required"))
 	}
 	verified, err := release.VerifyFiles(*manifest, *signature, *publicKey)
@@ -2194,7 +2208,8 @@ func releaseCommand(args []string) {
 		fatal(err)
 	}
 	var artifact release.Artifact
-	if verified.CompatibilityRevision == release.CompatibilityRevisionAdHocApp {
+	if verified.CompatibilityRevision == release.CompatibilityRevisionAdHocApp ||
+		verified.CompatibilityRevision == release.CompatibilityRevisionUpdater {
 		component := release.ComponentRelay
 		if runtime.GOOS == "darwin" {
 			component = release.ComponentMacOSMenuBarBundle
@@ -2207,6 +2222,39 @@ func releaseCommand(args []string) {
 		fatal(err)
 	}
 	fmt.Printf("release_version=%s compatibility_revision=%d artifact=%s sha256=%s\n", verified.Version, verified.CompatibilityRevision, artifact.File, artifact.SHA256)
+}
+
+func releaseCheckCommand(args []string) {
+	flags := flag.NewFlagSet("release check", flag.ExitOnError)
+	channel := flags.String("channel", "", "stable or preview")
+	currentVersion := flags.String("current-version", "", "installed strict SemVer")
+	publicKeyPath := flags.String("public-key", "", "absolute path to trusted PEM public key")
+	jsonOutput := flags.Bool("json", false, "emit schema-versioned JSON")
+	flags.Parse(args)
+	if flags.NArg() != 0 || !*jsonOutput || *channel == "" || *currentVersion == "" || *publicKeyPath == "" {
+		fatal(errors.New("--channel, --current-version, --public-key, and --json are required"))
+	}
+	publicKey, err := release.ReadPublicKeyFile(*publicKeyPath)
+	if err != nil {
+		fatal(err)
+	}
+	checker, err := release.NewProductionChecker(version)
+	if err != nil {
+		fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	result, err := checker.Check(ctx, release.CheckRequest{
+		Channel:        release.UpdateChannel(*channel),
+		CurrentVersion: *currentVersion,
+		PublicKeyPEM:   publicKey,
+	})
+	if err != nil {
+		fatal(err)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+		fatal(err)
+	}
 }
 
 func defaultCredentialSource() string {
