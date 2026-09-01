@@ -594,7 +594,7 @@ struct DevelopmentHomebrewGuardSetupView: View {
     }
 }
 
-private struct SheetVisibleFrameReader: NSViewRepresentable {
+struct SheetVisibleFrameReader: NSViewRepresentable {
     let onChange: @MainActor (CGSize) -> Void
 
     func makeNSView(context: Context) -> SheetVisibleFrameObservationView {
@@ -608,7 +608,7 @@ private struct SheetVisibleFrameReader: NSViewRepresentable {
 }
 
 @MainActor
-private final class SheetVisibleFrameObservationView: NSView {
+final class SheetVisibleFrameObservationView: NSView {
     var onChange: @MainActor (CGSize) -> Void
 
     init(onChange: @escaping @MainActor (CGSize) -> Void) {

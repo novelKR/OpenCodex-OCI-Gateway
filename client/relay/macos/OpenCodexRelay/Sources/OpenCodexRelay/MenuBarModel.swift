@@ -104,6 +104,42 @@ struct OpenCodexDiscoveryCandidatePresentation: Equatable, Identifiable {
     let automaticRemovalReason: OpenCodexAutomaticRemovalReason?
 }
 
+struct OpenCodexManualRemovalCommandPresentation: Equatable, Identifiable {
+    let id: String
+    let manager: OpenCodexPackageManager
+    let version: String
+    let reason: OpenCodexAutomaticRemovalReason
+    let nativeState: OpenCodexNativeState
+    let command: String
+}
+
+enum OpenCodexManualRemovalCommandResolver {
+    // The discovery contract deliberately omits installation paths. Keep this
+    // command path-independent and never interpolate candidate-provided data.
+    static let npmCommand =
+        "/usr/bin/env npm uninstall --global --ignore-scripts --no-audit --no-fund --offline '@bitkyc08/opencodex'"
+
+    static func resolve(
+        candidate: OpenCodexDiscoveryCandidatePresentation,
+        nativeState: OpenCodexNativeState
+    ) -> OpenCodexManualRemovalCommandPresentation? {
+        guard !candidate.automaticRemovalEligible else { return nil }
+        switch candidate.manager {
+        case .homebrew, .npm:
+            return OpenCodexManualRemovalCommandPresentation(
+                id: candidate.id,
+                manager: candidate.manager,
+                version: candidate.version,
+                reason: candidate.automaticRemovalReason ?? .verificationUnavailable,
+                nativeState: nativeState,
+                command: npmCommand
+            )
+        case .nvm, .fnm, .volta, .asdf:
+            return nil
+        }
+    }
+}
+
 enum OpenCodexDiscoverySnapshot: Equatable {
     case integrated(OpenCodexDiscoveryResult)
     case standaloneNative(OpenCodexNativeDiscoveryResult)
@@ -1245,6 +1281,36 @@ final class MenuBarModel: ObservableObject {
                 "version": candidate.version,
                 "manager": candidate.manager.rawValue,
                 "reason": reason.rawValue,
+            ]
+        )
+    }
+
+    func openCodexManualRemovalCommand(
+        candidateID: String
+    ) -> OpenCodexManualRemovalCommandPresentation? {
+        guard case let .candidates(.standaloneNative(result)) = openCodexDiscoveryState,
+              let candidate = discoveredOpenCodexCandidatePresentations.first(where: {
+                  $0.id == candidateID
+              }) else { return nil }
+        return OpenCodexManualRemovalCommandResolver.resolve(
+            candidate: candidate,
+            nativeState: result.nativeState
+        )
+    }
+
+    func copyOpenCodexManualRemovalCommand(candidateID: String) {
+        guard let presentation = openCodexManualRemovalCommand(candidateID: candidateID) else {
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(presentation.command, forType: .string)
+        activityLog.record(
+            category: .removal,
+            code: "opencodex_manual_removal_command_copied",
+            fields: [
+                "manager": presentation.manager.rawValue,
+                "reason": presentation.reason.rawValue,
+                "result_code": "copied",
             ]
         )
     }

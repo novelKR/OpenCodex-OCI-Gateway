@@ -1196,6 +1196,93 @@ final class MenuBarModelTests: XCTestCase {
                     "reason": "unreviewed_package_closure",
                 ]
         })
+
+        let command = try XCTUnwrap(
+            model.openCodexManualRemovalCommand(candidateID: candidate.id)
+        )
+        XCTAssertEqual(command.manager, .homebrew)
+        XCTAssertEqual(command.version, "2.22.0")
+        XCTAssertEqual(command.reason, .unreviewedPackageClosure)
+        XCTAssertEqual(command.nativeState, .openCodex)
+        XCTAssertEqual(command.command, OpenCodexManualRemovalCommandResolver.npmCommand)
+        XCTAssertFalse(command.command.contains("sudo"))
+        XCTAssertFalse(command.command.contains(candidate.id))
+        XCTAssertFalse(command.command.contains(candidate.version))
+
+        NSPasteboard.general.clearContents()
+        model.copyOpenCodexManualRemovalCommand(candidateID: candidate.id)
+        XCTAssertEqual(
+            NSPasteboard.general.string(forType: .string),
+            OpenCodexManualRemovalCommandResolver.npmCommand
+        )
+        XCTAssertTrue(activityLog.events.contains {
+            $0.code == "opencodex_manual_removal_command_copied" &&
+                $0.fields == [
+                    "manager": "homebrew",
+                    "reason": "unreviewed_package_closure",
+                    "result_code": "copied",
+                ]
+        })
+
+        model.cancelOpenCodexDiscovery()
+        NSPasteboard.general.clearContents()
+        model.copyOpenCodexManualRemovalCommand(candidateID: candidate.id)
+        XCTAssertNil(NSPasteboard.general.string(forType: .string))
+    }
+
+    func testManualRemovalCommandResolverIsBoundedToDirectNPMManagers() {
+        let manual = OpenCodexDiscoveryCandidatePresentation(
+            id: "candidate-id",
+            manager: .homebrew,
+            version: "2.22.0",
+            tier: nil,
+            help: nil,
+            automaticRemovalEligible: false,
+            automaticRemovalReason: .unreviewedPackageClosure
+        )
+        XCTAssertNotNil(
+            OpenCodexManualRemovalCommandResolver.resolve(
+                candidate: manual,
+                nativeState: .openCodex
+            )
+        )
+
+        for manager in [
+            OpenCodexPackageManager.nvm, .fnm, .volta, .asdf,
+        ] {
+            let environmentManaged = OpenCodexDiscoveryCandidatePresentation(
+                id: "candidate-id",
+                manager: manager,
+                version: "2.22.0",
+                tier: nil,
+                help: nil,
+                automaticRemovalEligible: false,
+                automaticRemovalReason: .manualPackageManager
+            )
+            XCTAssertNil(
+                OpenCodexManualRemovalCommandResolver.resolve(
+                    candidate: environmentManaged,
+                    nativeState: .openCodex
+                ),
+                "must not guess a command for \(manager)"
+            )
+        }
+
+        let eligible = OpenCodexDiscoveryCandidatePresentation(
+            id: "candidate-id",
+            manager: .npm,
+            version: "2.22.0",
+            tier: nil,
+            help: nil,
+            automaticRemovalEligible: true,
+            automaticRemovalReason: .eligible
+        )
+        XCTAssertNil(
+            OpenCodexManualRemovalCommandResolver.resolve(
+                candidate: eligible,
+                nativeState: .native
+            )
+        )
     }
 
     func testStandaloneManualCandidateFitsCommonWidthsInEnglishAndKorean() async throws {
@@ -1240,6 +1327,14 @@ final class MenuBarModelTests: XCTestCase {
             }
             XCTAssertFalse(localization.localizer.text(.menuDiscoveryCopyDiagnosticsAccessibility).isEmpty)
             XCTAssertFalse(localization.localizer.text(.menuDiscoveryCopyDiagnosticsHint).isEmpty)
+            XCTAssertFalse(localization.localizer.text(.menuDiscoveryManualRemovalInstructionsAccessibility).isEmpty)
+            XCTAssertFalse(localization.localizer.text(.menuDiscoveryManualRemovalInstructionsHint).isEmpty)
+
+            let command = try XCTUnwrap(
+                model.openCodexManualRemovalCommand(
+                    candidateID: model.discoveredOpenCodexCandidatePresentations[0].id
+                )
+            )
 
             for width in [CGFloat(800), 600, 320] {
                 let hostingView = NSHostingView(
@@ -1260,6 +1355,23 @@ final class MenuBarModelTests: XCTestCase {
                     hostingView.fittingSize.width,
                     width,
                     "manual candidate exceeded \(width)pt for \(selection)"
+                )
+
+                let commandSheet = NSHostingView(
+                    rootView: OpenCodexManualRemovalCommandSheet(
+                        presentation: command,
+                        model: model,
+                        localizer: localization.localizer
+                    )
+                    .environmentObject(localization)
+                    .frame(width: width)
+                )
+                commandSheet.layoutSubtreeIfNeeded()
+                XCTAssertGreaterThan(commandSheet.fittingSize.height, 80)
+                XCTAssertLessThanOrEqual(
+                    commandSheet.fittingSize.width,
+                    width,
+                    "manual command sheet exceeded \(width)pt for \(selection)"
                 )
             }
         }
