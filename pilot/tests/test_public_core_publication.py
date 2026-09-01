@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,6 +17,26 @@ PREPARER = ROOT / "tools" / "prepare-public-core.sh"
 VALIDATOR = ROOT / "tools" / "validate-public-core.sh"
 VERIFIER = ROOT / "tools" / "verify-public-core-remote.sh"
 RELEASE_REF_VERIFIER = ROOT / "tools" / "verify-release-ref.sh"
+WORKFLOW_DIRECTORY = ROOT / ".github" / "workflows"
+ACTION_MINIMUM_MAJORS = {
+    "actions/attest-build-provenance": 4,
+    "actions/checkout": 7,
+    "actions/setup-go": 7,
+    "actions/setup-python": 7,
+    "docker/build-push-action": 7,
+    "docker/login-action": 4,
+    "docker/setup-buildx-action": 4,
+    "docker/setup-qemu-action": 4,
+    "github/codeql-action": 4,
+}
+ACTION_USE_PATTERN = re.compile(
+    r"^\s*(?:-\s*)?uses:\s+"
+    r"(?P<target>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"
+    r"@(?P<sha>[0-9a-f]{40})\s+#\s+"
+    r"v(?P<major>0|[1-9][0-9]*)\."
+    r"(?P<minor>0|[1-9][0-9]*)\."
+    r"(?P<patch>0|[1-9][0-9]*)\s*$"
+)
 
 
 def run(*arguments, cwd=None, env=None):
@@ -117,6 +138,47 @@ class PublicCorePublicationTests(unittest.TestCase):
         )
         self.assertIn('tools/verify-release-ref.sh "$version"', container)
 
+    def test_external_actions_are_allowlisted_and_immutably_pinned(self):
+        references = []
+        workflow_paths = sorted(WORKFLOW_DIRECTORY.glob("*.yml")) + sorted(
+            WORKFLOW_DIRECTORY.glob("*.yaml")
+        )
+        self.assertGreater(len(workflow_paths), 0)
+
+        for workflow_path in workflow_paths:
+            workflow = workflow_path.read_text(encoding="utf-8")
+            self.assertNotIn("ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION", workflow)
+            for line_number, line in enumerate(workflow.splitlines(), start=1):
+                if "uses:" not in line:
+                    continue
+                value = line.split("uses:", 1)[1].strip()
+                if value.startswith("./"):
+                    continue
+                match = ACTION_USE_PATTERN.fullmatch(line)
+                self.assertIsNotNone(
+                    match,
+                    f"{workflow_path.relative_to(ROOT)}:{line_number}: "
+                    "external action must use a full commit SHA and vM.m.p comment",
+                )
+                target = match.group("target")
+                repository = "/".join(target.split("/")[:2])
+                self.assertIn(
+                    repository,
+                    ACTION_MINIMUM_MAJORS,
+                    f"{workflow_path.relative_to(ROOT)}:{line_number}: "
+                    f"external action repository is not allowlisted: {repository}",
+                )
+                major = int(match.group("major"))
+                self.assertGreaterEqual(
+                    major,
+                    ACTION_MINIMUM_MAJORS[repository],
+                    f"{workflow_path.relative_to(ROOT)}:{line_number}: "
+                    f"action version is below the Node 24 security floor: {repository}",
+                )
+                references.append((repository, match.group("sha")))
+
+        self.assertEqual(set(ACTION_MINIMUM_MAJORS), {item[0] for item in references})
+
     def test_relay_release_workflow_is_public_only_and_fail_closed(self):
         workflow = (
             ROOT / ".github" / "workflows" / "relay-release.yml"
@@ -168,13 +230,7 @@ class PublicCorePublicationTests(unittest.TestCase):
         self.assertIn("TeamIdentifier=not set", workflow)
         self.assertNotIn("notarytool", workflow)
         self.assertNotIn("stapler", workflow)
-        for action in (
-            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-            "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
-            "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
-        ):
-            self.assertIn(action, workflow)
-        self.assertNotRegex(workflow, r"uses: actions/[^@\n]+@v[0-9]+")
+        self.assertNotRegex(workflow, r"uses:\s+[^@\n]+@v[0-9]+")
 
     def test_release_ref_verifier_binds_tag_workflow_and_checkout_commits(self):
         with tempfile.TemporaryDirectory() as directory:
