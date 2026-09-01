@@ -42,11 +42,24 @@ let package = Package(
             dependencies: ["OpenCodexRelayCore"],
             resources: [.process("Resources")]
         ),
+        .target(
+            name: "OpenCodexRelayLegacyKeychainACL",
+            cSettings: [
+                .unsafeFlags([
+                    "-Werror",
+                    "-Wno-deprecated-declarations",
+                ]),
+            ],
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
+        ),
         .executableTarget(
             name: "OpenCodexRelay",
             dependencies: [
                 "OpenCodexRelayCore",
                 "OpenCodexRelayHelperInstallerCore",
+                "OpenCodexRelayLegacyKeychainACL",
                 "OpenCodexRelayLocalization",
                 "OpenCodexRelayHomebrewGuard",
             ],

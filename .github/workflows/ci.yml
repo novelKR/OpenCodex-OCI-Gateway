@@ -61,7 +61,9 @@ jobs:
         working-directory: client/relay/macos/OpenCodexRelay
         run: |
           swift test
-          swift build -c release
+          swift build -c release -Xswiftc -warnings-as-errors
+      - name: Isolated file-Keychain ACL integration
+        run: client/relay/scripts/test-keychain-acl-integration.sh
       - name: Dry-run the production release package
         run: |
           set -euo pipefail

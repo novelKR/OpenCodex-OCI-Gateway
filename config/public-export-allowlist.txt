@@ -7,6 +7,9 @@ LICENSE
 NOTICE
 README.md
 SECURITY.md
+# Audited legacy file-Keychain ACL compatibility boundary.
+client/relay/macos/OpenCodexRelay/Sources/OpenCodexRelayLegacyKeychainACL/LegacyKeychainACL.c
+client/relay/macos/OpenCodexRelay/Sources/OpenCodexRelayLegacyKeychainACL/include/OpenCodexRelayLegacyKeychainACL.h
 client/
 config/public-export-allowlist.txt
 config/deployment.example.toml

@@ -37,6 +37,29 @@ ACTION_USE_PATTERN = re.compile(
     r"(?P<minor>0|[1-9][0-9]*)\."
     r"(?P<patch>0|[1-9][0-9]*)\s*$"
 )
+LEGACY_KEYCHAIN_SOURCE = (
+    ROOT
+    / "client"
+    / "relay"
+    / "macos"
+    / "OpenCodexRelay"
+    / "Sources"
+    / "OpenCodexRelayLegacyKeychainACL"
+    / "LegacyKeychainACL.c"
+)
+LEGACY_KEYCHAIN_HEADER = LEGACY_KEYCHAIN_SOURCE.parent / "include" / (
+    "OpenCodexRelayLegacyKeychainACL.h"
+)
+LEGACY_SECURITY_SYMBOLS = (
+    "SecKeychainCopyDomainDefault",
+    "SecKeychainGetPath",
+    "SecKeychainItemCopyAccess",
+    "SecAccessCopyMatchingACLList",
+    "SecACLCopyContents",
+    "SecTrustedApplicationCreateFromPath",
+    "SecKeychainItemGetTypeID",
+    "SecTrustedApplicationCopyData",
+)
 
 
 def run(*arguments, cwd=None, env=None):
@@ -178,6 +201,47 @@ class PublicCorePublicationTests(unittest.TestCase):
                 references.append((repository, match.group("sha")))
 
         self.assertEqual(set(ACTION_MINIMUM_MAJORS), {item[0] for item in references})
+
+    def test_legacy_keychain_api_and_warning_suppression_are_isolated(self):
+        package_root = (
+            ROOT / "client" / "relay" / "macos" / "OpenCodexRelay"
+        )
+        source_paths = sorted((package_root / "Sources").rglob("*"))
+        for source_path in source_paths:
+            if not source_path.is_file() or source_path == LEGACY_KEYCHAIN_SOURCE:
+                continue
+            if source_path.suffix not in {".c", ".h", ".swift"}:
+                continue
+            source = source_path.read_text(encoding="utf-8")
+            for symbol in LEGACY_SECURITY_SYMBOLS:
+                self.assertNotIn(
+                    symbol,
+                    source,
+                    f"legacy Security symbol escaped compatibility source: "
+                    f"{source_path.relative_to(ROOT)}",
+                )
+
+        package = (package_root / "Package.swift").read_text(encoding="utf-8")
+        suppression = "-Wno-deprecated-declarations"
+        self.assertEqual(package.count(suppression), 1)
+        self.assertIn(
+            'name: "OpenCodexRelayLegacyKeychainACL",\n'
+            "            cSettings: [\n"
+            "                .unsafeFlags([\n"
+            '                    "-Werror",\n'
+            f'                    "{suppression}",',
+            package,
+        )
+        self.assertNotIn("-suppress-warnings", package)
+        self.assertNotIn("#pragma clang diagnostic", LEGACY_KEYCHAIN_SOURCE.read_text(
+            encoding="utf-8"
+        ))
+
+        allowlist = (
+            ROOT / "config" / "public-export-allowlist.txt"
+        ).read_text(encoding="utf-8").splitlines()
+        for path in (LEGACY_KEYCHAIN_SOURCE, LEGACY_KEYCHAIN_HEADER):
+            self.assertIn(path.relative_to(ROOT).as_posix(), allowlist)
 
     def test_relay_release_workflow_is_public_only_and_fail_closed(self):
         workflow = (
