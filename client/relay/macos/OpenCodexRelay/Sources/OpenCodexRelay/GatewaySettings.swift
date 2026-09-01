@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-import Security
+import OpenCodexRelayLegacyKeychainACL
 import OpenCodexRelayCore
 
 enum GatewayCredentialKind: String, CaseIterable, Codable, Hashable, Sendable {
@@ -252,32 +252,226 @@ extension GatewayCredentialStoring {
     }
 }
 
+struct LegacyFileKeychainACLInspection: Equatable, Sendable {
+    let keychainPath: String
+    let matches: Bool
+}
+
+protocol LegacyFileKeychainACLInspecting: Sendable {
+    func metadata(
+        service: String,
+        account: String,
+        keychainPathWitness: String?
+    ) throws -> GatewayCredentialMetadata
+    func inspectDecryptACL(
+        service: String,
+        account: String,
+        applicationPath: String
+    ) throws -> LegacyFileKeychainACLInspection
+}
+
+struct SystemLegacyFileKeychainACLInspector: LegacyFileKeychainACLInspecting, Sendable {
+    private enum Result: Int32 {
+        case success = 0
+        case failure = 1
+        case trustedApplicationUnavailable = 2
+        case invalidInput = 3
+    }
+
+    func metadata(
+        service: String,
+        account: String,
+        keychainPathWitness: String?
+    ) throws -> GatewayCredentialMetadata {
+        var rawMetadata = OCRLegacyKeychainItemMetadata(
+            configured: false,
+            has_modification_time: false,
+            modification_time_since_reference_date: 0
+        )
+        let inspect: (UnsafePointer<CChar>?) -> Int32 = { witnessPointer in
+            service.withCString { servicePointer in
+                account.withCString { accountPointer in
+                    OCRLegacyKeychainCopyItemMetadata(
+                        servicePointer,
+                        accountPointer,
+                        witnessPointer,
+                        &rawMetadata
+                    )
+                }
+            }
+        }
+        let status = if let keychainPathWitness {
+            keychainPathWitness.withCString(inspect)
+        } else {
+            inspect(nil)
+        }
+        try check(status)
+        return GatewayCredentialMetadata(
+            configured: rawMetadata.configured,
+            modifiedAt: rawMetadata.has_modification_time
+                ? Date(
+                    timeIntervalSinceReferenceDate:
+                        rawMetadata.modification_time_since_reference_date
+                )
+                : nil
+        )
+    }
+
+    func inspectDecryptACL(
+        service: String,
+        account: String,
+        applicationPath: String
+    ) throws -> LegacyFileKeychainACLInspection {
+        var matches = false
+        var pathBuffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let status = service.withCString { servicePointer in
+            account.withCString { accountPointer in
+                applicationPath.withCString { applicationPointer in
+                    "/usr/bin/security".withCString { securityPointer in
+                        OCRLegacyKeychainInspectDecryptACL(
+                            servicePointer,
+                            accountPointer,
+                            applicationPointer,
+                            securityPointer,
+                            &pathBuffer,
+                            pathBuffer.count,
+                            &matches
+                        )
+                    }
+                }
+            }
+        }
+        try check(status)
+        let pathBytes = pathBuffer.prefix { $0 != 0 }.map {
+            UInt8(bitPattern: $0)
+        }
+        guard let keychainPath = String(
+            bytes: pathBytes,
+            encoding: .utf8
+        ), !keychainPath.isEmpty else {
+            throw GatewayCredentialStoreError.keychainFailure
+        }
+        return LegacyFileKeychainACLInspection(
+            keychainPath: keychainPath,
+            matches: matches
+        )
+    }
+
+    private func check(_ status: Int32) throws {
+        switch Result(rawValue: status) {
+        case .success:
+            return
+        case .trustedApplicationUnavailable:
+            throw GatewayCredentialStoreError.accessControlUnavailable
+        case .failure, .invalidInput, nil:
+            throw GatewayCredentialStoreError.keychainFailure
+        }
+    }
+}
+
+struct GatewaySecurityCommandResult: Sendable {
+    let status: Int32
+    let output: Data
+}
+
+protocol GatewaySecurityCommandRunning: Sendable {
+    func run(
+        arguments: [String],
+        standardInput: Data?
+    ) -> GatewaySecurityCommandResult
+}
+
+struct SystemGatewaySecurityCommandRunner: GatewaySecurityCommandRunning, Sendable {
+    private static let maximumOutputBytes = 16 * 1_024
+
+    func run(
+        arguments: [String],
+        standardInput: Data? = nil
+    ) -> GatewaySecurityCommandResult {
+        let process = Process()
+        let output = Pipe()
+        let input = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        if standardInput == nil {
+            process.standardInput = FileHandle.nullDevice
+        } else {
+            process.standardInput = input
+        }
+        do {
+            try process.run()
+        } catch {
+            return GatewaySecurityCommandResult(status: -1, output: Data())
+        }
+        if let standardInput {
+            do {
+                try input.fileHandleForWriting.write(contentsOf: standardInput)
+            } catch {
+                process.terminate()
+            }
+            try? input.fileHandleForWriting.close()
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            process.terminate()
+            let grace = Date().addingTimeInterval(0.25)
+            while process.isRunning, Date() < grace {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            if process.isRunning, process.processIdentifier > 0 {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        guard data.count <= Self.maximumOutputBytes else {
+            return GatewaySecurityCommandResult(status: -1, output: Data())
+        }
+        return GatewaySecurityCommandResult(
+            status: process.terminationStatus,
+            output: data
+        )
+    }
+}
+
 struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendable {
     private static let maximumSecretBytes = 16 * 1_024
     private static let maximumSecurityCommandBytes = 4_000
     private let serviceNames: [GatewayCredentialKind: String]
     private let trustedApplicationPath: String?
     private let lifecycleGate: GatewayCredentialLifecycleGate
+    private let legacyACLInspector: any LegacyFileKeychainACLInspecting
+    private let securityCommandRunner: any GatewaySecurityCommandRunning
 
     init(
         serviceNames: [GatewayCredentialKind: String] = [:],
         trustedApplicationPath: String? = Bundle.main.executableURL?.path,
-        lifecycleHomeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path
+        lifecycleHomeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        legacyACLInspector: any LegacyFileKeychainACLInspecting =
+            SystemLegacyFileKeychainACLInspector(),
+        securityCommandRunner: any GatewaySecurityCommandRunning =
+            SystemGatewaySecurityCommandRunner()
     ) {
         self.serviceNames = Dictionary(uniqueKeysWithValues: GatewayCredentialKind.allCases.map {
             ($0, serviceNames[$0] ?? $0.service)
         })
         self.trustedApplicationPath = trustedApplicationPath
         self.lifecycleGate = GatewayCredentialLifecycleGate(homeDirectory: lifecycleHomeDirectory)
+        self.legacyACLInspector = legacyACLInspector
+        self.securityCommandRunner = securityCommandRunner
     }
 
     func inspect(account: String) throws -> [GatewayCredentialKind: GatewayCredentialMetadata] {
         guard !account.isEmpty else {
             throw GatewayCredentialStoreError.keychainFailure
         }
-        let keychain = try userKeychain()
         return try Dictionary(uniqueKeysWithValues: GatewayCredentialKind.allCases.map {
-            ($0, try metadata(for: $0, account: account, keychain: keychain))
+            ($0, try metadata(for: $0, account: account))
         })
     }
 
@@ -288,9 +482,8 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
         guard !account.isEmpty else {
             throw GatewayCredentialStoreError.keychainFailure
         }
-        let keychain = try userKeychain()
         return try Dictionary(uniqueKeysWithValues: kinds.map {
-            ($0, try metadata(for: $0, account: account, keychain: keychain))
+            ($0, try metadata(for: $0, account: account))
         })
     }
 
@@ -308,30 +501,25 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
         }
 
         return try lifecycleGate.withWriteAdmission {
-            let keychain = try userKeychain()
             let service = serviceName(for: kind)
-            let query = itemQuery(kind, account: account, keychain: keychain)
             guard let trustedApplicationPath,
                   FileManager.default.isExecutableFile(atPath: trustedApplicationPath) else {
                 throw GatewayCredentialStoreError.accessControlUnavailable
             }
-            let keychainPath = try path(for: keychain)
-            let accessAlreadyValid = try hasExpectedAccess(
-                query: query,
-                trustedApplicationPaths: [
-                    trustedApplicationPath,
-                    "/usr/bin/security",
-                ]
+            let accessInspection = try legacyACLInspector.inspectDecryptACL(
+                service: service,
+                account: account,
+                applicationPath: trustedApplicationPath
             )
             let storeCommand = try makeSecurityStoreCommand(
                 service: service,
                 account: account,
                 value: data,
                 trustedApplicationPath: trustedApplicationPath,
-                keychainPath: keychainPath,
-                repairAccess: !accessAlreadyValid
+                keychainPath: accessInspection.keychainPath,
+                repairAccess: !accessInspection.matches
             )
-            let storeResult = runSecurityCLI(
+            let storeResult = securityCommandRunner.run(
                 arguments: ["-i"],
                 standardInput: storeCommand
             )
@@ -342,75 +530,33 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
             guard verifyWithSecurityCLI(
                 service: service,
                 account: account,
-                keychainPath: keychainPath,
+                keychainPath: accessInspection.keychainPath,
                 expectedValue: normalized
             ) else {
                 throw GatewayCredentialStoreError.verificationFailed
             }
-            return try metadata(for: kind, account: account, keychain: keychain)
+            return try metadata(
+                for: kind,
+                account: account,
+                keychainPathWitness: accessInspection.keychainPath
+            )
         }
-    }
-
-    private func userKeychain() throws -> SecKeychain {
-        var keychain: SecKeychain?
-        guard SecKeychainCopyDomainDefault(.user, &keychain) == errSecSuccess,
-              let keychain else {
-            throw GatewayCredentialStoreError.keychainFailure
-        }
-        return keychain
     }
 
     private func serviceName(for kind: GatewayCredentialKind) -> String {
         serviceNames[kind] ?? kind.service
     }
 
-    private func itemQuery(
-        _ kind: GatewayCredentialKind,
-        account: String,
-        keychain: SecKeychain
-    ) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceName(for: kind),
-            kSecAttrAccount as String: account,
-            kSecMatchSearchList as String: [keychain],
-        ]
-    }
-
     private func metadata(
         for kind: GatewayCredentialKind,
         account: String,
-        keychain: SecKeychain
+        keychainPathWitness: String? = nil
     ) throws -> GatewayCredentialMetadata {
-        var query = itemQuery(kind, account: account, keychain: keychain)
-        query[kSecReturnAttributes as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound {
-            return GatewayCredentialMetadata(configured: false, modifiedAt: nil)
-        }
-        guard status == errSecSuccess,
-              let attributes = result as? [String: Any] else {
-            throw GatewayCredentialStoreError.keychainFailure
-        }
-        return GatewayCredentialMetadata(
-            configured: true,
-            modifiedAt: attributes[kSecAttrModificationDate as String] as? Date
+        try legacyACLInspector.metadata(
+            service: serviceName(for: kind),
+            account: account,
+            keychainPathWitness: keychainPathWitness
         )
-    }
-
-    private func path(for keychain: SecKeychain) throws -> String {
-        var length = UInt32(PATH_MAX)
-        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-        guard SecKeychainGetPath(keychain, &length, &buffer) == errSecSuccess else {
-            throw GatewayCredentialStoreError.keychainFailure
-        }
-        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-        guard let path = String(bytes: bytes, encoding: .utf8), !path.isEmpty else {
-            throw GatewayCredentialStoreError.keychainFailure
-        }
-        return path
     }
 
     private func makeSecurityStoreCommand(
@@ -461,103 +607,22 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
         return commandData
     }
 
-    private func hasExpectedAccess(
-        query: [String: Any],
-        trustedApplicationPaths: [String]
-    ) throws -> Bool {
-        guard let item = try itemReference(query: query) else {
-            return false
-        }
-        var access: SecAccess?
-        guard SecKeychainItemCopyAccess(item, &access) == errSecSuccess,
-              let access,
-              let aclList = SecAccessCopyMatchingACLList(
-                access,
-                kSecACLAuthorizationDecrypt
-              ),
-              CFArrayGetCount(aclList) > 0 else {
-            return false
-        }
-        let acl = unsafeBitCast(
-            CFArrayGetValueAtIndex(aclList, 0),
-            to: SecACL.self
-        )
-        var applications: CFArray?
-        var description: CFString?
-        var promptSelector: SecKeychainPromptSelector = []
-        guard SecACLCopyContents(
-            acl,
-            &applications,
-            &description,
-            &promptSelector
-        ) == errSecSuccess, let applications else {
-            return false
-        }
-
-        let actualIdentities = (0..<CFArrayGetCount(applications)).compactMap {
-            let application = unsafeBitCast(
-                CFArrayGetValueAtIndex(applications, $0),
-                to: SecTrustedApplication.self
-            )
-            return trustedApplicationIdentity(application)
-        }
-        let expectedIdentities = try trustedApplicationPaths.map {
-            var application: SecTrustedApplication?
-            let status = $0.withCString {
-                SecTrustedApplicationCreateFromPath($0, &application)
-            }
-            guard status == errSecSuccess, let application,
-                  let identity = trustedApplicationIdentity(application) else {
-                throw GatewayCredentialStoreError.accessControlUnavailable
-            }
-            return identity
-        }
-        return expectedIdentities.allSatisfy(actualIdentities.contains)
-    }
-
-    private func itemReference(query: [String: Any]) throws -> SecKeychainItem? {
-        var lookup = query
-        lookup[kSecReturnRef as String] = true
-        lookup[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(lookup as CFDictionary, &result)
-        if status == errSecItemNotFound {
-            return nil
-        }
-        guard status == errSecSuccess,
-              let result,
-              CFGetTypeID(result) == SecKeychainItemGetTypeID() else {
-            throw GatewayCredentialStoreError.keychainFailure
-        }
-        return (result as! SecKeychainItem)
-    }
-
-    private func trustedApplicationIdentity(
-        _ application: SecTrustedApplication
-    ) -> Data? {
-        var identity: CFData?
-        guard SecTrustedApplicationCopyData(
-            application,
-            &identity
-        ) == errSecSuccess, let identity else {
-            return nil
-        }
-        return identity as Data
-    }
-
     private func verifyWithSecurityCLI(
         service: String,
         account: String,
         keychainPath: String,
         expectedValue: String
     ) -> Bool {
-        let result = runSecurityCLI(arguments: [
-            "find-generic-password",
-            "-a", account,
-            "-s", service,
-            "-w",
-            keychainPath,
-        ])
+        let result = securityCommandRunner.run(
+            arguments: [
+                "find-generic-password",
+                "-a", account,
+                "-s", service,
+                "-w",
+                keychainPath,
+            ],
+            standardInput: nil
+        )
         guard result.status == 0 else {
             return false
         }
@@ -566,56 +631,6 @@ struct SystemGatewayCredentialStore: GatewayCredentialStoring, @unchecked Sendab
         return value == expectedValue
     }
 
-    private func runSecurityCLI(
-        arguments: [String],
-        standardInput: Data? = nil
-    ) -> (status: Int32, output: Data) {
-        let process = Process()
-        let output = Pipe()
-        let input = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = arguments
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        if standardInput == nil {
-            process.standardInput = FileHandle.nullDevice
-        } else {
-            process.standardInput = input
-        }
-        do {
-            try process.run()
-        } catch {
-            return (-1, Data())
-        }
-        if let standardInput {
-            do {
-                try input.fileHandleForWriting.write(contentsOf: standardInput)
-            } catch {
-                process.terminate()
-            }
-            try? input.fileHandleForWriting.close()
-        }
-        let deadline = Date().addingTimeInterval(5)
-        while process.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if process.isRunning {
-            process.terminate()
-            let grace = Date().addingTimeInterval(0.25)
-            while process.isRunning, Date() < grace {
-                Thread.sleep(forTimeInterval: 0.01)
-            }
-            if process.isRunning, process.processIdentifier > 0 {
-                _ = Darwin.kill(process.processIdentifier, SIGKILL)
-            }
-        }
-        process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        guard data.count <= Self.maximumSecretBytes else {
-            return (-1, Data())
-        }
-        return (process.terminationStatus, data)
-    }
 }
 
 struct GatewayVerificationReceipt: Codable, Equatable, Sendable {

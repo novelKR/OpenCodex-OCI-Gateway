@@ -81,7 +81,8 @@ The release builder emits:
 - `linux/arm64`.
 
 In `external_gateway` mode on macOS, the relay resolves only the credentials
-required by the selected authentication profile from the login Keychain. It
+required by the selected authentication profile from the current user's exact
+default file-based Keychain. It
 never places them in `config.toml` or the launchd plist. The following commands
 are manual diagnostic fallbacks, not steps every user must perform:
 
@@ -96,10 +97,17 @@ Connect a self-hosted server**. The onboarding prepares the current-user Relay
 integration, edits the address, selects an authentication profile, tests the
 connection, and adds or replaces only the required Keychain values. Existing
 values are never revealed, copied, or logged; unused values are retained but
-ignored. New items use a login-Keychain ACL limited to the Desktop app and
+ignored. New items use a default file-Keychain ACL limited to the Desktop app and
 `/usr/bin/security`. Replacement preserves existing ACL entries while repairing
 either required trust entry, and the save is reported successful only after
 non-interactive readback works.
+
+Security implementation note: the ad-hoc distribution still requires the
+deprecated file-Keychain trusted-application ACL. Those calls are confined to
+the internal `OpenCodexRelayLegacyKeychainACL` C compatibility target so Swift
+and unrelated C code remain warning-clean. This boundary is temporary and is
+not a completed migration to the modern Data Protection Keychain; that requires
+a separately reviewed signing, entitlement, and credential-migration design.
 
 **Test connection** performs exactly one authenticated
 `GET /v1/models?client_version=…` with a five-second deadline, no redirect or

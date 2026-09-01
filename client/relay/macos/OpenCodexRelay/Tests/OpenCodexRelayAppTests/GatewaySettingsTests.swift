@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import Security
 import XCTest
 @testable import OpenCodexRelay
 import OpenCodexRelayCore
@@ -312,6 +311,154 @@ final class GatewaySettingsTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return inspectedKindSetsStorage
+        }
+    }
+
+    private final class LegacyACLInspector: LegacyFileKeychainACLInspecting, @unchecked Sendable {
+        enum FailurePoint: Equatable {
+            case path
+            case metadata
+            case access
+        }
+
+        private let lock = NSLock()
+        private let keychainPath: String
+        private let itemMetadata: GatewayCredentialMetadata
+        private let accessMatches: Bool
+        private let failurePoint: FailurePoint?
+        private(set) var pathRequests = 0
+        private(set) var metadataRequests: [(
+            service: String,
+            account: String,
+            keychainPathWitness: String?
+        )] = []
+        private(set) var accessRequests: [(
+            service: String,
+            account: String,
+            applicationPath: String
+        )] = []
+
+        init(
+            keychainPath: String = "/private/tmp/test-default.keychain-db",
+            itemMetadata: GatewayCredentialMetadata = GatewayCredentialMetadata(
+                configured: true,
+                modifiedAt: Date(timeIntervalSince1970: 20)
+            ),
+            accessMatches: Bool = true,
+            failurePoint: FailurePoint? = nil
+        ) {
+            self.keychainPath = keychainPath
+            self.itemMetadata = itemMetadata
+            self.accessMatches = accessMatches
+            self.failurePoint = failurePoint
+        }
+
+        func metadata(
+            service: String,
+            account: String,
+            keychainPathWitness: String?
+        ) throws -> GatewayCredentialMetadata {
+            lock.lock()
+            metadataRequests.append((service, account, keychainPathWitness))
+            let shouldFail = failurePoint == .metadata
+            lock.unlock()
+            if shouldFail {
+                throw GatewayCredentialStoreError.keychainFailure
+            }
+            return itemMetadata
+        }
+
+        func inspectDecryptACL(
+            service: String,
+            account: String,
+            applicationPath: String
+        ) throws -> LegacyFileKeychainACLInspection {
+            lock.lock()
+            pathRequests += 1
+            accessRequests.append((service, account, applicationPath))
+            let shouldFail = failurePoint == .path || failurePoint == .access
+            lock.unlock()
+            if shouldFail {
+                throw GatewayCredentialStoreError.keychainFailure
+            }
+            return LegacyFileKeychainACLInspection(
+                keychainPath: keychainPath,
+                matches: accessMatches
+            )
+        }
+
+        func requestCounts() -> (path: Int, metadata: Int, access: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (pathRequests, metadataRequests.count, accessRequests.count)
+        }
+
+        func recordedMetadataRequests() -> [(
+            service: String,
+            account: String,
+            keychainPathWitness: String?
+        )] {
+            lock.lock()
+            defer { lock.unlock() }
+            return metadataRequests
+        }
+
+        func recordedAccessRequests() -> [(
+            service: String,
+            account: String,
+            applicationPath: String
+        )] {
+            lock.lock()
+            defer { lock.unlock() }
+            return accessRequests
+        }
+    }
+
+    private final class SecurityCommandRunner: GatewaySecurityCommandRunning, @unchecked Sendable {
+        struct Invocation {
+            let arguments: [String]
+            let standardInput: Data?
+        }
+
+        private let lock = NSLock()
+        private let verificationValue: String
+        private let storeStatus: Int32
+        private(set) var invocationStorage: [Invocation] = []
+
+        init(
+            verificationValue: String,
+            storeStatus: Int32 = 0
+        ) {
+            self.verificationValue = verificationValue
+            self.storeStatus = storeStatus
+        }
+
+        func run(
+            arguments: [String],
+            standardInput: Data?
+        ) -> GatewaySecurityCommandResult {
+            lock.lock()
+            invocationStorage.append(Invocation(
+                arguments: arguments,
+                standardInput: standardInput
+            ))
+            lock.unlock()
+            if arguments == ["-i"] {
+                return GatewaySecurityCommandResult(
+                    status: storeStatus,
+                    output: Data()
+                )
+            }
+            return GatewaySecurityCommandResult(
+                status: 0,
+                output: Data("\(verificationValue)\n".utf8)
+            )
+        }
+
+        func invocations() -> [Invocation] {
+            lock.lock()
+            defer { lock.unlock() }
+            return invocationStorage
         }
     }
 
@@ -1192,9 +1339,13 @@ final class GatewaySettingsTests: XCTestCase {
             contents: Data("untrusted".utf8),
             attributes: [.posixPermissions: 0o600]
         ))
+        let inspector = LegacyACLInspector()
+        let runner = SecurityCommandRunner(verificationValue: "temporary-secret")
         let store = SystemGatewayCredentialStore(
             trustedApplicationPath: "/path-that-must-not-be-inspected",
-            lifecycleHomeDirectory: home.path
+            lifecycleHomeDirectory: home.path,
+            legacyACLInspector: inspector,
+            securityCommandRunner: runner
         )
 
         XCTAssertThrowsError(
@@ -1206,29 +1357,216 @@ final class GatewaySettingsTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? GatewayCredentialStoreError, .lifecycleConflict)
         }
+        XCTAssertEqual(inspector.requestCounts().path, 0)
+        XCTAssertEqual(inspector.requestCounts().metadata, 0)
+        XCTAssertEqual(inspector.requestCounts().access, 0)
+        XCTAssertTrue(runner.invocations().isEmpty)
+    }
+
+    func testSystemCredentialStoreScopesInspectionThroughLegacyAdapter() throws {
+        let inspector = LegacyACLInspector(
+            itemMetadata: GatewayCredentialMetadata(
+                configured: false,
+                modifiedAt: nil
+            )
+        )
+        let store = SystemGatewayCredentialStore(
+            serviceNames: [.gatewayAPIKey: "test-gateway-service"],
+            trustedApplicationPath: ProcessInfo.processInfo.arguments[0],
+            legacyACLInspector: inspector,
+            securityCommandRunner: SecurityCommandRunner(
+                verificationValue: "unused"
+            )
+        )
+
+        let metadata = try store.inspect(
+            account: "bounded-account",
+            kinds: [.gatewayAPIKey]
+        )
+
+        XCTAssertEqual(
+            metadata[.gatewayAPIKey],
+            GatewayCredentialMetadata(configured: false, modifiedAt: nil)
+        )
+        let requests = inspector.recordedMetadataRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.service, "test-gateway-service")
+        XCTAssertEqual(requests.first?.account, "bounded-account")
+        XCTAssertNil(requests.first?.keychainPathWitness)
+        XCTAssertEqual(inspector.requestCounts().path, 0)
+        XCTAssertEqual(inspector.requestCounts().access, 0)
+    }
+
+    func testSystemCredentialStoreRepairsOnlyMismatchedLegacyACL() throws {
+        let executablePath = ProcessInfo.processInfo.arguments[0]
+        let secret = "temporary-secret"
+
+        for accessMatches in [true, false] {
+            let home = try makeTemporaryHome()
+            defer { try? FileManager.default.removeItem(at: home) }
+            let inspector = LegacyACLInspector(accessMatches: accessMatches)
+            let runner = SecurityCommandRunner(verificationValue: secret)
+            let store = SystemGatewayCredentialStore(
+                serviceNames: [.gatewayAPIKey: "test-gateway-service"],
+                trustedApplicationPath: executablePath,
+                lifecycleHomeDirectory: home.path,
+                legacyACLInspector: inspector,
+                securityCommandRunner: runner
+            )
+
+            let metadata = try store.replace(
+                .gatewayAPIKey,
+                account: "bounded-account",
+                value: secret
+            )
+
+            XCTAssertTrue(metadata.configured)
+            let invocations = runner.invocations()
+            XCTAssertEqual(invocations.count, 2)
+            XCTAssertEqual(invocations.first?.arguments, ["-i"])
+            let command = try XCTUnwrap(
+                invocations.first?.standardInput.flatMap {
+                    String(data: $0, encoding: .utf8)
+                }
+            )
+            if accessMatches {
+                XCTAssertFalse(command.contains(" -T "))
+            } else {
+                XCTAssertTrue(command.contains("-T \"\(executablePath)\""))
+                XCTAssertTrue(command.contains("-T \"/usr/bin/security\""))
+            }
+            XCTAssertEqual(
+                invocations.last?.arguments,
+                [
+                    "find-generic-password",
+                    "-a", "bounded-account",
+                    "-s", "test-gateway-service",
+                    "-w", "/private/tmp/test-default.keychain-db",
+                ]
+            )
+            let accessRequests = inspector.recordedAccessRequests()
+            XCTAssertEqual(accessRequests.count, 1)
+            XCTAssertEqual(accessRequests.first?.service, "test-gateway-service")
+            XCTAssertEqual(accessRequests.first?.account, "bounded-account")
+            XCTAssertEqual(accessRequests.first?.applicationPath, executablePath)
+            let metadataRequests = inspector.recordedMetadataRequests()
+            XCTAssertEqual(metadataRequests.count, 1)
+            XCTAssertEqual(
+                metadataRequests.first?.keychainPathWitness,
+                "/private/tmp/test-default.keychain-db"
+            )
+        }
+    }
+
+    func testSystemCredentialStoreFailsClosedOnLegacyAdapterErrors() throws {
+        let executablePath = ProcessInfo.processInfo.arguments[0]
+        for failurePoint in [
+            LegacyACLInspector.FailurePoint.path,
+            .access,
+        ] {
+            let home = try makeTemporaryHome()
+            defer { try? FileManager.default.removeItem(at: home) }
+            let inspector = LegacyACLInspector(failurePoint: failurePoint)
+            let runner = SecurityCommandRunner(verificationValue: "temporary-secret")
+            let store = SystemGatewayCredentialStore(
+                trustedApplicationPath: executablePath,
+                lifecycleHomeDirectory: home.path,
+                legacyACLInspector: inspector,
+                securityCommandRunner: runner
+            )
+
+            XCTAssertThrowsError(
+                try store.replace(
+                    .gatewayAPIKey,
+                    account: "bounded-account",
+                    value: "temporary-secret"
+                )
+            ) { error in
+                XCTAssertEqual(error as? GatewayCredentialStoreError, .keychainFailure)
+            }
+            XCTAssertTrue(runner.invocations().isEmpty)
+        }
+
+        let inspector = LegacyACLInspector(failurePoint: .metadata)
+        let store = SystemGatewayCredentialStore(
+            trustedApplicationPath: executablePath,
+            legacyACLInspector: inspector,
+            securityCommandRunner: SecurityCommandRunner(
+                verificationValue: "unused"
+            )
+        )
+        XCTAssertThrowsError(
+            try store.inspect(
+                account: "bounded-account",
+                kinds: [.gatewayAPIKey]
+            )
+        ) { error in
+            XCTAssertEqual(error as? GatewayCredentialStoreError, .keychainFailure)
+        }
+    }
+
+    func testSystemCredentialStoreRejectsMissingApplicationBeforeKeychainAccess() throws {
+        let home = try makeTemporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let inspector = LegacyACLInspector()
+        let runner = SecurityCommandRunner(verificationValue: "temporary-secret")
+        let store = SystemGatewayCredentialStore(
+            trustedApplicationPath: home
+                .appendingPathComponent("missing-executable")
+                .path,
+            lifecycleHomeDirectory: home.path,
+            legacyACLInspector: inspector,
+            securityCommandRunner: runner
+        )
+
+        XCTAssertThrowsError(
+            try store.replace(
+                .gatewayAPIKey,
+                account: "bounded-account",
+                value: "temporary-secret"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? GatewayCredentialStoreError,
+                .accessControlUnavailable
+            )
+        }
+        XCTAssertEqual(inspector.requestCounts().path, 0)
+        XCTAssertEqual(inspector.requestCounts().access, 0)
+        XCTAssertTrue(runner.invocations().isEmpty)
     }
 
     func testSystemKeychainAdapterCreatesAndReplacesTemporaryACLItems() throws {
         guard ProcessInfo.processInfo.environment["OPENCODEX_RUN_KEYCHAIN_INTEGRATION"] == "1" else {
-            throw XCTSkip("Set OPENCODEX_RUN_KEYCHAIN_INTEGRATION=1 for temporary login-Keychain ACL verification")
+            throw XCTSkip("Use the isolated temporary-Keychain integration runner")
         }
+        let environment = ProcessInfo.processInfo.environment
+        let secondaryKeychain = try XCTUnwrap(
+            environment["OPENCODEX_KEYCHAIN_INTEGRATION_SECONDARY_PATH"]
+        )
         let nonce = UUID().uuidString.lowercased()
         let account = "opencodex-relay-test-\(nonce)"
         let services = Dictionary(uniqueKeysWithValues: GatewayCredentialKind.allCases.map {
             ($0, "opencodex-relay-test-\($0.rawValue)-\(nonce)")
         })
-        defer {
-            for service in services.values {
-                SecItemDelete([
-                    kSecClass as String: kSecClassGenericPassword,
-                    kSecAttrService as String: service,
-                    kSecAttrAccount as String: account,
-                ] as CFDictionary)
-            }
-        }
+        let foreignCommand = try makeTemporarySecurityStoreCommand(
+            service: try XCTUnwrap(services[.gatewayAPIKey]),
+            account: account,
+            value: "foreign-search-list-value",
+            keychainPath: secondaryKeychain
+        )
+        XCTAssertEqual(runTemporarySecurityCommand(foreignCommand), 0)
         let store = SystemGatewayCredentialStore(
             serviceNames: services,
             trustedApplicationPath: ProcessInfo.processInfo.arguments[0]
+        )
+
+        XCTAssertEqual(
+            try store.inspect(
+                account: account,
+                kinds: [.gatewayAPIKey]
+            )[.gatewayAPIKey]?.configured,
+            false
         )
 
         let first = try store.replace(
@@ -1536,6 +1874,56 @@ final class GatewaySettingsTests: XCTestCase {
         XCTAssertEqual(controller.state, .helperUnavailable)
         XCTAssertNil(controller.inspection)
         XCTAssertFalse(controller.isBusy)
+    }
+
+    private func makeTemporarySecurityStoreCommand(
+        service: String,
+        account: String,
+        value: String,
+        keychainPath: String
+    ) throws -> Data {
+        let values = [account, service, keychainPath]
+        let encoded = try values.map { value -> String in
+            guard value.unicodeScalars.allSatisfy({
+                $0.value != 0 && $0.value != 10 && $0.value != 13
+            }) else {
+                throw GatewayCredentialStoreError.invalidValue
+            }
+            let escaped = value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        }
+        let secretHex = Data(value.utf8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return Data(([
+            "add-generic-password -U",
+            "-a \(encoded[0])",
+            "-s \(encoded[1])",
+            "-X \(secretHex)",
+            encoded[2],
+        ].joined(separator: " ") + "\n").utf8)
+    }
+
+    private func runTemporarySecurityCommand(_ command: Data) -> Int32 {
+        let process = Process()
+        let input = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["-i"]
+        process.standardInput = input
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            try input.fileHandleForWriting.write(contentsOf: command)
+            try input.fileHandleForWriting.close()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            process.terminate()
+            return -1
+        }
     }
 
     private func waitUntil(
