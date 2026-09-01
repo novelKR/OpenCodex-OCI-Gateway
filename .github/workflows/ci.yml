@@ -78,13 +78,13 @@ jobs:
           openssl genpkey -algorithm ED25519 -out "$signing_key"
           openssl pkey -in "$signing_key" -pubout -out "$signing_public_key"
           release_build_number="$(sed -n '1p' client/relay/RELEASE_BUILD_NUMBER)"
-          ./client/relay/scripts/build-release.sh 0.3.8-rc.9 \
+          ./client/relay/scripts/build-release.sh 0.3.8-rc.10 \
             --github-repo novelKR/OpenCodex-OCI-Gateway \
             --signing-key "$signing_key" \
-            --previous-build-number 1002 \
+            --previous-build-number 1003 \
             --output "$release_root"
-          manifest="${release_root}/manifest-0.3.8-rc.9.json"
-          base64 -D < "${release_root}/manifest-0.3.8-rc.9.sig" > "$signature_bin"
+          manifest="${release_root}/manifest-0.3.8-rc.10.json"
+          base64 -D < "${release_root}/manifest-0.3.8-rc.10.sig" > "$signature_bin"
           openssl pkeyutl -verify -pubin -inkey "$signing_public_key" -rawin \
             -in "$manifest" -sigfile "$signature_bin"
           python3 - "$release_root" "$manifest" <<'PY'
@@ -155,8 +155,8 @@ jobs:
             cd client/relay
             OPENCODEX_STAGE_APP_FIXTURE="$app" \
             OPENCODEX_STAGE_ARCHIVE_FIXTURE="${release_root}/OpenCodexRelay.app.zip" \
-            OPENCODEX_STAGE_TAG=0.3.8-rc.9 \
+            OPENCODEX_STAGE_TAG=0.3.8-rc.10 \
             OPENCODEX_STAGE_PUBLIC_KEY="${GITHUB_WORKSPACE}/config/trust/opencodex-relay-release-ed25519.pub" \
-            OPENCODEX_STAGE_CURRENT_BUILD=1002 \
+            OPENCODEX_STAGE_CURRENT_BUILD=1003 \
               go test ./internal/release -run '^(TestExtractReleaseArchiveDryRunFixture|TestSystemAppBundleValidatorDryRunFixture)$'
           )
