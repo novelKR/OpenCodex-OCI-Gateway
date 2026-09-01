@@ -118,6 +118,17 @@
 "menu.discovery.candidate" = "%@ %@ — Tier %@";
 "menu.discovery.native_candidate" = "%@ %@ — Native return available";
 "menu.discovery.manual_removal.badge" = "Manual removal required";
+"menu.discovery.manual_removal.instructions" = "Manual removal instructions…";
+"menu.discovery.manual_removal.instructions.accessibility" = "Open manual OpenCodex removal instructions";
+"menu.discovery.manual_removal.instructions.hint" = "Shows a reviewed npm package-removal command without running it.";
+"menu.discovery.manual_removal.title" = "Manual OpenCodex removal";
+"menu.discovery.manual_removal.detail" = "Copy this command and run it yourself in a Terminal where the npm environment used for the detected installation is active. The app never runs the command or receives an administrator password.";
+"menu.discovery.manual_removal.native_warning" = "This command removes only the OpenCodex package. It does not restore or verify the Codex configuration. Return to Native Codex and verify it before running the command.";
+"menu.discovery.manual_removal.native_ready" = "Native Codex is already active. The command still removes only the detected package; review the package manager and version below before running it.";
+"menu.discovery.manual_removal.command" = "Reviewed package-removal command";
+"menu.discovery.manual_removal.diagnostics" = "Bounded diagnostics";
+"menu.discovery.manual_removal.copy_command" = "Copy command";
+"menu.discovery.manual_removal.close" = "Close";
 "menu.discovery.copy_diagnostics" = "Copy diagnostic details";
 "menu.discovery.copy_diagnostics.accessibility" = "Copy bounded package diagnostics";
 "menu.discovery.copy_diagnostics.hint" = "Copies only the package version, manager, and automatic removal reason.";

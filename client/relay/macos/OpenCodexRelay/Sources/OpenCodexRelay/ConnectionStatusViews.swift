@@ -533,42 +533,13 @@ struct OpenCodexDiscoveryControls: View {
     }
 
     private func manualRemovalCandidate(_ candidate: OpenCodexDiscoveryCandidatePresentation) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(candidateTitle(candidate, context: .standaloneNative))
-                        .font(.body.weight(.medium))
-                    Spacer(minLength: 8)
-                    ControlCenterStatusBadge(
-                        text: localizer.text(.menuDiscoveryManualRemovalBadge),
-                        tone: .warning
-                    )
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(candidateTitle(candidate, context: .standaloneNative))
-                        .font(.body.weight(.medium))
-                    ControlCenterStatusBadge(
-                        text: localizer.text(.menuDiscoveryManualRemovalBadge),
-                        tone: .warning
-                    )
-                }
-            }
-            Text(localizer.text(reasonKey(candidate.automaticRemovalReason)))
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button {
-                model.copyOpenCodexManualRemovalDiagnostics(candidateID: candidate.id)
-            } label: {
-                Label(localizer.text(.menuDiscoveryCopyDiagnostics), systemImage: "doc.on.doc")
-            }
-            .buttonStyle(.borderless)
-            .disabled(model.isBusy)
-            .accessibilityLabel(localizer.text(.menuDiscoveryCopyDiagnosticsAccessibility))
-            .accessibilityHint(localizer.text(.menuDiscoveryCopyDiagnosticsHint))
-        }
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .contain)
+        OpenCodexManualRemovalCandidateView(
+            candidate: candidate,
+            title: candidateTitle(candidate, context: .standaloneNative),
+            reasonText: localizer.text(reasonKey(candidate.automaticRemovalReason)),
+            model: model,
+            localizer: localizer
+        )
     }
 
     private func reasonKey(_ reason: OpenCodexAutomaticRemovalReason?) -> AppStringKey {
@@ -603,6 +574,203 @@ struct OpenCodexDiscoveryControls: View {
                 candidate.version
             )
         }
+    }
+}
+
+struct OpenCodexManualRemovalCandidateView: View {
+    let candidate: OpenCodexDiscoveryCandidatePresentation
+    let title: String
+    let reasonText: String
+    @ObservedObject var model: MenuBarModel
+    let localizer: AppLocalizer
+    @State private var commandPresentation: OpenCodexManualRemovalCommandPresentation?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(title)
+                        .font(.body.weight(.medium))
+                    Spacer(minLength: 8)
+                    manualBadge
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(.body.weight(.medium))
+                    manualBadge
+                }
+            }
+            Text(reasonText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            AdaptiveActionRow {
+                if model.openCodexManualRemovalCommand(candidateID: candidate.id) != nil {
+                    Button {
+                        commandPresentation = model.openCodexManualRemovalCommand(
+                            candidateID: candidate.id
+                        )
+                    } label: {
+                        Label(
+                            localizer.text(.menuDiscoveryManualRemovalInstructions),
+                            systemImage: "terminal"
+                        )
+                    }
+                    .accessibilityLabel(
+                        localizer.text(.menuDiscoveryManualRemovalInstructionsAccessibility)
+                    )
+                    .accessibilityHint(
+                        localizer.text(.menuDiscoveryManualRemovalInstructionsHint)
+                    )
+                }
+                Button {
+                    model.copyOpenCodexManualRemovalDiagnostics(candidateID: candidate.id)
+                } label: {
+                    Label(localizer.text(.menuDiscoveryCopyDiagnostics), systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(localizer.text(.menuDiscoveryCopyDiagnosticsAccessibility))
+                .accessibilityHint(localizer.text(.menuDiscoveryCopyDiagnosticsHint))
+            }
+            .disabled(model.isBusy)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+        .sheet(item: $commandPresentation) { presentation in
+            OpenCodexManualRemovalCommandSheet(
+                presentation: presentation,
+                model: model,
+                localizer: localizer
+            )
+        }
+    }
+
+    private var manualBadge: some View {
+        ControlCenterStatusBadge(
+            text: localizer.text(.menuDiscoveryManualRemovalBadge),
+            tone: .warning
+        )
+    }
+}
+
+struct OpenCodexManualRemovalCommandSheet: View {
+    let presentation: OpenCodexManualRemovalCommandPresentation
+    @ObservedObject var model: MenuBarModel
+    let localizer: AppLocalizer
+    @Environment(\.dismiss) private var dismiss
+    @State private var visibleFrameSize = CGSize(width: 800, height: 600)
+
+    private var sheetSize: CGSize {
+        DevelopmentSetupSheetLayout.size(for: visibleFrameSize)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(
+                    localizer.text(.menuDiscoveryManualRemovalTitle),
+                    systemImage: "terminal"
+                )
+                .font(.title2.weight(.semibold))
+                Spacer()
+                Button(localizer.text(.menuDiscoveryManualRemovalClose)) {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 18)
+
+            Divider()
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text(localizer.text(.menuDiscoveryManualRemovalDetail))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    ControlCenterNotice(tone: presentation.nativeState == .native ? .success : .warning) {
+                        Text(localizer.text(nativeNoticeKey))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    GroupBox(localizer.text(.menuDiscoveryManualRemovalCommand)) {
+                        Text(presentation.command)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.vertical, 6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    GroupBox(localizer.text(.menuDiscoveryManualRemovalDiagnostics)) {
+                        Text(diagnostics)
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.vertical, 6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Divider()
+
+            ControlCenterActionFooter {
+                Button {
+                    model.copyOpenCodexManualRemovalDiagnostics(candidateID: presentation.id)
+                } label: {
+                    Label(localizer.text(.menuDiscoveryCopyDiagnostics), systemImage: "doc.on.doc")
+                }
+            } primary: {
+                Button {
+                    model.copyOpenCodexManualRemovalCommand(candidateID: presentation.id)
+                } label: {
+                    Label(
+                        localizer.text(.menuDiscoveryManualRemovalCopyCommand),
+                        systemImage: "doc.on.doc"
+                    )
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+            .disabled(model.isBusy)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
+        }
+        .frame(
+            minWidth: 320,
+            idealWidth: sheetSize.width,
+            maxWidth: sheetSize.width,
+            minHeight: 320,
+            idealHeight: sheetSize.height,
+            maxHeight: sheetSize.height
+        )
+        .background {
+            SheetVisibleFrameReader { size in
+                visibleFrameSize = size
+            }
+            .frame(width: 0, height: 0)
+        }
+    }
+
+    private var nativeNoticeKey: AppStringKey {
+        presentation.nativeState == .native
+            ? .menuDiscoveryManualRemovalNativeReady
+            : .menuDiscoveryManualRemovalNativeWarning
+    }
+
+    private var diagnostics: String {
+        [
+            "version=\(presentation.version)",
+            "manager=\(presentation.manager.rawValue)",
+            "automatic_removal_reason=\(presentation.reason.rawValue)",
+        ].joined(separator: "\n")
     }
 }
 
