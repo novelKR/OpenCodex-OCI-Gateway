@@ -29,8 +29,8 @@ Usage:
   install-relay.sh uninstall [--config PATH] [--codex-config PATH] [--confirm-desktop-exited]
 
 install verifies the signed release manifest and SHA-256 before atomically
-selecting legacy raw helpers or a revision-4 darwin/arm64 signed MenuBar app
-bundle. Revision 4 keeps relay helpers inside an ad-hoc-signed app and preserves
+selecting legacy raw helpers or a revision-4/5 darwin/arm64 signed MenuBar app
+bundle. Revisions 4 and 5 keep relay helpers inside an ad-hoc-signed app and preserve
 the current helper path through an internal bundle symlink.
 Public GitHub Releases require no token. An optional current-user-owned mode-0600
 token file may be supplied to avoid anonymous API rate limits; it never enters
@@ -83,7 +83,7 @@ component_artifact_row() {
       )]
       | select(length == 1)
       | .[0]
-      | "\(.file)|\(.url)|\(.sha256)|\(.bundle_id // \"\")|\(.signing_mode // \"\")"
+      | "\(.file)|\(.url)|\(.sha256)|\(.bundle_id // "")|\(.signing_mode // "")"
     ' "$manifest"
 }
 
@@ -103,13 +103,65 @@ document_row() {
 manifest_string() {
   local manifest="$1"
   local field="$2"
-  tr -d '\n' < "$manifest" | sed -nE "s#.*\"${field}\":\"([^\"]+)\".*#\1#p"
+  jq -er --arg field "$field" '.[$field] | select(type == "string" and length > 0)' "$manifest"
 }
 
 manifest_integer() {
   local manifest="$1"
   local field="$2"
-  tr -d '\n' < "$manifest" | sed -nE "s#.*\"${field}\":([0-9]+).*#\1#p"
+  jq -er --arg field "$field" '.[$field] | select(type == "number" and floor == .)' "$manifest"
+}
+
+manifest_is_canonical_json() {
+  local manifest="$1"
+  local canonical="$2"
+  jq -c . "$manifest" > "$canonical" 2>/dev/null || return 1
+  cmp -s "$manifest" "$canonical"
+}
+
+component_manifest_revision() {
+  [[ "$1" == 4 || "$1" == 5 ]]
+}
+
+manifest_has_notices() {
+  [[ "$1" == 2 ]] || component_manifest_revision "$1"
+}
+
+semver_valid() {
+  local value="$1"
+  local core
+  local prerelease
+  local identifier
+  [[ "$value" != *+* && "$value" != v* ]] || return 1
+  core="${value%%-*}"
+  [[ "$core" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$value" == "$core" ]] && return 0
+  prerelease="${value#"${core}"-}"
+  [[ -n "$prerelease" && "$prerelease" != "$value" ]] || return 1
+  IFS=. read -r -a prerelease_identifiers <<<"$prerelease"
+  for identifier in "${prerelease_identifiers[@]}"; do
+    [[ -n "$identifier" && "$identifier" =~ ^[0-9A-Za-z-]+$ ]] || return 1
+    [[ ! "$identifier" =~ ^[0-9]+$ || "$identifier" == 0 || "$identifier" != 0* ]] || return 1
+  done
+}
+
+macos_version_valid() {
+  [[ "$1" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?$ ]]
+}
+
+macos_version_at_least() {
+  local actual="$1"
+  local minimum="$2"
+  local actual_major actual_minor actual_patch
+  local minimum_major minimum_minor minimum_patch
+  macos_version_valid "$actual" && macos_version_valid "$minimum" || return 1
+  IFS=. read -r actual_major actual_minor actual_patch <<<"$actual"
+  IFS=. read -r minimum_major minimum_minor minimum_patch <<<"$minimum"
+  actual_patch="${actual_patch:-0}"
+  minimum_patch="${minimum_patch:-0}"
+  ((10#$actual_major > 10#$minimum_major)) ||
+    ((10#$actual_major == 10#$minimum_major && 10#$actual_minor > 10#$minimum_minor)) ||
+    ((10#$actual_major == 10#$minimum_major && 10#$actual_minor == 10#$minimum_minor && 10#$actual_patch >= 10#$minimum_patch))
 }
 
 configured_upstream() {
@@ -648,7 +700,7 @@ verify_and_extract_macos_bundle() {
   local expected_signing_mode="$4"
   local destination="$5"
   local compatibility_revision="$6"
-  [[ "$compatibility_revision" == 4 && "$expected_signing_mode" == adhoc ]] || \
+  component_manifest_revision "$compatibility_revision" && [[ "$expected_signing_mode" == adhoc ]] || \
     die 'macOS bundle signing contract is unsupported'
   local entry
   local entries
@@ -708,11 +760,11 @@ verify_and_extract_macos_bundle() {
   guard_helper="${app}/Contents/Library/HelperTools/${MACOS_GUARD_HELPER_NAME}"
   guard_installer="${app}/Contents/Library/Helpers/${MACOS_GUARD_INSTALLER_NAME}"
   [[ -x "$guard_helper" && ! -L "$guard_helper" && -x "$guard_installer" && ! -L "$guard_installer" ]] ||
-    die 'revision 4 Homebrew guard manual-installer bundle shape is invalid'
+    die 'revision 4/5 Homebrew guard manual-installer bundle shape is invalid'
   [[ ! -e "${app}/Contents/Library/LaunchDaemons" && ! -L "${app}/Contents/Library/LaunchDaemons" ]] ||
-    die 'revision 4 bundle must not embed an SMAppService LaunchDaemon'
+    die 'revision 4/5 bundle must not embed an SMAppService LaunchDaemon'
   helper_cdhash="$(codesign -dvvv "$guard_helper" 2>&1 | sed -nE 's/^CDHash=([0-9a-f]+)$/\1/p')"
-  [[ "$helper_cdhash" =~ ^[0-9a-f]{40,128}$ ]] || die 'revision 4 helper CDHash is unavailable'
+  [[ "$helper_cdhash" =~ ^[0-9a-f]{40,128}$ ]] || die 'revision 4/5 helper CDHash is unavailable'
   helper_requirement="cdhash H\"${helper_cdhash}\""
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardBackend' "${app}/Contents/Info.plist" 2>/dev/null)" == manual_admin &&
      "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexHomebrewGuardMachService' "${app}/Contents/Info.plist" 2>/dev/null)" == "io.github.novelkr.opencodex-relay.homebrew-guard" &&
@@ -1208,7 +1260,7 @@ release_source_install_lifecycle() {
 }
 
 require_version() {
-  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die 'VERSION must be explicit semver'
+  semver_valid "$1" || die 'VERSION must be strict SemVer without a v prefix or build metadata'
 }
 
 require_private_token_file() {
@@ -1484,24 +1536,53 @@ case "$action" in
     fi
     decode_base64 "$signature" "$signature_binary"
     openssl pkeyutl -verify -pubin -inkey "$public_key" -rawin -in "$manifest" -sigfile "$signature_binary" >/dev/null || die 'release manifest signature is invalid'
-    manifest_version="$(manifest_string "$manifest" version)"
-    [[ -n "$manifest_version" ]] || die 'release manifest has no valid version'
+    manifest_is_canonical_json "$manifest" "${tmp}/manifest.canonical.json" || \
+      die 'release manifest is not canonical JSON or contains duplicate fields'
+    manifest_version="$(manifest_string "$manifest" version)" || die 'release manifest has no valid version'
     [[ "$manifest_version" == "$version" ]] || die 'release manifest version does not match the requested version'
-    compatibility_revision="$(manifest_integer "$manifest" compatibility_revision)"
-    [[ "$compatibility_revision" == 1 || "$compatibility_revision" == 2 || "$compatibility_revision" == 4 ]] || \
+    compatibility_revision="$(manifest_integer "$manifest" compatibility_revision)" || \
+      die 'release manifest has no valid compatibility revision'
+    [[ "$compatibility_revision" == 1 || "$compatibility_revision" == 2 ]] || \
+      component_manifest_revision "$compatibility_revision" || \
       die 'release manifest compatibility revision is unsupported'
     jq -e --argjson revision "$compatibility_revision" '
+      (.version | type == "string") and
+      (.compatibility_revision == $revision) and
       (.artifacts | type == "array") and
       (if $revision == 1 then
         (keys | sort == ["artifacts", "compatibility_revision", "version"])
-      else
+      elif $revision == 2 or $revision == 4 then
         (keys | sort == ["artifacts", "compatibility_revision", "documents", "version"])
         and (.documents | type == "array")
+      else
+        (keys | sort == ["artifacts", "channel", "compatibility_revision", "documents", "minimum_updater_version", "trust_key_id", "version"])
+        and (.documents | type == "array")
+        and (.channel | type == "string")
+        and (.minimum_updater_version | type == "string")
+        and (.trust_key_id | type == "string")
       end)
     ' "$manifest" >/dev/null || die 'release manifest contains unknown or malformed top-level fields'
+    minimum_macos_version=""
+    if [[ "$compatibility_revision" == 5 ]]; then
+      signed_channel="$(manifest_string "$manifest" channel)" || die 'revision 5 manifest channel is invalid'
+      minimum_updater_version="$(manifest_string "$manifest" minimum_updater_version)" || \
+        die 'revision 5 minimum updater version is invalid'
+      trust_key_id="$(manifest_string "$manifest" trust_key_id)" || die 'revision 5 trust key ID is invalid'
+      expected_channel=stable
+      [[ "$version" != *-* ]] || expected_channel=preview
+      [[ "$signed_channel" == "$expected_channel" ]] || \
+        die 'revision 5 manifest channel does not match the release version'
+      semver_valid "$minimum_updater_version" || die 'revision 5 minimum updater version is not strict SemVer'
+      [[ "$trust_key_id" =~ ^[0-9a-f]{64}$ ]] || die 'revision 5 trust key ID is invalid'
+      public_key_der="${tmp}/release-public-key.der"
+      openssl pkey -pubin -in "$public_key" -outform DER > "$public_key_der" || \
+        die 'unable to derive the release trust-key fingerprint'
+      [[ "$(sha256 "$public_key_der")" == "$trust_key_id" ]] || \
+        die 'revision 5 trust key ID does not match the provided public key'
+    fi
     notices_url=""
     notices_hash=""
-    if [[ "$compatibility_revision" == 2 || "$compatibility_revision" == 4 ]]; then
+    if manifest_has_notices "$compatibility_revision"; then
       jq -e '
         (.documents | length == 1) and
         (.documents[0] | keys | sort == ["file", "sha256", "url"])
@@ -1516,28 +1597,65 @@ case "$action" in
           die 'manifest third-party notices URL does not match the selected GitHub release'
       fi
     fi
-    if [[ "$compatibility_revision" == 4 ]]; then
-      jq -e '
+    if component_manifest_revision "$compatibility_revision"; then
+      jq -e --argjson revision "$compatibility_revision" '
         (.artifacts | length == 5) and
         ([.artifacts[] | select(.os == "linux")]
           | length == 4
-          and all(.[]; keys | sort == ["arch", "component", "file", "os", "sha256", "url"]))
-      ' "$manifest" >/dev/null || die 'revision 4 Linux artifacts contain unknown or incomplete fields'
+          and all(.[];
+            (keys | sort == ["arch", "component", "file", "os", "sha256", "url"]) and
+            (.arch == "amd64" or .arch == "arm64") and
+            (.component == "relay" or .component == "relayctl") and
+            (.file | type == "string") and
+            (.url | type == "string" and test("^https://")) and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))) and
+        ([.artifacts[] | select(.os == "linux") | [.arch, .component, .file]] | sort == [
+          ["amd64", "relay", "opencodex-relay_linux_amd64"],
+          ["amd64", "relayctl", "opencodex-relayctl_linux_amd64"],
+          ["arm64", "relay", "opencodex-relay_linux_arm64"],
+          ["arm64", "relayctl", "opencodex-relayctl_linux_arm64"]
+        ]) and
+        ([.artifacts[] | select(.component == "macos_menu_bar_bundle")]
+          | length == 1
+          and all(.[];
+            .os == "darwin" and .arch == "arm64" and
+            .file == "OpenCodexRelay.app.zip" and
+            .bundle_id == "io.github.novelkr.opencodex-relay" and
+            .signing_mode == "adhoc" and
+            (.url | type == "string" and test("^https://")) and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            (if $revision == 4 then
+              (keys | sort == ["arch", "bundle_id", "component", "file", "os", "sha256", "signing_mode", "url"])
+            else
+              (keys | sort == ["arch", "bundle_id", "component", "file", "helper_protocol", "integration_protocol", "minimum_macos_version", "os", "sha256", "signing_mode", "url"]) and
+              (.minimum_macos_version | type == "string") and
+              .integration_protocol == 1 and .helper_protocol == 1
+            end)))
+      ' "$manifest" >/dev/null || die 'revision 4/5 artifacts contain unknown, incomplete, or unsupported fields'
+      if [[ "$compatibility_revision" == 5 ]]; then
+        minimum_macos_version="$(jq -er '
+          [.artifacts[] | select(.component == "macos_menu_bar_bundle")]
+          | select(length == 1) | .[0].minimum_macos_version
+          | select(type == "string")
+        ' "$manifest")" || die 'revision 5 minimum macOS version is invalid'
+        macos_version_valid "$minimum_macos_version" || die 'revision 5 minimum macOS version is invalid'
+      fi
     fi
     macos_bundle_mode=false
-    if [[ "$compatibility_revision" == 4 && "$goos" == darwin ]]; then
+    if component_manifest_revision "$compatibility_revision" && [[ "$goos" == darwin ]]; then
       macos_bundle_mode=true
       row="$(component_artifact_row "$manifest" "$goos" "$goarch" macos_menu_bar_bundle)" || \
-        die 'revision 4 manifest has no unique macOS MenuBar bundle'
+        die 'revision 4/5 manifest has no unique macOS MenuBar bundle'
       IFS='|' read -r bundle_file bundle_url bundle_hash bundle_id bundle_signing_mode <<<"$row"
       [[ "$bundle_file" == "$MACOS_MENU_BAR_ZIP" && "$bundle_url" =~ ^https:// && \
          "$bundle_hash" =~ ^[0-9a-f]{64}$ && "$bundle_id" == "$MACOS_MENU_BAR_BUNDLE_ID" && \
-         "$bundle_signing_mode" == adhoc ]] || die 'revision 4 macOS MenuBar bundle metadata is invalid'
-      jq -e '
-        [.artifacts[] | select(.component == "macos_menu_bar_bundle")]
-        | length == 1
-        and (.[0] | keys | sort == ["arch", "bundle_id", "component", "file", "os", "sha256", "signing_mode", "url"])
-      ' "$manifest" >/dev/null || die 'revision 4 macOS artifact contains unknown fields'
+         "$bundle_signing_mode" == adhoc ]] || die 'revision 4/5 macOS MenuBar bundle metadata is invalid'
+      if [[ "$compatibility_revision" == 5 ]]; then
+        actual_macos_version="$(/usr/bin/sw_vers -productVersion 2>/dev/null)" || \
+          die 'unable to determine the current macOS version'
+        macos_version_at_least "$actual_macos_version" "$minimum_macos_version" || \
+          die "revision 5 release requires macOS ${minimum_macos_version} or newer"
+      fi
       if [[ "$release_source" == github ]]; then
         [[ "$bundle_url" == "$(expected_github_download_url "$bundle_file")" ]] || \
           die 'manifest macOS bundle URL does not match the selected GitHub release'
@@ -1545,17 +1663,17 @@ case "$action" in
     else
       relay_file="opencodex-relay_${goos}_${goarch}"
       relayctl_file="opencodex-relayctl_${goos}_${goarch}"
-      if [[ "$compatibility_revision" == 4 ]]; then
+      if component_manifest_revision "$compatibility_revision"; then
         row="$(component_artifact_row "$manifest" "$goos" "$goarch" relay)" || \
-          die "revision 4 manifest has no relay for ${goos}/${goarch}"
+          die "revision 4/5 manifest has no relay for ${goos}/${goarch}"
         IFS='|' read -r selected_relay_file relay_url relay_hash ignored_bundle_id ignored_signing_mode <<<"$row"
         [[ "$selected_relay_file" == "$relay_file" && -z "$ignored_bundle_id" && -z "$ignored_signing_mode" ]] || \
-          die 'revision 4 relay component metadata is invalid'
+          die 'revision 4/5 relay component metadata is invalid'
         row="$(component_artifact_row "$manifest" "$goos" "$goarch" relayctl)" || \
-          die "revision 4 manifest has no relayctl for ${goos}/${goarch}"
+          die "revision 4/5 manifest has no relayctl for ${goos}/${goarch}"
         IFS='|' read -r selected_relayctl_file relayctl_url relayctl_hash ignored_bundle_id ignored_signing_mode <<<"$row"
         [[ "$selected_relayctl_file" == "$relayctl_file" && -z "$ignored_bundle_id" && -z "$ignored_signing_mode" ]] || \
-          die 'revision 4 relayctl component metadata is invalid'
+          die 'revision 4/5 relayctl component metadata is invalid'
       else
         row="$(artifact_row "$manifest" "$goos" "$goarch" "$relay_file")"
         [[ -n "$row" ]] || die "manifest has no artifact for ${goos}/${goarch}"
@@ -1575,12 +1693,12 @@ case "$action" in
           die 'manifest relayctl URL does not match the selected GitHub release'
       fi
     fi
-    # A revision-4 MenuBar embeds its own routing helper. Installing a raw legacy
+    # A revision-4/5 MenuBar embeds its own routing helper. Installing a raw legacy
     # release over that control surface would leave a stale signed app pointing
     # at a different routing contract. Refuse before touching config/current/
     # service state rather than claiming an unsafe in-place downgrade.
     if [[ "$(uname -s)" == Darwin && "$macos_bundle_mode" != true && ( -e "$MACOS_MENU_BAR_LINK" || -L "$MACOS_MENU_BAR_LINK" || -e "$MACOS_MENU_BAR_BINDING" || -L "$MACOS_MENU_BAR_BINDING" ) ]]; then
-      die 'legacy macOS downgrade requires a completed OpenCodexRelay uninstall first; the revision-4 MenuBar control surface is still registered'
+      die 'legacy macOS downgrade requires a completed OpenCodexRelay uninstall first; the revision-4/5 MenuBar control surface is still registered'
     fi
     staging_dir="$(mktemp -d "${tmp}/stage-${version}-${goos}-${goarch}.XXXXXX")"
     install_dir="${INSTALL_ROOT}/${version}/${goos}-${goarch}"
@@ -1614,7 +1732,7 @@ case "$action" in
       [[ "$(sha256 "$relayctl_path")" == "$relayctl_hash" ]] || die 'relayctl SHA-256 does not match manifest'
       chmod 0700 "$relay_path" "$relayctl_path"
     fi
-    if [[ "$compatibility_revision" == 2 || "$compatibility_revision" == 4 ]]; then
+    if manifest_has_notices "$compatibility_revision"; then
       if [[ "$release_source" == "github" ]]; then
         download_github_asset "$THIRD_PARTY_NOTICES_FILE" "$notices_path"
       else
@@ -1656,7 +1774,7 @@ case "$action" in
            "$(sha256 "${install_dir}/opencodex-relayctl")" == "$relayctl_hash" ]] || \
           die "existing release target differs from the signed manifest: $install_dir"
       fi
-      if [[ "$compatibility_revision" == 2 || "$compatibility_revision" == 4 ]]; then
+      if manifest_has_notices "$compatibility_revision"; then
         [[ -f "${install_dir}/${THIRD_PARTY_NOTICES_FILE}" && ! -L "${install_dir}/${THIRD_PARTY_NOTICES_FILE}" ]] || \
           die "existing release target has no third-party notices: $install_dir"
         [[ "$(sha256 "${install_dir}/${THIRD_PARTY_NOTICES_FILE}")" == "$notices_hash" ]] || \
@@ -1793,7 +1911,7 @@ case "$action" in
     if [[ "$legacy_migration" == true && "$defer_codex_routing" == false ]]; then
       "$relayctl_path" migrate-legacy --codex-config "$codex_config"
     fi
-    if [[ "$compatibility_revision" == 4 ]]; then
+    if component_manifest_revision "$compatibility_revision"; then
       if [[ "$defer_codex_routing" == false ]]; then
         # This is deliberately intent-only. The service starts parked when a
         # native Codex config needs to move to relay routing; the MenuBar (or
@@ -1827,7 +1945,7 @@ case "$action" in
       exit "$service_install_status"
     fi
     wait_for_dual_listener_health "$config_path" "$relayctl_path" "$codex_config"
-    if [[ "$compatibility_revision" == 4 ]]; then
+    if component_manifest_revision "$compatibility_revision"; then
       if [[ "$defer_codex_routing" == false ]]; then
         verify_requested_routing_state "$relayctl_path" "$config_path" "$codex_config"
       else
@@ -1856,7 +1974,7 @@ case "$action" in
     trap 'exit 143' TERM
     ((source_install_release_status == 0)) || \
       die 'unable to release the Relay source-install lifecycle reservation'
-    if [[ "$compatibility_revision" != 4 ]]; then
+    if ! component_manifest_revision "$compatibility_revision"; then
       printf 'relay_installed=%s target=%s/%s codex_routing=legacy_compatibility\n' "$version" "$goos" "$goarch"
     elif [[ "$defer_codex_routing" == true ]]; then
       printf 'relay_installed=%s target=%s/%s codex_routing=deferred\n' "$version" "$goos" "$goarch"

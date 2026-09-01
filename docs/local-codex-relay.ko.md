@@ -322,7 +322,7 @@ routing binding을 사용하거나 만들지 않고 launchd, Keychain, `/Library
 ### 개인·조직 내부 local-only development distribution
 
 개인 간 직접 전달 또는 조직 내부 macOS 시험에는 별도 local-only development 경로를
-사용합니다. 이는 production release가 아니며 official signed-manifest revision 4 계약을 약화하지
+사용합니다. 이는 production release가 아니며 official signed-manifest revision 4/5 계약을 약화하지
 않습니다. macOS 26+ Apple Silicon만 지원하고 release URL, GitHub downloader, 자동 update,
 Developer ID, notarization, Gatekeeper 검사, quarantine 제거를 사용하지 않습니다.
 
