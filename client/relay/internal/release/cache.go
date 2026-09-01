@@ -175,12 +175,19 @@ func ReadPublicKeyFile(path string) ([]byte, error) {
 }
 
 func NewProductionChecker(updaterVersion string) (*Checker, error) {
+	return newProductionChecker(updaterVersion, 12*time.Second)
+}
+
+func newProductionChecker(updaterVersion string, requestTimeout time.Duration) (*Checker, error) {
+	if requestTimeout <= 0 {
+		return nil, errors.New("release checker request timeout is invalid")
+	}
 	cache, err := ProductionCheckCache()
 	if err != nil {
 		return nil, err
 	}
 	client := &http.Client{
-		Timeout: 12 * time.Second,
+		Timeout: requestTimeout,
 		CheckRedirect: func(request *http.Request, previous []*http.Request) error {
 			if len(previous) >= 4 || !allowedProductionRedirect(request.URL) {
 				return errors.New("release request redirect is not allowed")

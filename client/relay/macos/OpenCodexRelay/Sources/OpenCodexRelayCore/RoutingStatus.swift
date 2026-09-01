@@ -1023,6 +1023,12 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
     case integrationStateUnsafe = "integration_state_unsafe"
     case integrationRecoveryRequired = "integration_recovery_required"
     case integrationActivationFailed = "integration_activation_failed"
+    case releaseStageInvalidRequest = "release_stage_invalid_request"
+    case releaseStageBusy = "release_stage_busy"
+    case releaseStageVerificationFailed = "release_stage_verification_failed"
+    case releaseStageRecoveryRequired = "release_stage_recovery_required"
+    case lifecycleWriterBusy = "lifecycle_writer_busy"
+    case lifecycleStateUnsafe = "lifecycle_state_unsafe"
 
     fileprivate var expectedRetryable: Bool {
         switch self {
@@ -1034,7 +1040,7 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
              .authenticationFailed, .gatewayUnreachable, .configChanged,
              .routingChanged, .transitionPending, .runtimeSwapFailed,
              .integrationStateChanged, .integrationRecoveryRequired,
-             .integrationActivationFailed:
+             .integrationActivationFailed, .releaseStageBusy, .lifecycleWriterBusy:
             true
         case .invalidRequest, .operationCancelled, .permissionRequired,
              .nativeRoutingUnverified, .nativeRepairUnavailable, .nativeOwnerConfigurationInvalid, .nativeOwnerResultInvalid,
@@ -1043,7 +1049,9 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
              .teardownUnsupported, .teardownRefused, .teardownResultInvalid,
              .teardownVerificationFailed, .invalidAddress, .credentialUnavailable,
              .catalogInvalid, .gatewayUnsupported, .integrationAppLocationInvalid,
-             .integrationArtifactInvalid, .integrationStateUnsafe:
+             .integrationArtifactInvalid, .integrationStateUnsafe,
+             .releaseStageInvalidRequest, .releaseStageVerificationFailed,
+             .releaseStageRecoveryRequired, .lifecycleStateUnsafe:
             false
         }
     }
@@ -1082,6 +1090,10 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
         case .integrationStateUnsafe: "manual_remediation"
         case .integrationRecoveryRequired: "open_recovery"
         case .integrationActivationFailed: "retry"
+        case .releaseStageInvalidRequest: "check_for_updates"
+        case .releaseStageBusy, .lifecycleWriterBusy: "retry"
+        case .releaseStageVerificationFailed: "open_release"
+        case .releaseStageRecoveryRequired, .lifecycleStateUnsafe: "manual_remediation"
         }
     }
 }
@@ -1299,6 +1311,14 @@ public enum RelayctlError: LocalizedError, Equatable, Sendable {
                 return "Recover the interrupted user integration before trying again."
             case .integrationActivationFailed:
                 return "The user Relay could not be started and verified."
+            case .releaseStageInvalidRequest:
+                return "The selected update request is no longer valid. Check for updates again."
+            case .releaseStageBusy, .lifecycleWriterBusy:
+                return "Another Relay lifecycle operation is active. Try again after it finishes."
+            case .releaseStageVerificationFailed:
+                return "The selected release failed verification. Open the exact release for review."
+            case .releaseStageRecoveryRequired, .lifecycleStateUnsafe:
+                return "Resolve the existing Relay recovery state before staging an update."
             case .invalidRequest, .operationFailed:
                 return "Relay control did not complete. Refresh the status and try again."
             }

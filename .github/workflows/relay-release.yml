@@ -167,16 +167,16 @@ jobs:
           done < "$app_assets"
           previous_build_number="$(python3 - "$builds" <<'PY'
           import pathlib
+          import re
           import sys
-
-          def parsed(value: str) -> tuple[int, int, int]:
-              parts = [int(part) for part in value.split(".")]
-              return tuple((parts + [0, 0])[:3])
 
           values = [line.strip() for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.strip()]
           if not values:
               raise SystemExit("no previous build numbers")
-          print(max(values, key=parsed))
+          tracked = [int(value) for value in values if re.fullmatch(r"[1-9][0-9]{0,3}", value)]
+          if not tracked:
+              raise SystemExit("no tracked numeric previous build numbers")
+          print(max(tracked))
           PY
           )"
           printf 'previous_build_number=%s\n' "$previous_build_number" >> "$GITHUB_OUTPUT"
@@ -289,8 +289,18 @@ jobs:
           version = sys.argv[2]
           repository = sys.argv[3]
           manifest = json.loads((root / f"manifest-{version}.json").read_text(encoding="utf-8"))
-          if manifest.get("version") != version or manifest.get("compatibility_revision") != 4:
+          if manifest.get("version") != version or manifest.get("compatibility_revision") != 5:
               raise SystemExit("manifest version or compatibility revision mismatch")
+          expected_channel = "preview" if "-" in version else "stable"
+          if manifest.get("channel") != expected_channel:
+              raise SystemExit("manifest signed channel mismatch")
+          if manifest.get("minimum_updater_version") != "0.3.8-rc.6":
+              raise SystemExit("manifest minimum updater mismatch")
+          trust_key_id = manifest.get("trust_key_id")
+          if not isinstance(trust_key_id, str) or len(trust_key_id) != 64 or any(
+              character not in "0123456789abcdef" for character in trust_key_id
+          ):
+              raise SystemExit("manifest trust key ID is invalid")
           artifacts = manifest.get("artifacts")
           documents = manifest.get("documents")
           if not isinstance(artifacts, list) or len(artifacts) != 5:
@@ -311,6 +321,10 @@ jobs:
               raise SystemExit("manifest has no darwin/arm64 app bundle")
           if macos.get("bundle_id") != "io.github.novelkr.opencodex-relay" or macos.get("signing_mode") != "adhoc":
               raise SystemExit("manifest macOS signing identity mismatch")
+          if macos.get("minimum_macos_version") != "26.0":
+              raise SystemExit("manifest minimum macOS mismatch")
+          if macos.get("integration_protocol") != 1 or macos.get("helper_protocol") != 1:
+              raise SystemExit("manifest protocol metadata mismatch")
           PY
 
           extract_root="${RUNNER_TEMP}/relay-release-verify-${version}"
@@ -343,6 +357,8 @@ jobs:
           openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY" -outform DER > "$tracked_key_der"
           openssl pkey -pubin -in "$bundled_release_key" -outform DER > "$bundled_key_der"
           cmp -s "$tracked_key_der" "$bundled_key_der"
+          [[ "$(shasum -a 256 "$tracked_key_der" | awk '{print $1}')" == \
+             "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["trust_key_id"])' "$manifest")" ]]
           for component in "$app" "$app_binary" "$helper" "$installer" "$relay" "$relayctl"; do
             details="$(codesign -dvvv --verbose=4 "$component" 2>&1)"
             grep -Fx 'Signature=adhoc' <<<"$details" >/dev/null

@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +28,7 @@ import (
 )
 
 var version = "dev"
+var releaseBuildNumber = "dev"
 
 var errHandoffCodexConfigPreflight = errors.New("selected Codex config must be a missing or regular non-symlink file")
 
@@ -144,6 +146,9 @@ func writeUsage(writer io.Writer) {
       --token SHA256 [--remove-created-root] --json
   opencodex-relayctl release verify --manifest PATH --signature PATH --public-key PATH
   opencodex-relayctl release check --channel stable|preview --current-version VERSION
+      --public-key ABSOLUTE_PATH --json
+  opencodex-relayctl release stage --channel stable|preview --current-version VERSION
+      --release-id ID --tag TAG --expected-manifest-sha256 SHA256
       --public-key ABSOLUTE_PATH --json
 `)
 }
@@ -2188,6 +2193,8 @@ func releaseCommand(args []string) {
 		releaseVerifyCommand(args[1:])
 	case "check":
 		releaseCheckCommand(args[1:])
+	case "stage":
+		releaseStageCommand(args[1:])
 	default:
 		usage()
 		os.Exit(2)
@@ -2257,6 +2264,104 @@ func releaseCheckCommand(args []string) {
 	}
 }
 
+func releaseStageCommand(args []string) {
+	flags := flag.NewFlagSet("release stage", flag.ExitOnError)
+	channel := flags.String("channel", "", "stable or preview")
+	currentVersion := flags.String("current-version", "", "installed strict SemVer")
+	releaseID := flags.Int64("release-id", 0, "exact GitHub release ID returned by release check")
+	tag := flags.String("tag", "", "exact strict SemVer tag returned by release check")
+	expectedManifestSHA256 := flags.String("expected-manifest-sha256", "", "signed manifest SHA-256 returned by release check")
+	publicKeyPath := flags.String("public-key", "", "absolute path to trusted PEM public key")
+	jsonOutput := flags.Bool("json", false, "emit schema-versioned JSON")
+	flags.Parse(args)
+	if flags.NArg() != 0 || !*jsonOutput || *channel == "" || *currentVersion == "" ||
+		*releaseID <= 0 || *tag == "" || *expectedManifestSHA256 == "" || *publicKeyPath == "" {
+		fatal(release.ErrStageInvalidRequest)
+	}
+	buildNumber, err := strconv.Atoi(releaseBuildNumber)
+	if err != nil || strconv.Itoa(buildNumber) != releaseBuildNumber || buildNumber < 1 || buildNumber > 9999 {
+		fatal(release.ErrStageInvalidRequest)
+	}
+	publicKey, err := release.ReadPublicKeyFile(*publicKeyPath)
+	if err != nil {
+		fatal(err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatal(release.ErrStageUnsafeFilesystem)
+	}
+	lifecycleContext, cancelLifecycle := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	lifecycle, err := lifecyclelock.AcquireWriter(
+		lifecycleContext,
+		home,
+		os.Getenv(lifecyclelock.SourceInstallReservationEnvironment),
+	)
+	cancelLifecycle()
+	if errors.Is(err, context.DeadlineExceeded) {
+		fatal(release.ErrStageBusy)
+	}
+	if err != nil {
+		fatal(err)
+	}
+	defer lifecycle.Close()
+	if err := requireReleaseStageLifecycleClean(home); err != nil {
+		fatal(err)
+	}
+	stager, err := release.NewProductionStager(version, buildNumber)
+	if err != nil {
+		fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	receipt, err := stager.Stage(ctx, release.StageRequest{
+		Channel:                release.UpdateChannel(*channel),
+		CurrentVersion:         *currentVersion,
+		ReleaseID:              *releaseID,
+		Tag:                    *tag,
+		ExpectedManifestSHA256: *expectedManifestSHA256,
+		PublicKeyPEM:           publicKey,
+	})
+	if err != nil {
+		fatal(err)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(receipt); err != nil {
+		fatal(err)
+	}
+}
+
+func requireReleaseStageLifecycleClean(home string) error {
+	home = filepath.Clean(home)
+	if !filepath.IsAbs(home) {
+		return release.ErrStageUnsafeFilesystem
+	}
+	productionConfig := filepath.Join(home, ".config", "opencodex-relay", "relay.json")
+	standaloneAnchor, err := handoff.StandaloneRemovalAnchorPath(home)
+	if err != nil {
+		return release.ErrStageUnsafeFilesystem
+	}
+	recoveryPaths := []string{
+		filepath.Join(home, "Library", "Application Support", "OpenCodexRelay", "application-relocation.json"),
+		filepath.Join(home, "Library", "Application Support", "OpenCodexRelay", "integration-journal.json"),
+		routing.TransactionPath(productionConfig),
+		handoff.RemovalCleanupPath(productionConfig),
+		handoff.RemovalCleanupPath(standaloneAnchor),
+	}
+	for _, recoveryPath := range recoveryPaths {
+		if _, err := os.Lstat(recoveryPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+			return release.ErrStageUnsafeFilesystem
+		}
+	}
+	store, err := routing.Open(productionConfig)
+	if err != nil {
+		return release.ErrStageUnsafeFilesystem
+	}
+	state, legacy, err := store.Read()
+	if err != nil || (!legacy && (state.Phase == routing.PhaseApplying || state.Phase == routing.PhaseRecoveryRequired)) {
+		return release.ErrStageUnsafeFilesystem
+	}
+	return nil
+}
+
 func defaultCredentialSource() string {
 	if runtime.GOOS == "darwin" {
 		return "keychain"
@@ -2294,6 +2399,26 @@ func safeOperationError(err error) operationErrorEnvelope {
 		RecommendedAction: "refresh_status",
 	}
 	switch {
+	case errors.Is(err, release.ErrStageInvalidRequest):
+		payload.Code = "release_stage_invalid_request"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "check_for_updates"
+	case errors.Is(err, release.ErrStageBusy):
+		payload.Code = "release_stage_busy"
+		payload.MessageKey = payload.Code
+		payload.RecommendedAction = "retry"
+	case errors.Is(err, release.ErrStageInvalidRelease), errors.Is(err, release.ErrStageInvalidArchive),
+		errors.Is(err, release.ErrStageInvalidBundle):
+		payload.Code = "release_stage_verification_failed"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "open_release"
+	case errors.Is(err, release.ErrStageUnsafeFilesystem):
+		payload.Code = "release_stage_recovery_required"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "manual_remediation"
 	case errors.Is(err, lifecyclelock.ErrReservationBusy):
 		payload.Code = "lifecycle_writer_busy"
 		payload.MessageKey = payload.Code

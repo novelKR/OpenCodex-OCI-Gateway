@@ -751,9 +751,12 @@ and attempts bounded cleanup if the final immutable state cannot be confirmed.
 Release `0.3.6` is the first version using this public CI path.
 
 Do not commit the private key, its base64 representation, a generated release
-directory, credentials, or live request logs. Manifest compatibility revision 4 signs component identity,
-the macOS bundle ID, `signing_mode: "adhoc"`, the final app zip hash, and the
-notice URL/SHA-256. The installer verifies the Ed25519 signature, every asset
+directory, credentials, or live request logs. The `0.3.8-rc.6` updater bootstrap
+uses manifest compatibility revision 4. Starting with `0.3.8-rc.7`, revision 5
+also signs the release channel, minimum updater/macOS versions, trust key ID,
+and integration/helper protocols. Both revisions sign component identity, the
+macOS bundle ID, `signing_mode: "adhoc"`, the final app ZIP hash, and the notice
+URL/SHA-256. The installer verifies the Ed25519 signature, every asset
 hash, the nested ad-hoc signatures, the absence of a Relay Team ID, and the
 Hardened Runtime before selecting the bundle. Revision 1 and 2 releases remain
 eligible rollback targets only when an already installed lifecycle-capable
@@ -768,17 +771,30 @@ blocks app replacement. Retain the
 previous release directory so changing the `current` symlink can be rolled back
 by reinstalling the prior reviewed version.
 
+The `release stage` command introduced in `0.3.8-rc.7` is an assisted macOS app
+update path, not the Relay runtime installer above. It accepts only the exact
+release ID, tag, and manifest digest returned by `release check`, re-fetches and
+re-verifies the immutable release, and safely extracts the signed app into the
+owner-only Application Support update root. The app applies and reads back
+Foundation quarantine metadata, reveals the verified bundle in Finder, and
+quits only after a separate user confirmation. The user then copies or replaces
+the app in Applications and opens it manually. This path never removes
+quarantine, bypasses Gatekeeper, self-relocates, relaunches, updates the
+privileged Helper, or promises an atomic app-level rollback.
+
 Install the exact public release with `--github-repo
 novelKR/OpenCodex-OCI-Gateway` and the tracked public key. A mode-`0600` token
 is optional when anonymous API rate limits are insufficient; details and the
 Remote-host command are in [`../../docs/local-codex-relay.md`](../../docs/local-codex-relay.md).
 
 The macOS app is deliberately not notarized and has no Apple publisher
-identity. Open it from Finder once. If macOS blocks it, immediately open
+identity. Open every newly installed copy from Finder once. If macOS blocks it,
+immediately open
 **System Settings → Privacy & Security** and choose **Open Anyway** for
 OpenCodexRelay (the button is normally available for about one hour after the
 blocked launch), then confirm **Open**. A rebuilt or updated app may require the
 same approval again. Do not remove quarantine attributes or disable Gatekeeper.
+Keep the previous app manually until the replacement has launched successfully.
 
 ### Ownership-based local-development native repair
 

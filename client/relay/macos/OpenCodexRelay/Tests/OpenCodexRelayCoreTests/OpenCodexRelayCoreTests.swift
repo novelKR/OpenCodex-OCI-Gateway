@@ -905,6 +905,12 @@ final class OpenCodexRelayCoreTests: XCTestCase {
             ("native_removal_boundary_changed", true, "refresh_native_removal"),
             ("native_recovery_required", true, "open_recovery"),
             ("custom_codex_home_unsupported", false, "review_request"),
+            ("release_stage_invalid_request", false, "check_for_updates"),
+            ("release_stage_busy", true, "retry"),
+            ("release_stage_verification_failed", false, "open_release"),
+            ("release_stage_recovery_required", false, "manual_remediation"),
+            ("lifecycle_writer_busy", true, "retry"),
+            ("lifecycle_state_unsafe", false, "manual_remediation"),
         ] {
             let data = Data("""
             {"schema_version":1,"ok":false,"error":{"code":"\(code)","message_key":"\(code)","retryable":\(retryable),"recommended_action":"\(action)"}}
