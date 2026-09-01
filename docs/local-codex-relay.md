@@ -338,7 +338,7 @@ local-development build/install procedure below.
 
 For direct person-to-person or organization-internal macOS testing, use the
 separate local-only development path. It is **not** a production release and
-does not weaken the official signed-manifest revision-4 contract. It supports only
+does not weaken the official signed-manifest revision-4/5 contract. It supports only
 macOS 26+ Apple Silicon and has no release URL, GitHub downloader, automatic
 updater, Developer ID, notarization, Gatekeeper assessment, or quarantine
 removal.

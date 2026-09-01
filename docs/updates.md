@@ -66,6 +66,18 @@ results by strict SemVer: stable considers only non-prereleases, while preview
 considers both stable and prerelease versions and selects the maximum. Neither
 channel selects a version below the installed version.
 
+The app-bundled updater in `0.3.8-rc.7` and `0.3.8-rc.8` correctly verifies
+revision 5. Their tagged standalone `install-relay.sh`, however, still accepted
+only revisions 1, 2, and 4, so a fresh or Linux install stopped before any
+persistent Relay mutation. `0.3.8-rc.9` (`CFBundleVersion=1003`) corrects that
+standalone compatibility boundary. It accepts both revision 4 and 5 component
+manifests, validates the signed channel, strict minimum-updater version,
+provided-key fingerprint, exact artifact fields, minimum macOS version, and
+protocol values, then uses the existing transactional revision-4 install path.
+Use the rc.9 tagged installer for standalone revision-5 installation; the
+immutable rc.7/rc.8 app assets and their in-app check/stage contracts are not
+altered by this correction.
+
 Starting with the manually installed `0.3.8-rc.6` bootstrap, the production
 menu-bar app checks this public repository directly. Stable is the default;
 preview is an explicit opt-in. Automatic checks are enabled by default, begin

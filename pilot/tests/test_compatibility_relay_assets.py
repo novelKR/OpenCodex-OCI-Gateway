@@ -301,20 +301,47 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 "fi\n",
                 encoding="utf-8",
             )
+            relayctl_script = (asset_dir / relayctl_name).read_text(encoding="utf-8")
+            relayctl_script = relayctl_script.replace(
+                "if [[ \"${1:-}\" == enable ]]; then\n",
+                "if [[ \"${1:-}\" == mode ]]; then\n"
+                "  case \"${2:-}\" in\n"
+                "    status) printf '%s\\n' '{\"applied_backend\":\"none\"}' ;;\n"
+                "    request) exit 0 ;;\n"
+                "    *) exit 64 ;;\n"
+                "  esac\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [[ \"${1:-}\" == enable ]]; then\n",
+            )
+            (asset_dir / relayctl_name).write_text(relayctl_script, encoding="utf-8")
             for path in (asset_dir / relay_name, asset_dir / relayctl_name):
                 path.chmod(0o755)
+
+            arm_relay_name = "opencodex-relay_linux_arm64"
+            arm_relayctl_name = "opencodex-relayctl_linux_arm64"
+            app_name = "OpenCodexRelay.app.zip"
+            notices_name = "THIRD_PARTY_NOTICES.md"
+            for name in (arm_relay_name, arm_relayctl_name, app_name, notices_name):
+                (asset_dir / name).write_text(f"fixture {name}\n", encoding="utf-8")
 
             def digest(name: str) -> str:
                 return hashlib.sha256((asset_dir / name).read_bytes()).hexdigest()
 
             release_base = "https://releases.example.test"
+            public_der = subprocess.run(
+                ["openssl", "pkey", "-pubin", "-in", str(public_key), "-outform", "DER"],
+                check=True,
+                capture_output=True,
+            ).stdout
             manifest = {
                 "version": version,
-                "compatibility_revision": 1,
+                "compatibility_revision": 5,
                 "artifacts": [
                     {
                         "os": "linux",
                         "arch": "amd64",
+                        "component": "relay",
                         "file": relay_name,
                         "url": f"{release_base}/{version}/{relay_name}",
                         "sha256": digest(relay_name),
@@ -322,11 +349,51 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                     {
                         "os": "linux",
                         "arch": "amd64",
+                        "component": "relayctl",
                         "file": relayctl_name,
                         "url": f"{release_base}/{version}/{relayctl_name}",
                         "sha256": digest(relayctl_name),
                     },
+                    {
+                        "os": "linux",
+                        "arch": "arm64",
+                        "component": "relay",
+                        "file": arm_relay_name,
+                        "url": f"{release_base}/{version}/{arm_relay_name}",
+                        "sha256": digest(arm_relay_name),
+                    },
+                    {
+                        "os": "linux",
+                        "arch": "arm64",
+                        "component": "relayctl",
+                        "file": arm_relayctl_name,
+                        "url": f"{release_base}/{version}/{arm_relayctl_name}",
+                        "sha256": digest(arm_relayctl_name),
+                    },
+                    {
+                        "os": "darwin",
+                        "arch": "arm64",
+                        "component": "macos_menu_bar_bundle",
+                        "file": app_name,
+                        "url": f"{release_base}/{version}/{app_name}",
+                        "sha256": digest(app_name),
+                        "bundle_id": "io.github.novelkr.opencodex-relay",
+                        "signing_mode": "adhoc",
+                        "minimum_macos_version": "26.0",
+                        "integration_protocol": 1,
+                        "helper_protocol": 1,
+                    },
                 ],
+                "documents": [
+                    {
+                        "file": notices_name,
+                        "url": f"{release_base}/{version}/{notices_name}",
+                        "sha256": digest(notices_name),
+                    }
+                ],
+                "channel": "stable",
+                "minimum_updater_version": "0.3.8-rc.6",
+                "trust_key_id": hashlib.sha256(public_der).hexdigest(),
             }
             manifest_path = asset_dir / f"manifest-{version}.json"
             manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -646,7 +713,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("snapshot_regular_file \"$interactive_profile\"", installer)
         self.assertIn("preflight_interactive_profile", installer)
         self.assertIn("legacy_write_interactive_profile", installer)
-        self.assertIn('if [[ "$compatibility_revision" == 4 ]]', installer)
+        self.assertIn('component_manifest_revision "$compatibility_revision"', installer)
         self.assertIn("snapshot_owner_only_control_file \"$routing_state_path\"", installer)
         self.assertIn("snapshot_owner_only_control_file \"$routing_initialized_path\"", installer)
         self.assertIn("snapshot_owner_only_control_file \"$routing_journal_path\"", installer)
@@ -759,7 +826,11 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         )
         self.assertNotRegex(builder, r"(?m)^\s*(?:xcrun\s+)?(?:notarytool|stapler)\b")
         self.assertIn('"documents":[{"file":"%s"', builder)
-        self.assertIn('compatibility_revision" == 4', installer)
+        self.assertIn('[[ "$1" == 4 || "$1" == 5 ]]', installer)
+        self.assertIn("release manifest is not canonical JSON or contains duplicate fields", installer)
+        self.assertIn("revision 5 manifest channel does not match the release version", installer)
+        self.assertIn("revision 5 trust key ID does not match the provided public key", installer)
+        self.assertIn("revision 5 minimum macOS version is invalid", installer)
         self.assertIn("require_ed25519_private_key", builder)
         self.assertIn("require_ed25519_public_key", publisher)
         self.assertIn('THIRD_PARTY_NOTICES.md SHA-256 does not match manifest', installer)
@@ -856,6 +927,218 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             )
         self.assertNotEqual(unsafe_token.returncode, 0)
         self.assertIn("mode 0600", unsafe_token.stderr)
+
+    def test_standalone_installer_strictly_accepts_revision_five_before_download(self) -> None:
+        installer_path = RELAY / "scripts" / "install-relay.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            assets = root / "assets"
+            fake_bin = root / "bin"
+            tmp_dir = root / "tmp"
+            for path in (home, assets, fake_bin, tmp_dir):
+                path.mkdir()
+
+            private_key = root / "private.pem"
+            public_key = root / "public.pem"
+            subprocess.run(
+                ["openssl", "genpkey", "-algorithm", "Ed25519", "-out", str(private_key)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["openssl", "pkey", "-in", str(private_key), "-pubout", "-out", str(public_key)],
+                check=True,
+                capture_output=True,
+            )
+            public_der = subprocess.run(
+                ["openssl", "pkey", "-pubin", "-in", str(public_key), "-outform", "DER"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            trust_key_id = hashlib.sha256(public_der).hexdigest()
+            version = "1.2.3-rc.1"
+            base_url = "https://releases.example.test"
+            manifest_path = assets / f"manifest-{version}.json"
+            signature_path = assets / f"manifest-{version}.sig"
+            artifact_attempt = root / "artifact-attempted"
+
+            def linux_artifact(arch: str, component: str) -> dict[str, object]:
+                command = "opencodex-relayctl" if component == "relayctl" else "opencodex-relay"
+                file = f"{command}_linux_{arch}"
+                return {
+                    "os": "linux",
+                    "arch": arch,
+                    "component": component,
+                    "file": file,
+                    "url": f"{base_url}/{version}/{file}",
+                    "sha256": "0" * 64,
+                }
+
+            valid_manifest: dict[str, object] = {
+                "version": version,
+                "compatibility_revision": 5,
+                "artifacts": [
+                    linux_artifact("amd64", "relay"),
+                    linux_artifact("amd64", "relayctl"),
+                    linux_artifact("arm64", "relay"),
+                    linux_artifact("arm64", "relayctl"),
+                    {
+                        "os": "darwin",
+                        "arch": "arm64",
+                        "component": "macos_menu_bar_bundle",
+                        "file": "OpenCodexRelay.app.zip",
+                        "url": f"{base_url}/{version}/OpenCodexRelay.app.zip",
+                        "sha256": "1" * 64,
+                        "bundle_id": "io.github.novelkr.opencodex-relay",
+                        "signing_mode": "adhoc",
+                        "minimum_macos_version": "26.0",
+                        "integration_protocol": 1,
+                        "helper_protocol": 1,
+                    },
+                ],
+                "documents": [
+                    {
+                        "file": "THIRD_PARTY_NOTICES.md",
+                        "url": f"{base_url}/{version}/THIRD_PARTY_NOTICES.md",
+                        "sha256": "2" * 64,
+                    }
+                ],
+                "channel": "preview",
+                "minimum_updater_version": "0.3.8-rc.6",
+                "trust_key_id": trust_key_id,
+            }
+
+            (fake_bin / "uname").write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == -m ]]; then printf 'x86_64\\n'; else printf 'Linux\\n'; fi\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "curl").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "output= url=\n"
+                "while [[ $# -gt 0 ]]; do\n"
+                "  case \"$1\" in\n"
+                "    -o) output=\"$2\"; shift 2 ;;\n"
+                "    --fail|--location|--silent|--show-error) shift ;;\n"
+                "    *) url=\"$1\"; shift ;;\n"
+                "  esac\n"
+                "done\n"
+                "case \"${url##*/}\" in\n"
+                f"  manifest-{version}.json|manifest-{version}.sig) cp \"$FAKE_ASSET_DIR/${{url##*/}}\" \"$output\" ;;\n"
+                "  *) : > \"$FAKE_ARTIFACT_ATTEMPT\"; exit 44 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            for path in fake_bin.iterdir():
+                path.chmod(0o755)
+
+            environment = os.environ | {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "TMPDIR": str(tmp_dir),
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "FAKE_ASSET_DIR": str(assets),
+                "FAKE_ARTIFACT_ATTEMPT": str(artifact_attempt),
+            }
+            command = [
+                "bash",
+                str(installer_path),
+                "install",
+                version,
+                "--release-base-url",
+                base_url,
+                "--public-key",
+                str(public_key),
+                "--upstream",
+                "https://example.test/v1",
+            ]
+
+            def run_manifest(
+                payload: dict[str, object], *, raw: str | None = None
+            ) -> subprocess.CompletedProcess[str]:
+                artifact_attempt.unlink(missing_ok=True)
+                manifest_path.write_text(
+                    raw if raw is not None else json.dumps(payload, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                signed = subprocess.run(
+                    [
+                        "openssl",
+                        "pkeyutl",
+                        "-sign",
+                        "-rawin",
+                        "-inkey",
+                        str(private_key),
+                        "-in",
+                        str(manifest_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                signature_path.write_text(
+                    base64.b64encode(signed).decode("ascii") + "\n", encoding="ascii"
+                )
+                return subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+
+            accepted = run_manifest(valid_manifest)
+            self.assertEqual(accepted.returncode, 44, accepted.stderr)
+            self.assertTrue(artifact_attempt.is_file())
+
+            revision_four = json.loads(json.dumps(valid_manifest))
+            revision_four["compatibility_revision"] = 4
+            revision_four.pop("channel")
+            revision_four.pop("minimum_updater_version")
+            revision_four.pop("trust_key_id")
+            for field in ("minimum_macos_version", "integration_protocol", "helper_protocol"):
+                revision_four["artifacts"][4].pop(field)
+            accepted_revision_four = run_manifest(revision_four)
+            self.assertEqual(accepted_revision_four.returncode, 44, accepted_revision_four.stderr)
+            self.assertTrue(artifact_attempt.is_file())
+
+            invalid_cases: tuple[tuple[dict[str, object], str], ...] = (
+                (valid_manifest | {"unknown": True}, "unknown or malformed top-level fields"),
+                (valid_manifest | {"channel": "stable"}, "channel does not match"),
+                (
+                    valid_manifest | {"minimum_updater_version": "0.3.8-06"},
+                    "minimum updater version is not strict SemVer",
+                ),
+                (valid_manifest | {"trust_key_id": "f" * 64}, "trust key ID does not match"),
+            )
+            for payload, message in invalid_cases:
+                rejected = run_manifest(payload)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn(message, rejected.stderr)
+                self.assertFalse(artifact_attempt.exists())
+
+            invalid_artifacts = json.loads(json.dumps(valid_manifest))
+            invalid_artifacts["artifacts"][4]["helper_protocol"] = 2
+            rejected_protocol = run_manifest(invalid_artifacts)
+            self.assertIn("artifacts contain unknown, incomplete, or unsupported fields", rejected_protocol.stderr)
+            self.assertFalse(artifact_attempt.exists())
+
+            compact = json.dumps(valid_manifest, separators=(",", ":"))
+            duplicate = compact.replace('"channel":"preview"', '"channel":"preview","channel":"preview"') + "\n"
+            rejected_duplicate = run_manifest(valid_manifest, raw=duplicate)
+            self.assertIn("duplicate fields", rejected_duplicate.stderr)
+            self.assertFalse(artifact_attempt.exists())
+
+            for invalid_version in ("01.2.3", "1.2.3-01", "1.2.3+build", "1.2.3-alpha..1"):
+                invalid_version_result = subprocess.run(
+                    ["bash", str(installer_path), "install", invalid_version],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(invalid_version_result.returncode, 0)
+                self.assertIn("strict SemVer", invalid_version_result.stderr)
 
     def test_release_builder_signs_full_third_party_notice_in_exact_asset_set(self) -> None:
         notice_path = RELAY / "THIRD_PARTY_NOTICES.md"

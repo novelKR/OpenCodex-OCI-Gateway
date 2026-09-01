@@ -58,6 +58,15 @@ updater는 bounded pagination 결과를 strict SemVer로
 비교하며, stable channel은 non-prerelease만, preview channel은 stable과 prerelease를 함께
 고려해 최댓값을 고릅니다. 어느 channel도 현재 버전보다 낮은 release를 선택하지 않습니다.
 
+`0.3.8-rc.7`과 `0.3.8-rc.8`의 app 내 updater는 revision 5를 정상 검증하지만, 해당 tag의
+독립 `install-relay.sh`는 revision 1, 2, 4만 허용하여 신규 설치나 Linux 설치가 영속 Relay
+변경 전에 중단되었습니다. `0.3.8-rc.9`(`CFBundleVersion=1003`)는 이 독립 설치 호환 경계를
+수정합니다. revision 4와 5 component manifest를 모두 허용하고, signed channel, strict
+minimum-updater version, 전달된 공개키 fingerprint, exact artifact field, minimum macOS
+version, protocol 값을 검증한 뒤 기존 revision-4 transaction 설치 경로를 그대로 사용합니다.
+독립 revision-5 설치에는 rc.9 tag의 installer를 사용해야 합니다. 이 보정은 immutable
+rc.7/rc.8 app asset이나 app 내 check/stage 계약을 변경하지 않습니다.
+
 수동 설치하는 첫 bootstrap `0.3.8-rc.6`부터 production 메뉴 막대 앱이 이 public 저장소를
 직접 확인합니다. 기본값은 stable이며 preview는 명시적으로 opt-in해야 합니다. 자동 확인은
 기본으로 켜져 있고 앱 실행 5–15분 사이의 무작위 지연 후 시작해 이후 최대 24시간마다
