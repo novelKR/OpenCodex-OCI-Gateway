@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/integration"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
 
@@ -56,6 +57,8 @@ func TestSafeOperationErrorMapsRecoveryWithoutRawDetails(t *testing.T) {
 		{handoff.ErrUnsafeExecutable, "opencodex_candidate_changed", true, "rediscover_opencodex"},
 		{routing.ErrNativeVerification, "native_routing_unverified", false, "manual_remediation"},
 		{routing.ErrNativeRepairGenerationStale, "routing_generation_changed", true, "refresh_status"},
+		{integration.ErrUpgradeIncompatible, "runtime_upgrade_incompatible", false, "manual_remediation"},
+		{integration.ErrRestartConfirmationNeeded, "relay_restart_confirmation_required", false, "confirm_restart"},
 	} {
 		result := safeOperationError(test.err)
 		if result.Error.Code != test.code || result.Error.Retryable != test.retryable || result.Error.RecommendedAction != test.action {

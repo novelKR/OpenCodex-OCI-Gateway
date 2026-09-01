@@ -139,6 +139,10 @@ func writeUsage(writer io.Writer) {
 	  opencodex-relayctl integration inspect --json
 	  opencodex-relayctl integration apply --expected-state-digest SHA256 --json < candidate.json
 	  opencodex-relayctl integration recover --json
+	  opencodex-relayctl integration upgrade inspect --json
+	  opencodex-relayctl integration upgrade apply --expected-state-digest SHA256
+	      --confirm-relay-restart --json
+	  opencodex-relayctl integration upgrade recover --json
 	  opencodex-relayctl lifecycle source-install-capability --json
 	  opencodex-relayctl lifecycle reserve-source-install --scope production|local_development
 	      --recovery-file ABSOLUTE_PATH --json
@@ -2147,6 +2151,72 @@ func integrationCommand(args []string) {
 		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 			fatal(err)
 		}
+	case "upgrade":
+		integrationUpgradeCommand(manager, args[1:])
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+func integrationUpgradeCommand(manager *integration.Manager, args []string) {
+	if len(args) == 0 {
+		usage()
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "inspect":
+		flags := newModeFlagSet("integration upgrade inspect")
+		jsonOutput := flags.Bool("json", false, "emit JSON")
+		flags.Parse(args[1:])
+		if flags.NArg() != 0 || !*jsonOutput {
+			fatal(integration.ErrUnsafeState)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		result, err := manager.InspectUpgrade(ctx)
+		if err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			fatal(err)
+		}
+	case "apply":
+		flags := newModeFlagSet("integration upgrade apply")
+		expectedDigest := flags.String("expected-state-digest", "", "exact runtime-upgrade state SHA-256 from inspect")
+		confirmRestart := flags.Bool("confirm-relay-restart", false, "confirm interruption of active Relay requests")
+		jsonOutput := flags.Bool("json", false, "emit JSON")
+		flags.Parse(args[1:])
+		if flags.NArg() != 0 || !*jsonOutput || !routingDigest(*expectedDigest) || !*confirmRestart {
+			fatal(integration.ErrRestartConfirmationNeeded)
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		ctx, timeoutCancel := context.WithTimeout(ctx, 150*time.Second)
+		defer timeoutCancel()
+		result, err := manager.ApplyUpgrade(ctx, *expectedDigest, *confirmRestart)
+		if err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			fatal(err)
+		}
+	case "recover":
+		flags := newModeFlagSet("integration upgrade recover")
+		jsonOutput := flags.Bool("json", false, "emit JSON")
+		flags.Parse(args[1:])
+		if flags.NArg() != 0 || !*jsonOutput {
+			fatal(integration.ErrUnsafeState)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		result, err := manager.RecoverUpgrade(ctx)
+		if err != nil {
+			fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			fatal(err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -2575,6 +2645,16 @@ func safeOperationError(err error) operationErrorEnvelope {
 		payload.Code = "integration_activation_failed"
 		payload.MessageKey = payload.Code
 		payload.RecommendedAction = "retry"
+	case errors.Is(err, integration.ErrUpgradeIncompatible):
+		payload.Code = "runtime_upgrade_incompatible"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "manual_remediation"
+	case errors.Is(err, integration.ErrRestartConfirmationNeeded):
+		payload.Code = "relay_restart_confirmation_required"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "confirm_restart"
 
 	case errors.Is(err, routing.ErrNativeRepairGenerationStale):
 		payload.Code = "routing_generation_changed"

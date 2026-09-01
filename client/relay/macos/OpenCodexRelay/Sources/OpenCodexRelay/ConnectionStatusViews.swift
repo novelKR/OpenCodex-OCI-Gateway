@@ -138,6 +138,7 @@ struct RelayControlCenterView: View {
     @ObservedObject var windowCoordinator: ControlCenterWindowCoordinator
     @ObservedObject var relocation: ApplicationRelocationController
     @ObservedObject var updates: ReleaseUpdateController
+    @ObservedObject var runtimeUpgrade: RuntimeUpgradeController
     @EnvironmentObject private var localization: LocalizationStore
     @StateObject private var codexConfiguration: CodexConfigurationController
     @StateObject private var gatewaySettings: GatewaySettingsController
@@ -152,12 +153,14 @@ struct RelayControlCenterView: View {
         model: MenuBarModel,
         windowCoordinator: ControlCenterWindowCoordinator,
         relocation: ApplicationRelocationController,
-        updates: ReleaseUpdateController
+        updates: ReleaseUpdateController,
+        runtimeUpgrade: RuntimeUpgradeController
     ) {
         self.model = model
         self.windowCoordinator = windowCoordinator
         self.relocation = relocation
         self.updates = updates
+        self.runtimeUpgrade = runtimeUpgrade
         _codexConfiguration = StateObject(
             wrappedValue: model.makeCodexConfigurationController()
         )
@@ -189,6 +192,7 @@ struct RelayControlCenterView: View {
                         Button {
                             model.refresh()
                             gatewaySettings.load()
+                            runtimeUpgrade.refresh()
                         } label: {
                             Label {
                                 Text(localizer.text(.menuRefresh))
@@ -353,6 +357,7 @@ struct RelayControlCenterView: View {
                 gatewaySettings: gatewaySettings,
                 relocation: relocation,
                 updates: updates,
+                runtimeUpgrade: runtimeUpgrade,
                 languageSelection: $localization.selection,
                 languageDescriptors: localization.registry.descriptors,
                 localizer: localizer,
@@ -363,6 +368,8 @@ struct RelayControlCenterView: View {
             AppInformationControlCenterPage(
                 model: model,
                 updates: updates,
+                runtimeUpgrade: runtimeUpgrade,
+                relocation: relocation,
                 localizer: localizer,
                 title: localizer.text(section.titleKey),
                 systemImage: section.systemImage

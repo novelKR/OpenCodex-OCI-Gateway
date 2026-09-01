@@ -2152,6 +2152,8 @@ final class MenuBarModelTests: XCTestCase {
                 distributionFlavor: .localDevelopment,
                 currentVersion: "0.3.8"
             )
+            let relocation = ApplicationRelocationController(runtimeMode: .preview)
+            let runtimeUpgrade = RuntimeUpgradeController()
             let pages: [AnyView] = [
                 AnyView(OverviewControlCenterPage(
                     model: model,
@@ -2208,8 +2210,9 @@ final class MenuBarModelTests: XCTestCase {
                 AnyView(SettingsControlCenterPage(
                     model: model,
                     gatewaySettings: model.makeGatewaySettingsController(),
-                    relocation: ApplicationRelocationController(runtimeMode: .preview),
+                    relocation: relocation,
                     updates: updates,
+                    runtimeUpgrade: runtimeUpgrade,
                     languageSelection: .constant(selection),
                     languageDescriptors: localization.registry.descriptors,
                     localizer: localizer,
@@ -2219,6 +2222,8 @@ final class MenuBarModelTests: XCTestCase {
                 AnyView(AppInformationControlCenterPage(
                     model: model,
                     updates: updates,
+                    runtimeUpgrade: runtimeUpgrade,
+                    relocation: relocation,
                     localizer: localizer,
                     title: localizer.text(.controlCenterAppInformation),
                     systemImage: "info.circle"

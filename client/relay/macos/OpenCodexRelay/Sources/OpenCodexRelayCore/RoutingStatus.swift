@@ -1029,6 +1029,8 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
     case releaseStageRecoveryRequired = "release_stage_recovery_required"
     case lifecycleWriterBusy = "lifecycle_writer_busy"
     case lifecycleStateUnsafe = "lifecycle_state_unsafe"
+    case runtimeUpgradeIncompatible = "runtime_upgrade_incompatible"
+    case relayRestartConfirmationRequired = "relay_restart_confirmation_required"
 
     fileprivate var expectedRetryable: Bool {
         switch self {
@@ -1051,7 +1053,8 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
              .catalogInvalid, .gatewayUnsupported, .integrationAppLocationInvalid,
              .integrationArtifactInvalid, .integrationStateUnsafe,
              .releaseStageInvalidRequest, .releaseStageVerificationFailed,
-             .releaseStageRecoveryRequired, .lifecycleStateUnsafe:
+             .releaseStageRecoveryRequired, .lifecycleStateUnsafe,
+             .runtimeUpgradeIncompatible, .relayRestartConfirmationRequired:
             false
         }
     }
@@ -1094,6 +1097,8 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
         case .releaseStageBusy, .lifecycleWriterBusy: "retry"
         case .releaseStageVerificationFailed: "open_release"
         case .releaseStageRecoveryRequired, .lifecycleStateUnsafe: "manual_remediation"
+        case .runtimeUpgradeIncompatible: "manual_remediation"
+        case .relayRestartConfirmationRequired: "confirm_restart"
         }
     }
 }
@@ -1319,6 +1324,10 @@ public enum RelayctlError: LocalizedError, Equatable, Sendable {
                 return "The selected release failed verification. Open the exact release for review."
             case .releaseStageRecoveryRequired, .lifecycleStateUnsafe:
                 return "Resolve the existing Relay recovery state before staging an update."
+            case .runtimeUpgradeIncompatible:
+                return "The installed and bundled Relay runtimes are not safely upgrade-compatible."
+            case .relayRestartConfirmationRequired:
+                return "Confirm the Relay restart before finishing the runtime update."
             case .invalidRequest, .operationFailed:
                 return "Relay control did not complete. Refresh the status and try again."
             }

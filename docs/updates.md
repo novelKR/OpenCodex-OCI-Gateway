@@ -151,6 +151,36 @@ app or resident Relay. The privileged Helper is never replaced by this flow; a
 version mismatch remains `manual_update_required` and needs its own administrator
 approval.
 
+Starting with `0.3.8-rc.8` (`CFBundleVersion=1002`), the newly installed app
+also performs a read-only inspection of the resident self-hosted Relay runtime.
+This is a separate lifecycle from app download, Finder replacement, Gatekeeper
+approval, and privileged Helper maintenance:
+
+```bash
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  integration upgrade inspect --json
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  integration upgrade apply \
+  --expected-state-digest REPLACE_WITH_INSPECTED_SHA256 \
+  --confirm-relay-restart \
+  --json
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  integration upgrade recover --json
+```
+
+`inspect` reports only `not_integrated`, `current`, `upgrade_available`,
+`recovery_required`, or `incompatible`. `apply` requires the lifecycle writer
+lock, rechecks the inspection digest, verifies both bundled executables, stages
+an immutable `<version>-<combined-digest>` runtime, snapshots routing, config,
+credential-account, and ownership invariants, and persists a phase journal
+before switching `current` and the LaunchAgent. The Relay is restarted only
+after the explicit confirmation flag. Success requires loopback readiness and
+proof that the running PID maps to the expected executable and digest. Failure
+restores the previous runtime and LaunchAgent and verifies its readiness;
+`recover` chooses either that rollback or a verified forward completion from
+the journal. The previous runtime is retained; M3 does not delete it. The
+privileged Helper is never installed or replaced by this transaction.
+
 ### Public GitHub Release option
 
 Use a lightweight strict-SemVer tag without a `v` prefix. Before approving the

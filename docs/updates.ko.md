@@ -132,6 +132,34 @@ lifecycle busy 또는 기존 recovery journal이 있으면 현재 app과 residen
 stage/handoff를 막습니다. privileged Helper는 이 flow에서 절대 교체하지 않습니다. version
 mismatch는 계속 `manual_update_required`이며 별도 관리자 승인이 필요합니다.
 
+`0.3.8-rc.8`(`CFBundleVersion=1002`)부터 새로 설치한 앱은 상주 self-hosted Relay
+runtime도 read-only로 검사합니다. 이 lifecycle은 app 다운로드, Finder 교체,
+Gatekeeper 승인, privileged Helper 유지보수와 서로 분리됩니다.
+
+```bash
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  integration upgrade inspect --json
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  integration upgrade apply \
+  --expected-state-digest REPLACE_WITH_INSPECTED_SHA256 \
+  --confirm-relay-restart \
+  --json
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  integration upgrade recover --json
+```
+
+`inspect`는 `not_integrated`, `current`, `upgrade_available`,
+`recovery_required`, `incompatible` 중 하나만 보고합니다. `apply`는 lifecycle
+writer lock을 잡고 inspection digest를 재검증하며, bundled executable 두 개를
+검증한 뒤 immutable `<version>-<combined-digest>` runtime을 staging합니다.
+routing, config, credential account, ownership 불변식을 snapshot하고 phase journal을
+영속화한 다음에만 `current`와 LaunchAgent를 전환합니다. Relay 재시작은 명시적인
+확인 flag 뒤에만 수행됩니다. 성공하려면 loopback readiness와 실행 중 PID가 expected
+executable 및 digest에 대응한다는 증거가 필요합니다. 실패하면 이전 runtime과
+LaunchAgent를 복원하고 readiness를 확인하며, `recover`는 journal에 따라 그 rollback
+또는 검증된 forward completion 중 안전한 한 경로만 선택합니다. 이전 runtime은 보존되며
+M3에서는 삭제하지 않습니다. privileged Helper는 이 transaction에서 설치·교체되지 않습니다.
+
 ### public GitHub Release를 사용하는 경우
 
 `v` 접두사가 없는 lightweight strict-SemVer tag를 사용합니다. 보호된 Environment 배포를

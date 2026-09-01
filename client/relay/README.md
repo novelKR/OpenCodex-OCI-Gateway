@@ -782,6 +782,16 @@ the app in Applications and opens it manually. This path never removes
 quarantine, bypasses Gatekeeper, self-relocates, relaunches, updates the
 privileged Helper, or promises an atomic app-level rollback.
 
+The `integration upgrade` namespace introduced in `0.3.8-rc.8` updates only the
+already integrated resident Relay runtime. `inspect` returns a digest-bound
+snapshot, `apply` requires that exact digest plus explicit Relay-restart
+confirmation, and `recover` resolves a persisted upgrade journal without
+reapplying routing or credentials. The transaction verifies the bundled and
+running executable identities, preserves config/routing/credential ownership,
+retains the previous runtime for rollback, and never installs or replaces the
+privileged Helper. The app exposes this separately as **Finish Relay Update**
+after the newly copied app launches.
+
 Install the exact public release with `--github-repo
 novelKR/OpenCodex-OCI-Gateway` and the tracked public key. A mode-`0600` token
 is optional when anonymous API rate limits are insufficient; details and the

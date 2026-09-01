@@ -6,6 +6,8 @@ import OpenCodexRelayLocalization
 struct AppInformationView: View {
     @ObservedObject var model: MenuBarModel
     @ObservedObject var updates: ReleaseUpdateController
+    @ObservedObject var runtimeUpgrade: RuntimeUpgradeController
+    @ObservedObject var relocation: ApplicationRelocationController
     let localizer: AppLocalizer
     private let reader: AppInformationReader
     @State private var information: AppInformationSnapshot
@@ -14,11 +16,15 @@ struct AppInformationView: View {
     init(
         model: MenuBarModel,
         updates: ReleaseUpdateController,
+        runtimeUpgrade: RuntimeUpgradeController,
+        relocation: ApplicationRelocationController,
         localizer: AppLocalizer,
         reader: AppInformationReader = AppInformationReader()
     ) {
         self.model = model
         self.updates = updates
+        self.runtimeUpgrade = runtimeUpgrade
+        self.relocation = relocation
         self.localizer = localizer
         self.reader = reader
         _information = State(initialValue: reader.loadingSnapshot)
@@ -108,6 +114,13 @@ struct AppInformationView: View {
             }
 
             updateCard
+
+            RuntimeUpgradeCard(
+                controller: runtimeUpgrade,
+                model: model,
+                relocation: relocation,
+                localizer: localizer
+            )
 
             ControlCenterSupportingText(
                 localizer.text(.appInformationAdHocDistributionNotice),
