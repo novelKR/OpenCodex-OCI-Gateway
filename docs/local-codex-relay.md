@@ -196,9 +196,12 @@ one manifest with an off-repository Ed25519 private key:
 
 Publish the manifest, signature, four Linux helpers, ad-hoc-signed
 `OpenCodexRelay.app.zip`, and `THIRD_PARTY_NOTICES.md` together under
-`RELEASE_BASE/VERSION/`. Compatibility revision 4 binds each component, the
-macOS bundle ID, `signing_mode: "adhoc"`, the final app zip hash, and the notice URL/SHA-256 into
-the signed manifest. Distribute the trusted public PEM through an independently
+`RELEASE_BASE/VERSION/`. The `0.3.8-rc.6` bootstrap uses compatibility revision
+4. Starting with `0.3.8-rc.7`, revision 5 additionally binds channel, minimum
+updater/macOS versions, trust key ID, and integration/helper protocols. Both
+revisions bind each component, the macOS bundle ID, `signing_mode: "adhoc"`,
+the final app ZIP hash, and the notice URL/SHA-256 into the signed manifest.
+Distribute the trusted public PEM through an independently
 reviewed channel. Never put the private key on the repository, release host, or
 client.
 
@@ -242,6 +245,20 @@ The menu and App Information page show the channel, last check, status, and a
 candidate-specific dismissible badge. Automatic checking defaults on for
 production and is prohibited at the network boundary for local development.
 This release does not download, stage, replace, relaunch, or restart anything.
+
+`0.3.8-rc.7` changes publication to revision 5 and build `1001`. A production
+user can explicitly download and verify a selected update through `release
+stage`; the helper re-fetches the exact immutable release and revalidates the
+signature, app digest, safe ZIP shape, production bundle identity, newer build,
+arm64 executable set, nested ad-hoc signatures, absent Team ID, Hardened
+Runtime, helper CDHash binding, and embedded tracked key. Staging is locked and
+owner-only, and its strict receipt is bound to the release ID and manifest
+digest. The app revalidates that receipt and bundle, applies and reads back
+Foundation quarantine, and reveals it in Finder. It quits only after a separate
+confirmation. The user copies or replaces the Applications copy and opens it
+manually; the app never removes quarantine, bypasses Gatekeeper, performs a
+self-relocation update, or claims atomic app rollback. The privileged Helper
+remains a separate administrator-approved lifecycle.
 
 ### Public GitHub Release distribution
 
@@ -492,7 +509,7 @@ the same Codex home.
 
 ### Switch modes and inspect connection state
 
-On macOS 26+ Apple Silicon, revision 4 installs the ad-hoc-signed, Hardened
+On macOS 26+ Apple Silicon, the supported release manifests install the ad-hoc-signed, Hardened
 Runtime `~/Applications/OpenCodexRelay.app` link. It does not launch the app or
 require login registration as part of installation.
 The MenuBar app stores and controls only a Codex Desktop `.app` whose reviewed
@@ -517,7 +534,9 @@ Because the Relay app is not notarized, open it from Finder once. If macOS
 blocks it, immediately open **System Settings → Privacy & Security**, choose
 **Open Anyway** for OpenCodexRelay (normally available for about one hour after
 the blocked launch), and confirm **Open**. Updates may require this approval
-again. Never remove quarantine attributes or disable Gatekeeper. The helper's
+again. For staged updates, use the Finder handoff and keep the previous app
+manually until the replacement launches successfully. Never remove quarantine
+attributes or disable Gatekeeper. The helper's
 administrator prompt is a separate approval.
 `login_registration=pending` means macOS still requires Login Items approval;
 reopen the app or inspect its status after granting that approval.

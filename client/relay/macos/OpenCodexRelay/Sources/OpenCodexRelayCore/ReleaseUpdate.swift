@@ -198,6 +198,7 @@ public enum ReleaseUpdateContractError: Error, Equatable, Sendable {
     case invalidCandidate
     case invalidCompatibility
     case invalidRequest
+    case invalidStage
 }
 
 private struct FlatJSONKeyScanner {
@@ -369,6 +370,179 @@ public struct ProcessReleaseUpdateChecker: ReleaseUpdateChecking, Sendable {
             throw RelayctlError.invocationFailed(exitCode: result.exitCode)
         }
         return try ReleaseUpdateCheckResult.decodeStrict(result.stdout)
+    }
+}
+
+public struct ReleaseUpdateStageReceipt: Codable, Sendable, Equatable {
+    public let schemaVersion: Int
+    public let releaseID: Int64
+    public let tag: String
+    public let channel: ReleaseUpdateChannel
+    public let manifestSHA256: String
+    public let appSHA256: String
+    public let bundleFingerprint: String
+    public let trustKeyID: String
+    public let stagingPath: String
+    public let verifiedAt: String
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case schemaVersion = "schema_version"
+        case releaseID = "release_id"
+        case tag
+        case channel
+        case manifestSHA256 = "manifest_sha256"
+        case appSHA256 = "app_sha256"
+        case bundleFingerprint = "bundle_fingerprint"
+        case trustKeyID = "trust_key_id"
+        case stagingPath = "staging_path"
+        case verifiedAt = "verified_at"
+    }
+
+    public var stagedApplicationURL: URL {
+        URL(fileURLWithPath: stagingPath, isDirectory: true)
+    }
+
+    public static func decodeStrict(_ data: Data) throws -> Self {
+        guard data.count <= 64 * 1024 else { throw ReleaseUpdateContractError.invalidStage }
+        do {
+            var scanner = FlatJSONKeyScanner(data: data)
+            try scanner.validateUniqueKeys()
+        } catch let error as ReleaseUpdateContractError {
+            throw error
+        } catch {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys).isSubset(of: Set(CodingKeys.allCases.map(\.rawValue))) else {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+        let receipt: Self
+        do {
+            receipt = try JSONDecoder().decode(Self.self, from: data)
+        } catch {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+        return try receipt.validated()
+    }
+
+    public func validated(for selection: ReleaseUpdateCheckResult) throws -> Self {
+        let validated = try validated()
+        guard selection.status == .updateAvailable,
+              validated.releaseID == selection.releaseID,
+              validated.tag == selection.tag,
+              validated.channel == selection.channel,
+              validated.manifestSHA256 == selection.manifestSHA256,
+              validated.appSHA256 == selection.appSHA256,
+              validated.trustKeyID == selection.trustKeyID else {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+        return validated
+    }
+
+    private func validated() throws -> Self {
+        let standardized = URL(fileURLWithPath: stagingPath, isDirectory: true)
+            .standardizedFileURL.path
+        guard schemaVersion == 1,
+              releaseID > 0,
+              StrictReleaseVersion(tag) != nil,
+              channel != .stable || !tag.contains("-"),
+              Self.validSHA256(manifestSHA256),
+              Self.validSHA256(appSHA256),
+              Self.validSHA256(bundleFingerprint),
+              Self.validSHA256(trustKeyID),
+              stagingPath.hasPrefix("/"),
+              standardized == stagingPath,
+              stagingPath.hasSuffix("/OpenCodexRelay.app"),
+              ISO8601DateFormatter().date(from: verifiedAt) != nil else {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+        return self
+    }
+
+    private static func validSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy { character in
+            guard let ascii = character.asciiValue else { return false }
+            return (0x30...0x39).contains(ascii) || (0x61...0x66).contains(ascii)
+        }
+    }
+}
+
+public protocol ReleaseUpdateStaging: Sendable {
+    func stage(
+        selection: ReleaseUpdateCheckResult,
+        currentVersion: String,
+        publicKeyURL: URL
+    ) async throws -> ReleaseUpdateStageReceipt
+}
+
+public struct ProcessReleaseUpdateStager: ReleaseUpdateStaging, Sendable {
+    public let executableURL: URL
+    public let executionPolicy: RelayctlExecutionPolicy
+
+    public init(
+        executableURL: URL = RelayctlHelperLocation.resolve(),
+        executionPolicy: RelayctlExecutionPolicy = RelayctlExecutionPolicy(
+            timeout: 300,
+            terminationGracePeriod: 0.5,
+            maximumOutputBytes: 64 * 1024
+        )
+    ) {
+        self.executableURL = executableURL
+        self.executionPolicy = executionPolicy
+    }
+
+    public func stage(
+        selection: ReleaseUpdateCheckResult,
+        currentVersion: String,
+        publicKeyURL: URL
+    ) async throws -> ReleaseUpdateStageReceipt {
+        guard selection.status == .updateAvailable,
+              selection.currentVersion == currentVersion,
+              let releaseID = selection.releaseID,
+              let tag = selection.tag,
+              let manifestSHA256 = selection.manifestSHA256,
+              selection.minimumUpdaterVersion != nil,
+              selection.minimumMacOSVersion != nil,
+              selection.trustKeyID != nil,
+              StrictReleaseVersion(currentVersion) != nil,
+              publicKeyURL.isFileURL,
+              publicKeyURL.path.hasPrefix("/") else {
+            throw ReleaseUpdateContractError.invalidRequest
+        }
+        guard executableURL.isFileURL,
+              FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw RelayctlError.helperUnavailable
+        }
+        let operation = RelayctlProcessOperation(
+            executableURL: executableURL,
+            arguments: [
+                "release", "stage",
+                "--channel", selection.channel.rawValue,
+                "--current-version", currentVersion,
+                "--release-id", String(releaseID),
+                "--tag", tag,
+                "--expected-manifest-sha256", manifestSHA256,
+                "--public-key", publicKeyURL.path,
+                "--json",
+            ],
+            policy: executionPolicy
+        )
+        let result = try await withTaskCancellationHandler {
+            try await Task.detached(priority: .utility) { try operation.run() }.value
+        } onCancel: {
+            operation.cancel()
+        }
+        if Task.isCancelled { throw RelayctlError.cancelled }
+        guard result.exitCode == 0 else {
+            if let envelope = try? JSONDecoder().decode(
+                RelayctlOperationErrorEnvelope.self,
+                from: result.stdout
+            ), let code = envelope.reportedCode() {
+                throw RelayctlError.reported(code)
+            }
+            throw RelayctlError.invocationFailed(exitCode: result.exitCode)
+        }
+        return try ReleaseUpdateStageReceipt.decodeStrict(result.stdout).validated(for: selection)
     }
 }
 

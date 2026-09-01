@@ -75,6 +75,8 @@ shift
 require_version "$version"
 release_is_prerelease=false
 [[ "$version" != *-* ]] || release_is_prerelease=true
+release_channel="stable"
+[[ "$release_is_prerelease" == false ]] || release_channel="preview"
 
 repo=""
 input_dir=""
@@ -154,12 +156,19 @@ decode_base64 "$signature" "$signature_binary"
 openssl pkeyutl -verify -pubin -inkey "$public_key" -rawin \
   -in "$manifest" -sigfile "$signature_binary" >/dev/null || \
   die 'release manifest signature is invalid'
-jq -e --arg version "$version" '
+public_key_der="${tmp}/release-public-key.der"
+openssl pkey -pubin -in "$public_key" -outform DER > "$public_key_der"
+expected_trust_key_id="$(sha256 "$public_key_der")"
+jq -e --arg version "$version" --arg channel "$release_channel" \
+  --arg trust_key_id "$expected_trust_key_id" '
   .version == $version
-  and .compatibility_revision == 4
+  and .compatibility_revision == 5
   and (.artifacts | type == "array" and length == 5)
-  and (keys | sort == ["artifacts", "compatibility_revision", "documents", "version"])
-' "$manifest" >/dev/null || die 'release manifest is not a complete revision 4 artifact set'
+  and .channel == $channel
+  and .minimum_updater_version == "0.3.8-rc.6"
+  and .trust_key_id == $trust_key_id
+  and (keys | sort == ["artifacts", "channel", "compatibility_revision", "documents", "minimum_updater_version", "trust_key_id", "version"])
+' "$manifest" >/dev/null || die 'release manifest is not a complete revision 5 artifact set'
 
 manifest_artifact_matches() {
   local os="$1"
@@ -188,7 +197,10 @@ jq -e '
   [.artifacts[] | select(.component == "macos_menu_bar_bundle")]
   | length == 1 and .[0].bundle_id == "io.github.novelkr.opencodex-relay"
   and .[0].signing_mode == "adhoc"
-  and (.[0] | keys | sort == ["arch", "bundle_id", "component", "file", "os", "sha256", "signing_mode", "url"])
+  and .[0].minimum_macos_version == "26.0"
+  and .[0].integration_protocol == 1
+  and .[0].helper_protocol == 1
+  and (.[0] | keys | sort == ["arch", "bundle_id", "component", "file", "helper_protocol", "integration_protocol", "minimum_macos_version", "os", "sha256", "signing_mode", "url"])
 ' "$manifest" >/dev/null || die 'manifest macOS bundle signing metadata is invalid'
 
 verify_local_artifact_hash() {
@@ -324,7 +336,7 @@ Linux installations need both the relay daemon and the matching `relayctl` contr
 
 ## Security and verification
 
-Public GitHub Actions built and independently verified all eight release assets before publication. The signed revision 4 manifest binds every downloadable runtime artifact and `THIRD_PARTY_NOTICES.md` to its SHA-256 digest. Verify the manifest with the tracked [v2 Ed25519 public key](https://github.com/__REPOSITORY__/blob/__VERSION__/config/trust/opencodex-relay-release-ed25519.pub).
+Public GitHub Actions built and independently verified all eight release assets before publication. The signed revision 5 manifest binds the update channel, minimum updater and macOS compatibility, integration/helper protocols, every downloadable runtime artifact, and `THIRD_PARTY_NOTICES.md`. Verify the manifest with the tracked [v2 Ed25519 public key](https://github.com/__REPOSITORY__/blob/__VERSION__/config/trust/opencodex-relay-release-ed25519.pub).
 
 Each asset also has GitHub build provenance bound to this tag:
 

@@ -1,5 +1,87 @@
+import AppKit
+import CoreServices
 import Foundation
 import OpenCodexRelayCore
+
+enum ReleaseUpdateStageState: Equatable, Sendable {
+    case idle
+    case staging
+    case ready
+    case preparingFinderHandoff
+    case awaitingQuit
+    case failed
+}
+
+protocol ReleaseUpdateQuarantining: Sendable {
+    func applyAndVerify(
+        stagedApplicationURL: URL,
+        selection: ReleaseUpdateCheckResult
+    ) throws
+}
+
+struct SystemReleaseUpdateQuarantine: ReleaseUpdateQuarantining, @unchecked Sendable {
+    func applyAndVerify(
+        stagedApplicationURL: URL,
+        selection: ReleaseUpdateCheckResult
+    ) throws {
+        guard let tag = selection.tag,
+              let releaseURL = selection.canonicalReleaseURL,
+              let dataURL = URL(
+                string: "https://github.com/novelKR/OpenCodex-OCI-Gateway/releases/download/\(tag)/OpenCodexRelay.app.zip"
+              ) else {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+        let typeKey = kLSQuarantineTypeKey as String
+        let agentKey = kLSQuarantineAgentNameKey as String
+        let agentBundleKey = kLSQuarantineAgentBundleIdentifierKey as String
+        let originKey = kLSQuarantineOriginURLKey as String
+        let dataKey = kLSQuarantineDataURLKey as String
+        let timestampKey = kLSQuarantineTimeStampKey as String
+        let expected: [String: Any] = [
+            typeKey: kLSQuarantineTypeWebDownload as String,
+            agentKey: "OpenCodexRelay",
+            agentBundleKey: "io.github.novelkr.opencodex-relay",
+            originKey: releaseURL,
+            dataKey: dataURL,
+            timestampKey: Date(),
+        ]
+        var values = URLResourceValues()
+        values.quarantineProperties = expected
+        var mutableURL = stagedApplicationURL
+        try mutableURL.setResourceValues(values)
+        let readBack = try stagedApplicationURL.resourceValues(
+            forKeys: [.quarantinePropertiesKey]
+        ).quarantineProperties
+        guard let readBack,
+              readBack[typeKey] as? String == kLSQuarantineTypeWebDownload as String,
+              readBack[agentKey] as? String == "OpenCodexRelay",
+              readBack[agentBundleKey] as? String == "io.github.novelkr.opencodex-relay",
+              readBack[timestampKey] is Date,
+              let eventIdentifier = readBack["LSQuarantineEventIdentifier"] as? String,
+              !eventIdentifier.isEmpty,
+              eventIdentifier.count <= 128,
+              readBack["LSQuarantineIsOwnedByCurrentUser"] as? Bool == true else {
+            throw ReleaseUpdateContractError.invalidStage
+        }
+    }
+}
+
+@MainActor
+protocol ReleaseUpdateFinderHandingOff: AnyObject {
+    func reveal(_ applicationURL: URL)
+    func terminateCurrentApplication()
+}
+
+@MainActor
+final class SystemReleaseUpdateFinderHandoff: ReleaseUpdateFinderHandingOff {
+    func reveal(_ applicationURL: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([applicationURL])
+    }
+
+    func terminateCurrentApplication() {
+        NSApplication.shared.terminate(nil)
+    }
+}
 
 @MainActor
 final class ReleaseUpdateController: ObservableObject {
@@ -15,6 +97,8 @@ final class ReleaseUpdateController: ObservableObject {
     @Published private(set) var releaseURL: URL?
     @Published private(set) var isChecking = false
     @Published private(set) var lastCheckFailed = false
+    @Published private(set) var stageState: ReleaseUpdateStageState = .idle
+    @Published private(set) var stagedApplicationURL: URL?
 
     private enum DefaultsKey {
         static let channel = "release_update.channel"
@@ -27,6 +111,9 @@ final class ReleaseUpdateController: ObservableObject {
     }
 
     private let checker: any ReleaseUpdateChecking
+    private let stager: any ReleaseUpdateStaging
+    private let quarantine: any ReleaseUpdateQuarantining
+    private let finderHandoff: any ReleaseUpdateFinderHandingOff
     private let distributionFlavor: DistributionFlavor
     private let currentVersion: String
     private let publicKeyURL: URL
@@ -34,11 +121,16 @@ final class ReleaseUpdateController: ObservableObject {
     private let now: @Sendable () -> Date
     private let jitter: @Sendable () -> TimeInterval
     private var dismissedCandidateVersion: String?
+    private var candidateSelection: ReleaseUpdateCheckResult?
+    private var stagedReceipt: ReleaseUpdateStageReceipt?
     private var scheduledCheck: Task<Void, Never>?
     private var started = false
 
     init(
         checker: any ReleaseUpdateChecking = ProcessReleaseUpdateChecker(),
+        stager: any ReleaseUpdateStaging = ProcessReleaseUpdateStager(),
+        quarantine: any ReleaseUpdateQuarantining = SystemReleaseUpdateQuarantine(),
+        finderHandoff: any ReleaseUpdateFinderHandingOff = SystemReleaseUpdateFinderHandoff(),
         distributionFlavor: DistributionFlavor = .current,
         currentVersion: String = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
@@ -51,6 +143,9 @@ final class ReleaseUpdateController: ObservableObject {
         }
     ) {
         self.checker = checker
+        self.stager = stager
+        self.quarantine = quarantine
+        self.finderHandoff = finderHandoff
         self.distributionFlavor = distributionFlavor
         self.currentVersion = currentVersion
         self.publicKeyURL = publicKeyURL
@@ -100,6 +195,11 @@ final class ReleaseUpdateController: ObservableObject {
         distributionFlavor == .production && automaticChecksEnabled
     }
 
+    var canDownloadUpdate: Bool {
+        distributionFlavor == .production && status == .updateAvailable &&
+            candidateSelection != nil && (stageState == .idle || stageState == .failed)
+    }
+
     func start() {
         guard !started else { return }
         started = true
@@ -127,6 +227,69 @@ final class ReleaseUpdateController: ObservableObject {
 
     func checkNow() {
         Task { await performCheck(manual: true) }
+    }
+
+    func downloadUpdate() {
+        Task { await performStage() }
+    }
+
+    func performStage() async {
+        guard canDownloadUpdate, let selection = candidateSelection else { return }
+        stageState = .staging
+        stagedApplicationURL = nil
+        stagedReceipt = nil
+        do {
+            let receipt = try await stager.stage(
+                selection: selection,
+                currentVersion: currentVersion,
+                publicKeyURL: publicKeyURL
+            )
+            guard candidateSelection == selection, stageState == .staging else { return }
+            stagedReceipt = receipt
+            stagedApplicationURL = receipt.stagedApplicationURL
+            stageState = .ready
+        } catch {
+            if candidateSelection == selection, stageState == .staging {
+                stageState = .failed
+            }
+        }
+    }
+
+    func prepareFinderHandoff() {
+        Task { await performFinderHandoff() }
+    }
+
+    func performFinderHandoff() async {
+        guard stageState == .ready,
+              let selection = candidateSelection,
+              stagedReceipt != nil else { return }
+        stageState = .preparingFinderHandoff
+        do {
+            let reverified = try await stager.stage(
+                selection: selection,
+                currentVersion: currentVersion,
+                publicKeyURL: publicKeyURL
+            )
+            guard candidateSelection == selection,
+                  stageState == .preparingFinderHandoff else { return }
+            try quarantine.applyAndVerify(
+                stagedApplicationURL: reverified.stagedApplicationURL,
+                selection: selection
+            )
+            stagedReceipt = reverified
+            stagedApplicationURL = reverified.stagedApplicationURL
+            finderHandoff.reveal(reverified.stagedApplicationURL)
+            stageState = .awaitingQuit
+        } catch {
+            if candidateSelection == selection, stageState == .preparingFinderHandoff {
+                stageState = .failed
+            }
+        }
+    }
+
+    func confirmQuitForFinderInstall() {
+        guard stageState == .awaitingQuit else { return }
+        finderHandoff.terminateCurrentApplication()
     }
 
     func performCheck(manual: Bool) async {
@@ -187,10 +350,17 @@ final class ReleaseUpdateController: ObservableObject {
 
     private func apply(_ result: ReleaseUpdateCheckResult) {
         let previousCandidate = candidateVersion
+        let previousManifest = candidateSelection?.manifestSHA256
         status = result.status
         lastCheckedAt = ISO8601DateFormatter().date(from: result.checkedAt) ?? now()
         candidateVersion = result.candidateVersion
         releaseURL = result.canonicalReleaseURL
+        candidateSelection = result.status == .updateAvailable && result.trustKeyID != nil
+            ? result
+            : nil
+        if candidateVersion != previousCandidate || result.manifestSHA256 != previousManifest {
+            clearStagedUpdate()
+        }
         if candidateVersion != previousCandidate {
             dismissedCandidateVersion = nil
             defaults.removeObject(forKey: DefaultsKey.dismissedCandidateVersion)
@@ -210,9 +380,17 @@ final class ReleaseUpdateController: ObservableObject {
         candidateVersion = nil
         releaseURL = nil
         dismissedCandidateVersion = nil
+        candidateSelection = nil
+        clearStagedUpdate()
         defaults.removeObject(forKey: DefaultsKey.candidateVersion)
         defaults.removeObject(forKey: DefaultsKey.releaseURL)
         defaults.removeObject(forKey: DefaultsKey.dismissedCandidateVersion)
+    }
+
+    private func clearStagedUpdate() {
+        stageState = .idle
+        stagedApplicationURL = nil
+        stagedReceipt = nil
     }
 
     private func rescheduleAutomaticCheck() {

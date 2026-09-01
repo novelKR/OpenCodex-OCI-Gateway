@@ -49,6 +49,7 @@ type checkFixture struct {
 	manifest       []byte
 	signature      []byte
 	publicKey      []byte
+	privateKey     ed25519.PrivateKey
 	assets         []githubAsset
 	release        githubRelease
 	listStatus     int
@@ -135,6 +136,7 @@ func newCheckFixture(t *testing.T, tag string, revision int) *checkFixture {
 		manifest:       manifestBytes,
 		signature:      signature,
 		publicKey:      key,
+		privateKey:     private,
 		assets:         assets,
 		release:        release,
 		listStatus:     http.StatusOK,

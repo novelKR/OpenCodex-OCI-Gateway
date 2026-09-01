@@ -154,6 +154,8 @@ class PublicCorePublicationTests(unittest.TestCase):
         self.assertNotIn("gh api --paginate --slurp", workflow)
         self.assertIn("--previous-build-number", workflow)
         self.assertIn("client/relay/RELEASE_BUILD_NUMBER", workflow)
+        self.assertIn("no tracked numeric previous build numbers", workflow)
+        self.assertIn(r'[1-9][0-9]{0,3}', workflow)
         self.assertIn("ReleaseTrust/opencodex-relay-release-ed25519.pub", workflow)
         self.assertIn("publish-github-release.sh \"$version\"", workflow)
         self.assertIn(

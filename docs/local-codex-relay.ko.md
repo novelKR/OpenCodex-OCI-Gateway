@@ -202,15 +202,17 @@ https://REPLACE_WITH_RELEASE_HOST/opencodex-relay/REPLACE_WITH_VERSION/
 ```
 
 private key는 저장소·release server·client에 배포하지 않습니다. trusted public PEM은
-release URL과 독립된 검토 경로로 client에 전달합니다. revision 4 manifest는 component,
-macOS bundle ID, `signing_mode: "adhoc"`, app zip hash, notice URL/SHA-256를 함께
-서명합니다. installer는 Ed25519 manifest signature, 모든 asset SHA-256, zip shape,
+release URL과 독립된 검토 경로로 client에 전달합니다. `0.3.8-rc.6` bootstrap은 revision 4를
+사용합니다. `0.3.8-rc.7`부터 revision 5가 channel, minimum updater/macOS version, trust key
+ID 및 integration/helper protocol을 추가로 결합합니다. 두 revision 모두 component, macOS
+bundle ID, `signing_mode: "adhoc"`, app ZIP hash, notice URL/SHA-256를 함께 서명합니다.
+installer는 Ed25519 manifest signature, 모든 asset SHA-256, zip shape,
 nested ad-hoc signature, Hardened Runtime 및 Relay Team ID 부재를 확인한 뒤 app 내부
 helper를 `current`로 선택합니다. notarization 도구를 호출하지 않으며 최초 Gatekeeper 차단을
-설치 transaction 실패로 처리하지 않습니다. revision 4는 권한 helper와 generic
+설치 transaction 실패로 처리하지 않습니다. 지원 manifest는 권한 helper와 generic
 `OpenCodexRelayHelperInstaller`를 포함하고, 별도 관리자 승인을 받은 `install` 또는 `update`가
 고정 LaunchDaemon을 생성하며 app·installer·helper exact CDHash를 결합합니다. Linux에서는
-선택한 relay/relayctl과 notice의 SHA-256을 확인합니다. revision 4 앱을 교체·제거하기 전에는
+선택한 relay/relayctl과 notice의 SHA-256을 확인합니다. 앱을 교체·제거하기 전에는
 기존 guard 상태를 경로·mode 없이 조회합니다. busy 또는 recovery-required 저널이면 교체를
 차단하고, ready 또는 approval-pending이면 먼저 unregister하며 transaction rollback 시 이전
 등록을 복원합니다. 기존 revision 1/2 release는 rollback용으로 계속 지원하지만 parked
@@ -238,6 +240,17 @@ pagination, strict SemVer channel 선택, owner-only ETag cache와 exact-release
 자동 확인은 production에서 기본으로 켜지지만 local development에서는 network boundary에서
 금지됩니다. 이 release는 어떤 항목도 download, stage, replace, relaunch 또는 restart하지
 않습니다.
+
+`0.3.8-rc.7`은 publication을 revision 5와 build `1001`로 전환합니다. production 사용자가
+명시적으로 선택한 update만 `release stage`로 download·verify합니다. helper는 exact immutable
+release를 다시 조회하고 signature, app digest, 안전한 ZIP shape, production bundle identity,
+더 큰 build, arm64 executable 집합, nested ad-hoc signature, Team ID 부재, Hardened Runtime,
+helper CDHash binding과 embedded tracked key를 재검증합니다. staging은 current-user 전용이며
+lock과 release ID/manifest digest에 결합된 strict receipt를 사용합니다. 앱은 receipt와 bundle을
+다시 검증하고 Foundation quarantine을 적용·read-back한 뒤 Finder에 표시합니다. 별도 확인
+후에만 종료하며, 사용자가 Applications copy를 직접 교체하고 수동으로 엽니다. 앱은 quarantine을
+제거하거나 Gatekeeper를 우회하거나 self-relocation update를 수행하거나 atomic app rollback을
+보장하지 않습니다. privileged Helper lifecycle은 별도 관리자 승인으로 남습니다.
 
 ### public GitHub Release 배포 채널
 
@@ -478,7 +491,7 @@ revision 4에서는 제거된 `codex_routing=true` shorthand 대신 `mode status
 
 ### 4. Native 전환과 Connection Status Center
 
-macOS 26+ Apple Silicon revision 4 설치는 Hardened Runtime을 적용한 ad-hoc
+macOS 26+ Apple Silicon의 지원 release manifest는 Hardened Runtime을 적용한 ad-hoc
 `~/Applications/OpenCodexRelay.app` link를 만들며 설치 중 앱을 실행하거나 login item 성공을
 요구하지 않습니다. MenuBar app은
 reviewed bundle ID, strict code-signature signed identifier, exact 10자 대문자 Apple Team ID가
@@ -499,7 +512,8 @@ Relay 앱은 공증하지 않으므로 Finder에서 한 번 여십시오. macOS�
 **시스템 설정 → 개인정보 보호 및 보안**에서 OpenCodexRelay의 **확인 없이 열기(Open
 Anyway)**를 선택하고 다시 **열기**를 확인합니다. 버튼은 차단된 실행 뒤 보통 약 1시간 동안
 표시되며 update 뒤 같은 승인이 다시 필요할 수 있습니다. quarantine attribute 삭제나
-Gatekeeper 비활성화는 하지 않습니다. helper의 관리자 prompt는 별도 승인입니다.
+Gatekeeper 비활성화는 하지 않습니다. staged update는 Finder handoff를 사용하고 새 앱이
+정상 실행될 때까지 이전 앱을 수동 보관합니다. helper의 관리자 prompt는 별도 승인입니다.
 `login_registration=pending`은 macOS Login Items 승인이 아직 필요하다는 뜻이므로, 승인 뒤 app을
 다시 열거나 상태를 다시 확인합니다.
 

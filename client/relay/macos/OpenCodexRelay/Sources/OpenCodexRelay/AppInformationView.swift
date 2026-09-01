@@ -9,6 +9,7 @@ struct AppInformationView: View {
     let localizer: AppLocalizer
     private let reader: AppInformationReader
     @State private var information: AppInformationSnapshot
+    @State private var showsUpdateQuitConfirmation = false
 
     init(
         model: MenuBarModel,
@@ -193,10 +194,76 @@ struct AppInformationView: View {
                             updates.dismissBadge()
                         }
                     }
+
+                    if updates.canDownloadUpdate {
+                        Button {
+                            updates.downloadUpdate()
+                        } label: {
+                            Label(localizer.text(.updateDownload), systemImage: "arrow.down.circle")
+                        }
+                        .accessibilityHint(localizer.text(.updateDownloadHint))
+                    }
+
+                    if updates.stageState == .ready {
+                        Button {
+                            updates.prepareFinderHandoff()
+                        } label: {
+                            Label(localizer.text(.updateRevealInFinder), systemImage: "folder")
+                        }
+                        .accessibilityHint(localizer.text(.updateRevealInFinderHint))
+                    }
+
+                    if updates.stageState == .awaitingQuit {
+                        Button(role: .destructive) {
+                            showsUpdateQuitConfirmation = true
+                        } label: {
+                            Label(localizer.text(.updateQuitForInstall), systemImage: "power")
+                        }
+                    }
+                }
+
+                if updates.stageState == .staging || updates.stageState == .preparingFinderHandoff {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(
+                            updates.stageState == .staging
+                                ? localizer.text(.updateStageDownloading)
+                                : localizer.text(.updateStageRevalidating)
+                        )
+                    }
+                    .foregroundStyle(.secondary)
+                } else if updates.stageState == .ready {
+                    ControlCenterSupportingText(
+                        localizer.text(.updateStageReady),
+                        systemImage: "checkmark.shield"
+                    )
+                } else if updates.stageState == .awaitingQuit {
+                    ControlCenterSupportingText(
+                        localizer.text(.updateFinderHandoffReady),
+                        systemImage: "folder.badge.gearshape"
+                    )
+                } else if updates.stageState == .failed {
+                    ControlCenterSupportingText(
+                        localizer.text(.updateStageFailed),
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 4)
+        }
+        .confirmationDialog(
+            localizer.text(.updateQuitConfirmationTitle),
+            isPresented: $showsUpdateQuitConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(localizer.text(.updateQuitConfirmationAction), role: .destructive) {
+                updates.confirmQuitForFinderInstall()
+            }
+            Button(localizer.text(.updateQuitConfirmationCancel), role: .cancel) {}
+        } message: {
+            Text(localizer.text(.updateQuitConfirmationDetail))
         }
     }
 

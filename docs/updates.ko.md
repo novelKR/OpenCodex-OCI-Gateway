@@ -45,14 +45,16 @@ private signing key는 보호된 `relay-release` GitHub Environment에 두고 bu
 노출합니다. 다섯 component, `THIRD_PARTY_NOTICES.md`, manifest와 signature를 총 8개
 immutable asset으로 함께 publish하고, 각 client는
 `current`를 바꾸기 전에 manifest signature, 선택 component checksum, signed notice checksum을
-모두 검증합니다. revision 1/2는 rollback artifact로 남지만 새 build는
-`signing_mode: "adhoc"`을 포함하는 component-aware compatibility revision 4를 사용합니다.
+모두 검증합니다. revision 1/2는 rollback artifact로 남습니다. updater bootstrap인
+`0.3.8-rc.6`은 `signing_mode: "adhoc"`을 포함하는 component-aware compatibility
+revision 4를 사용하고, `0.3.8-rc.7` 이후 updater release는 revision 5를 사용합니다.
 배포 app은 tracked release public key를 포함하며, `CFBundleVersion`은
 `client/relay/RELEASE_BUILD_NUMBER`의 단조 증가 정수입니다. stable은 GitHub latest이고
 preview prerelease는 latest가 아니며, API 표시 순서는 버전 순서로 사용하지 않습니다.
 revision 5 verifier는 M0부터 호환되지만 첫 updater bootstrap인 `0.3.8-rc.6`은 revision 4로
-게시하고 기존 사용자는 이를 수동 설치해야 합니다. 이후 release부터 signed update
-compatibility metadata를 사용합니다. updater는 bounded pagination 결과를 strict SemVer로
+게시하고 기존 사용자는 이를 수동 설치해야 합니다. revision 5는 channel, minimum updater
+version, trust-key ID, minimum macOS version 및 integration/helper protocol을 서명합니다.
+updater는 bounded pagination 결과를 strict SemVer로
 비교하며, stable channel은 non-prerelease만, preview channel은 stable과 prerelease를 함께
 고려해 최댓값을 고릅니다. 어느 channel도 현재 버전보다 낮은 release를 선택하지 않습니다.
 
@@ -61,8 +63,8 @@ compatibility metadata를 사용합니다. updater는 bounded pagination 결과�
 기본으로 켜져 있고 앱 실행 5–15분 사이의 무작위 지연 후 시작해 이후 최대 24시간마다
 실행하며 설정에서 끌 수 있습니다. local-development bundle은 자동 update network request를
 절대 만들지 않습니다. **업데이트 확인…**은 bounded ETag cache를 재사용하면서 항상 즉시
-수동 확인합니다. 이 milestone에서는 Notification Center 권한을 요청하지 않으며 update를
-다운로드하거나 설치하지 않습니다.
+수동 확인합니다. Notification Center 권한은 요청하지 않습니다. `0.3.8-rc.6` bootstrap은
+알림 전용입니다.
 
 bundle에 포함된 control helper도 같은 read-only 결과를 schema-versioned JSON으로 제공합니다.
 production에서는 GitHub API와 repository가 고정되며 repository/API override는 의도적으로
@@ -84,6 +86,51 @@ unsafe local trust-key path 및 invalid local JSON contract는 명령 실패입�
 release, 8개 asset 집합, manifest signature 및 signed app ZIP digest를 모두 검증하기 전에는
 candidate metadata를 신뢰하지 않습니다. release note는 canonical GitHub tag URL만 외부
 browser에서 열고 app 내부에서 release-body HTML을 렌더링하지 않습니다.
+
+`0.3.8-rc.7`(`CFBundleVersion=1001`)부터 사용자가 **다운로드 및 검증**을 선택한 경우에만
+다운로드를 시작합니다. bundle의 control helper는 앞선 check 결과를 그대로 신뢰하지 않고
+exact immutable release를 다시 조회해 signed revision 5 manifest와 app digest를 다시
+검증하며, 현재 버전보다 새 버전이 아니면 거부합니다. 검증한 app만 current-user 전용
+`~/Library/Application Support/OpenCodexRelay/Updates` root에 stage합니다. release ID와
+manifest digest가 staging directory를 식별하고 exclusive lock으로 동시 stage를 막습니다.
+strict schema-version-1 receipt는 release, channel, app digest, bundle fingerprint, trust key와
+검증된 path를 묶습니다.
+
+archive 상한은 128 MiB입니다. 압축을 풀기 전에 absolute/parent-traversal path, 빈 path
+component, duplicate와 대소문자 충돌, link와 non-regular file, multiple root, path length·file
+count·expanded size·compression ratio 상한 초과를 거부합니다. 압축 해제 후에는 exact
+production bundle ID, version, 더 큰 숫자 build, arm64 executable 집합, nested ad-hoc
+signature, Team ID 부재, Hardened Runtime, helper CDHash binding과 byte-identical embedded
+trust key를 검증합니다. Finder handoff 직전 receipt와 staged app을 다시 검증합니다.
+
+공개 CLI 명령은 `release check`가 반환한 exact 값을 사용합니다.
+
+```bash
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  release stage \
+  --channel preview \
+  --current-version 0.3.8-rc.7 \
+  --release-id REPLACE_WITH_RELEASE_ID \
+  --tag REPLACE_WITH_EXACT_TAG \
+  --expected-manifest-sha256 REPLACE_WITH_MANIFEST_SHA256 \
+  --public-key /Applications/OpenCodexRelay.app/Contents/Resources/ReleaseTrust/opencodex-relay-release-ed25519.pub \
+  --json
+```
+
+설치는 Finder가 관리하고 사용자가 승인합니다. 앱은 Foundation quarantine metadata를 staged
+bundle에 적용하고 read-back한 뒤 Finder에서 표시하며, 별도 **앱 종료** 확인을 제공합니다.
+quarantine을 제거하거나 `spctl`을 호출하거나 `/Applications` 위에 직접 복사하거나 스스로
+재실행하지 않으며, atomic app rollback을 보장한다고 주장하지 않습니다. 앱 종료 후 사용자가
+Applications에 직접 복사·교체하고 그 exact copy를 수동으로 엽니다. macOS가 요구하면
+**확인 없이 열기**도 사용자가 수행합니다. 새 앱의 정상 실행을 확인할 때까지 이전 앱을
+수동으로 보관합니다.
+
+이 Finder handoff는 최초 설치용 relocation card와 의도적으로 분리됩니다. ad-hoc app은
+Gatekeeper 승인 전에 App Translocation에서 실행되어 최종 Applications path에서 실행되지
+않을 수 있으므로, update flow는 self-relocation을 install transaction으로 사용하지 않습니다.
+lifecycle busy 또는 기존 recovery journal이 있으면 현재 app과 resident Relay를 바꾸지 않고
+stage/handoff를 막습니다. privileged Helper는 이 flow에서 절대 교체하지 않습니다. version
+mismatch는 계속 `manual_update_required`이며 별도 관리자 승인이 필요합니다.
 
 ### public GitHub Release를 사용하는 경우
 

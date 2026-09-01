@@ -690,7 +690,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", service)
         self.assertIn("--github-repo OWNER/REPO", builder)
         self.assertIn("github_release_repo", builder)
-        self.assertIn("--previous-build-number NUMERIC_VERSION", builder)
+        self.assertIn("--previous-build-number NUMERIC_BUILD", builder)
         self.assertIn("RELEASE_BUILD_NUMBER", builder)
         self.assertIn("Contents/Resources/ReleaseTrust", builder)
         self.assertIn("bundled release public key bytes differ", builder)
@@ -742,7 +742,10 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertLess(publisher.index("verify_release_assets true"), publisher.index("--draft=false"))
         self.assertLess(publisher.index("verify_release_body"), publisher.index("--draft=false"))
         self.assertIn('verify_release_assets false', publisher)
-        self.assertIn('"compatibility_revision":4', builder)
+        self.assertIn('"compatibility_revision":5', builder)
+        self.assertIn(r'\"minimum_macos_version\":\"${MINIMUM_MACOS_VERSION}\"', builder)
+        self.assertIn('"minimum_updater_version":"%s"', builder)
+        self.assertIn('"trust_key_id":"%s"', builder)
         self.assertIn(r'\"signing_mode\":\"adhoc\"', builder)
         self.assertNotIn("--apple-signing-identity", builder)
         self.assertNotIn("--apple-team-id", builder)
@@ -854,7 +857,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertNotEqual(unsafe_token.returncode, 0)
         self.assertIn("mode 0600", unsafe_token.stderr)
 
-    def test_release_builder_signs_full_third_party_notice_as_ninth_asset(self) -> None:
+    def test_release_builder_signs_full_third_party_notice_in_exact_asset_set(self) -> None:
         notice_path = RELAY / "THIRD_PARTY_NOTICES.md"
         notice = notice_path.read_text(encoding="utf-8")
         embedded_license = notice.split("```text\n", 1)[1].split("\n```\n", 1)[0] + "\n"
@@ -965,6 +968,23 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 )
                 self.assertNotEqual(invalid_build_number.returncode, 0)
                 self.assertIn("one integer from 1 through 9999", invalid_build_number.stderr)
+            for invalid_previous in ("0", "10000", "0.3.8", "0100", "build"):
+                invalid_previous_build = subprocess.run(
+                    [
+                        "python3",
+                        str(validator),
+                        str(RELAY / "RELEASE_BUILD_NUMBER"),
+                        invalid_previous,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(invalid_previous_build.returncode, 0)
+                self.assertIn(
+                    "previous public CFBundleVersion is invalid",
+                    invalid_previous_build.stderr,
+                )
             build_prefix = [
                 "bash",
                 str(RELAY / "scripts" / "build-release.sh"),
@@ -1000,7 +1020,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 [
                     *build_prefix,
                     "--previous-build-number",
-                    "0.3.8",
+                    "1000",
                     "--output",
                     str(output),
                 ],
@@ -1062,7 +1082,10 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             )
             manifest_path = output / "manifest-1.2.3.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["compatibility_revision"], 4)
+            self.assertEqual(manifest["compatibility_revision"], 5)
+            self.assertEqual(manifest["channel"], "stable")
+            self.assertEqual(manifest["minimum_updater_version"], "0.3.8-rc.6")
+            self.assertRegex(manifest["trust_key_id"], r"^[0-9a-f]{64}$")
             self.assertEqual(len(manifest["artifacts"]), 5)
             macos = next(
                 artifact
@@ -1070,6 +1093,9 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 if artifact["component"] == "macos_menu_bar_bundle"
             )
             self.assertEqual(macos["signing_mode"], "adhoc")
+            self.assertEqual(macos["minimum_macos_version"], "26.0")
+            self.assertEqual(macos["integration_protocol"], 1)
+            self.assertEqual(macos["helper_protocol"], 1)
             self.assertNotIn("team_id", macos)
             self.assertEqual(len(manifest["documents"]), 1)
             document = manifest["documents"][0]
@@ -1105,6 +1131,40 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(verified.returncode, 0, verified.stderr)
+
+            # This publisher unit uses an ephemeral signing key. Bind the
+            # fixture manifest to that key and re-sign it so revision 5 trust
+            # validation succeeds before exercising notice tampering. The
+            # production build itself remains bound to the tracked app key.
+            public_der = subprocess.run(
+                ["openssl", "pkey", "-pubin", "-in", str(public_key), "-outform", "DER"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            ephemeral_key_id = hashlib.sha256(public_der).hexdigest()
+            manifest_bytes = manifest_path.read_bytes()
+            tracked_key_id = manifest["trust_key_id"].encode("ascii")
+            self.assertEqual(manifest_bytes.count(tracked_key_id), 1)
+            manifest_path.write_bytes(manifest_bytes.replace(tracked_key_id, ephemeral_key_id.encode("ascii")))
+            subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-sign",
+                    "-inkey",
+                    str(private_key),
+                    "-rawin",
+                    "-in",
+                    str(manifest_path),
+                    "-out",
+                    str(signature_binary),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            (output / "manifest-1.2.3.sig").write_bytes(
+                base64.b64encode(signature_binary.read_bytes()) + b"\n"
+            )
 
             gh_state = root / "gh-state"
             gh_state.mkdir()
@@ -1368,6 +1428,7 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
                 shutil.copy2(artifact, prerelease_output / artifact.name)
             prerelease_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             prerelease_manifest["version"] = prerelease_version
+            prerelease_manifest["channel"] = "preview"
             for entry in [
                 *prerelease_manifest["artifacts"],
                 *prerelease_manifest["documents"],

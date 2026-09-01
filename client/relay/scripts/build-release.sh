@@ -23,19 +23,23 @@ readonly MACOS_GUARD_INSTALLER_NAME="OpenCodexRelayHelperInstaller"
 readonly TRUSTED_CODEX_BUNDLE_ID="com.openai.codex"
 readonly TRUSTED_CODEX_TEAM_ID="2DC432GLL2"
 readonly MACOS_LOCALIZATION_BUNDLE="OpenCodexRelay_OpenCodexRelayLocalization.bundle"
+readonly MINIMUM_UPDATER_VERSION="0.3.8-rc.6"
+readonly MINIMUM_MACOS_VERSION="26.0"
+readonly INTEGRATION_PROTOCOL="1"
+readonly HELPER_PROTOCOL="1"
 
 usage() {
   cat <<'USAGE'
 Usage:
   build-release.sh VERSION (--base-url HTTPS_URL | --github-repo OWNER/REPO) \\
     (--signing-key PEM | --signing-key-keychain-service SERVICE) \\
-    --previous-build-number NUMERIC_VERSION --output DIR
+    --previous-build-number NUMERIC_BUILD --output DIR
 
 Builds Linux amd64/arm64 relay and relayctl binaries plus a self-contained,
 ad-hoc-signed darwin/arm64 OpenCodexRelay.app.zip. The macOS bundle uses the
 Hardened Runtime, contains the two Go helpers, the manual privileged-helper
 installer, and the tracked release trust key, and is the only darwin artifact in
-revision 4. RELEASE_BUILD_NUMBER supplies the monotonically increasing numeric
+revision 5. RELEASE_BUILD_NUMBER supplies the monotonically increasing numeric
 CFBundleVersion. No Apple developer account or notarization credential is used.
 The Ed25519 private key remains an off-repository release-workstation input.
 USAGE
@@ -86,6 +90,8 @@ shift
 # Keep the full SemVer for the user-facing marketing version so prereleases remain
 # distinguishable while every distributed app gets a unique numeric build value.
 bundle_short_version="$version"
+release_channel="stable"
+[[ "$version" != *-* ]] || release_channel="preview"
 
 base_url=""
 github_repo=""
@@ -153,7 +159,7 @@ else
 fi
 require_ed25519_private_key "$signing_key"
 [[ -n "$output_dir" ]] || die '--output is required'
-[[ "$(uname -s)" == "Darwin" ]] || die 'revision 4 release builds require a macOS release workstation'
+[[ "$(uname -s)" == "Darwin" ]] || die 'revision 5 release builds require a macOS release workstation'
 command -v go >/dev/null || die 'Go toolchain is required'
 command -v swift >/dev/null || die 'Swift toolchain is required'
 command -v codesign >/dev/null || die 'codesign is required'
@@ -190,9 +196,13 @@ build_go_binary() {
   local goarch="$2"
   local command="$3"
   local destination="$4"
+  local ldflags="-s -w -X main.version=${version}"
+  if [[ "$command" == "opencodex-relayctl" ]]; then
+    ldflags+=" -X main.releaseBuildNumber=${bundle_build_version}"
+  fi
   (cd "$RELAY_ROOT" && \
     CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-      go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=${version}" \
+      go build -trimpath -buildvcs=false -ldflags "$ldflags" \
         -o "$destination" "./cmd/${command}")
   chmod 0755 "$destination"
 }
@@ -282,9 +292,9 @@ release_trust_key_id="$(sha256 "$trusted_public_der")"
 build_go_binary darwin arm64 opencodex-relay "${helpers_dir}/opencodex-relay"
 build_go_binary darwin arm64 opencodex-relayctl "${helpers_dir}/opencodex-relayctl"
 
-(cd "$MACOS_APP_ROOT" && MACOSX_DEPLOYMENT_TARGET=26.0 swift build -c release --arch arm64 --target OpenCodexRelayLocalization)
-(cd "$MACOS_APP_ROOT" && MACOSX_DEPLOYMENT_TARGET=26.0 swift build -c release --arch arm64)
-swift_bin_dir="$(cd "$MACOS_APP_ROOT" && MACOSX_DEPLOYMENT_TARGET=26.0 swift build -c release --arch arm64 --show-bin-path)"
+(cd "$MACOS_APP_ROOT" && MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS_VERSION" swift build -c release --arch arm64 --target OpenCodexRelayLocalization)
+(cd "$MACOS_APP_ROOT" && MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS_VERSION" swift build -c release --arch arm64)
+swift_bin_dir="$(cd "$MACOS_APP_ROOT" && MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS_VERSION" swift build -c release --arch arm64 --show-bin-path)"
 app_executable="${app_dir}/Contents/MacOS/OpenCodexRelay"
 guard_helper="${guard_helpers_dir}/${MACOS_GUARD_HELPER_NAME}"
 guard_installer="${helpers_dir}/${MACOS_GUARD_INSTALLER_NAME}"
@@ -354,7 +364,7 @@ ditto -c -k --keepParent "$app_dir" "$bundle_path"
 chmod 0644 "$bundle_path"
 bundle_hash="$(sha256 "$bundle_path")"
 bundle_url="${base_url%/}/${version}/${bundle_file}"
-append_artifact "{\"os\":\"darwin\",\"arch\":\"arm64\",\"component\":\"macos_menu_bar_bundle\",\"file\":\"${bundle_file}\",\"url\":\"${bundle_url}\",\"sha256\":\"${bundle_hash}\",\"bundle_id\":\"${MACOS_BUNDLE_ID}\",\"signing_mode\":\"adhoc\"}"
+append_artifact "{\"os\":\"darwin\",\"arch\":\"arm64\",\"component\":\"macos_menu_bar_bundle\",\"file\":\"${bundle_file}\",\"url\":\"${bundle_url}\",\"sha256\":\"${bundle_hash}\",\"bundle_id\":\"${MACOS_BUNDLE_ID}\",\"signing_mode\":\"adhoc\",\"minimum_macos_version\":\"${MINIMUM_MACOS_VERSION}\",\"integration_protocol\":${INTEGRATION_PROTOCOL},\"helper_protocol\":${HELPER_PROTOCOL}}"
 
 notices="${output_dir}/${THIRD_PARTY_NOTICES_FILE}"
 install -m 0644 "$THIRD_PARTY_NOTICES_SOURCE" "$notices"
@@ -362,8 +372,9 @@ notices_hash="$(sha256 "$notices")"
 notices_url="${base_url%/}/${version}/${THIRD_PARTY_NOTICES_FILE}"
 manifest="${output_dir}/manifest-${version}.json"
 signature="${output_dir}/manifest-${version}.sig"
-printf '{"version":"%s","compatibility_revision":4,"artifacts":[%s],"documents":[{"file":"%s","url":"%s","sha256":"%s"}]}\n' \
-  "$version" "$artifact_json" "$THIRD_PARTY_NOTICES_FILE" "$notices_url" "$notices_hash" > "$manifest"
+printf '{"version":"%s","compatibility_revision":5,"artifacts":[%s],"documents":[{"file":"%s","url":"%s","sha256":"%s"}],"channel":"%s","minimum_updater_version":"%s","trust_key_id":"%s"}\n' \
+  "$version" "$artifact_json" "$THIRD_PARTY_NOTICES_FILE" "$notices_url" "$notices_hash" \
+  "$release_channel" "$MINIMUM_UPDATER_VERSION" "$release_trust_key_id" > "$manifest"
 openssl pkeyutl -sign -rawin -inkey "$signing_key" -in "$manifest" | base64 | tr -d '\n' > "$signature"
 printf '\n' >> "$signature"
 chmod 0644 "$manifest" "$signature"

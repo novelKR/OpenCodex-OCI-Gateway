@@ -51,15 +51,17 @@ workflow publishes the five components, `THIRD_PARTY_NOTICES.md`, manifest, and
 signature together as eight immutable assets. Each client verifies the manifest
 signature, selected component checksums, and signed notice checksum before it
 updates `current`.
-Revision 1 and 2 releases remain available for rollback; new builds use
-component-aware compatibility revision 4 with `signing_mode: "adhoc"`.
+Revision 1 and 2 releases remain available for rollback. The updater bootstrap
+`0.3.8-rc.6` uses component-aware compatibility revision 4 with
+`signing_mode: "adhoc"`; `0.3.8-rc.7` and later updater releases use revision 5.
 The distribution app embeds the tracked release public key and uses the
 monotonically increasing integer in `client/relay/RELEASE_BUILD_NUMBER` as its
 `CFBundleVersion`. Stable releases are GitHub latest; preview prereleases are
 not, and API display order is never used as version order. Revision 5 verifier
 support begins in M0, while the first updater bootstrap `0.3.8-rc.6` remains a
-revision 4 release that existing users must install manually. Later releases add
-signed update compatibility data. The updater compares bounded pagination
+revision 4 release that existing users must install manually. Revision 5 signs
+the channel, minimum updater version, trust-key ID, minimum macOS version, and
+integration/helper protocols. The updater compares bounded pagination
 results by strict SemVer: stable considers only non-prereleases, while preview
 considers both stable and prerelease versions and selects the maximum. Neither
 channel selects a version below the installed version.
@@ -71,7 +73,7 @@ with a randomized 5–15 minute launch delay, and then run at most once every 24
 hours. They can be disabled in Settings. Local-development bundles never make
 automatic update requests. **Check for Updates…** always performs an immediate
 check while reusing the bounded ETag cache. The app does not request Notification
-Center permission and does not download or install an update in this milestone.
+Center permission. The `0.3.8-rc.6` bootstrap is notification-only.
 
 The bundled control helper exposes the same read-only result as schema-versioned
 JSON. Production fixes both the GitHub API and repository; there is deliberately
@@ -95,6 +97,59 @@ command. Candidate metadata is not trusted until the exact immutable release,
 eight-asset set, manifest signature, and signed app ZIP digest all verify.
 Release notes are opened only as the canonical GitHub tag URL in the external
 browser; release-body HTML is never rendered in the app.
+
+Starting with `0.3.8-rc.7` (`CFBundleVersion=1001`), a download begins only
+after the user selects **Download and Verify**. The bundled control helper
+re-fetches the exact immutable release instead of trusting the earlier check
+result, verifies the signed revision 5 manifest and app digest again, rejects a
+non-newer candidate, and stages only the verified app under the owner-only
+`~/Library/Application Support/OpenCodexRelay/Updates` root. The release ID and
+manifest digest identify the staging directory; an exclusive lock prevents
+concurrent staging, and a strict schema-version-1 receipt binds the release,
+channel, app digest, bundle fingerprint, trust key, and verified path.
+
+The archive is limited to 128 MiB. Before extraction, the helper rejects
+absolute or parent-traversing paths, empty path components, duplicates and
+case-fold collisions, links and non-regular files, multiple roots, excessive
+path length or file count, oversized expansion, and excessive compression
+ratios. After extraction it verifies the exact production bundle ID, version,
+newer numeric build, arm64 executable set, nested ad-hoc signatures, absent Team
+ID, Hardened Runtime, helper CDHash binding, and byte-identical embedded trust
+key. It validates the receipt and staged app again immediately before Finder
+handoff.
+
+The equivalent public command consumes the exact values returned by `release
+check`:
+
+```bash
+/Applications/OpenCodexRelay.app/Contents/Library/Helpers/opencodex-relayctl \
+  release stage \
+  --channel preview \
+  --current-version 0.3.8-rc.7 \
+  --release-id REPLACE_WITH_RELEASE_ID \
+  --tag REPLACE_WITH_EXACT_TAG \
+  --expected-manifest-sha256 REPLACE_WITH_MANIFEST_SHA256 \
+  --public-key /Applications/OpenCodexRelay.app/Contents/Resources/ReleaseTrust/opencodex-relay-release-ed25519.pub \
+  --json
+```
+
+Installation remains Finder-managed and user-approved. The app applies
+Foundation quarantine metadata to the staged bundle, reads it back, reveals the
+bundle in Finder, and offers a separate **Quit App** confirmation. It does not
+remove quarantine, invoke `spctl`, copy over `/Applications`, relaunch itself,
+or claim an atomic application rollback. After the app quits, the user copies
+or replaces the app in Applications and opens that exact copy manually,
+including **Open Anyway** when macOS requires it. Keep a manual copy of the
+previous app until the replacement has launched successfully.
+
+This Finder handoff is deliberately separate from the first-install relocation
+card. An ad-hoc app launched under App Translocation may not run from its final
+Applications path before Gatekeeper approval, so the update flow never uses
+self-relocation as an installation transaction. A busy lifecycle or an existing
+recovery journal prevents update staging or handoff without mutating the current
+app or resident Relay. The privileged Helper is never replaced by this flow; a
+version mismatch remains `manual_update_required` and needs its own administrator
+approval.
 
 ### Public GitHub Release option
 
