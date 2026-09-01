@@ -201,7 +201,7 @@ public enum ReleaseUpdateContractError: Error, Equatable, Sendable {
     case invalidStage
 }
 
-private struct FlatJSONKeyScanner {
+struct FlatJSONKeyScanner {
     private let bytes: [UInt8]
     private var index = 0
 
@@ -557,7 +557,7 @@ public enum ReleaseUpdateTrustKeyLocation {
     }
 }
 
-private struct StrictReleaseVersion {
+struct StrictReleaseVersion {
     let isPrerelease: Bool
 
     init?(_ value: String) {

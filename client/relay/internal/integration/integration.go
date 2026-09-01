@@ -90,6 +90,7 @@ type Manager struct {
 	Runner         CommandRunner
 	ValidateBundle func(context.Context, Paths) error
 	VerifyHealth   func(context.Context, config.Config, routing.State) error
+	VerifyUpgrade  func(context.Context, config.Config, routing.State, string, string) error
 }
 
 type systemRunner struct{}
@@ -148,6 +149,7 @@ func NewDefault(version string) (*Manager, error) {
 		Runner:         systemRunner{},
 		ValidateBundle: validateBundle,
 		VerifyHealth:   verifyHealth,
+		VerifyUpgrade:  verifyRuntimeUpgrade,
 	}, nil
 }
 
@@ -658,15 +660,7 @@ func (m *Manager) installService(ctx context.Context, relay string) error {
 	if err := secureDirectory(m.Paths.LogDirectory); err != nil {
 		return err
 	}
-	payload := []byte(fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>%s</string><string>--config</string><string>%s</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Background</string>
-<key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
-</dict></plist>
-`, html.EscapeString(m.Paths.Label), html.EscapeString(relay), html.EscapeString(m.Paths.Config), html.EscapeString(filepath.Join(m.Paths.LogDirectory, "relay.log")), html.EscapeString(filepath.Join(m.Paths.LogDirectory, "relay-error.log"))))
+	payload := m.servicePayload(relay)
 	if err := atomicWrite(m.Paths.ServicePlist, payload, 0o600); err != nil {
 		return err
 	}
@@ -677,6 +671,18 @@ func (m *Manager) installService(ctx context.Context, relay string) error {
 	}
 	_, err := m.Runner.Run(ctx, "/bin/launchctl", "kickstart", "-k", "gui/"+uid+"/"+m.Paths.Label)
 	return err
+}
+
+func (m *Manager) servicePayload(relay string) []byte {
+	return []byte(fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>%s</string>
+<key>ProgramArguments</key><array><string>%s</string><string>--config</string><string>%s</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+`, html.EscapeString(m.Paths.Label), html.EscapeString(relay), html.EscapeString(m.Paths.Config), html.EscapeString(filepath.Join(m.Paths.LogDirectory, "relay.log")), html.EscapeString(filepath.Join(m.Paths.LogDirectory, "relay-error.log"))))
 }
 
 func (m *Manager) writeBinding() error {

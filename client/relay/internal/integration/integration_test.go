@@ -403,6 +403,16 @@ func integrationFixture(t *testing.T) (*Manager, *fakeRunner, func()) {
 		Runner:         runner,
 		ValidateBundle: func(context.Context, Paths) error { return nil },
 		VerifyHealth:   func(context.Context, config.Config, routing.State) error { return nil },
+		VerifyUpgrade: func(_ context.Context, _ config.Config, _ routing.State, path, digest string) error {
+			if !runner.active {
+				return ErrActivationFailed
+			}
+			observed, err := fileDigest(path)
+			if err != nil || observed != digest {
+				return ErrActivationFailed
+			}
+			return nil
+		},
 	}
 	return manager, runner, func() { _ = os.RemoveAll(root) }
 }

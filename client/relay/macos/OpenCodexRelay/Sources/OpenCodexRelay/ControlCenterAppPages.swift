@@ -7,6 +7,7 @@ struct SettingsControlCenterPage: View {
     @ObservedObject var gatewaySettings: GatewaySettingsController
     @ObservedObject var relocation: ApplicationRelocationController
     @ObservedObject var updates: ReleaseUpdateController
+    @ObservedObject var runtimeUpgrade: RuntimeUpgradeController
     @Binding var languageSelection: AppLanguageSelection
     let languageDescriptors: [AppLanguageDescriptor]
     let localizer: AppLocalizer
@@ -83,6 +84,13 @@ struct SettingsControlCenterPage: View {
                 .padding(.vertical, 4)
             }
 
+            RuntimeUpgradeCard(
+                controller: runtimeUpgrade,
+                model: model,
+                relocation: relocation,
+                localizer: localizer
+            )
+
             ControlCenterSectionCard(localizer.text(.controlCenterLoginItem), systemImage: "power") {
                 VStack(alignment: .leading, spacing: 10) {
                     if let loginItemMessage = model.loginItemMessage {
@@ -113,13 +121,21 @@ struct SettingsControlCenterPage: View {
 struct AppInformationControlCenterPage: View {
     @ObservedObject var model: MenuBarModel
     @ObservedObject var updates: ReleaseUpdateController
+    @ObservedObject var runtimeUpgrade: RuntimeUpgradeController
+    @ObservedObject var relocation: ApplicationRelocationController
     let localizer: AppLocalizer
     let title: String
     let systemImage: String
 
     var body: some View {
         ControlCenterPage(title: title, systemImage: systemImage, model: model, localizer: localizer) {
-            AppInformationView(model: model, updates: updates, localizer: localizer)
+            AppInformationView(
+                model: model,
+                updates: updates,
+                runtimeUpgrade: runtimeUpgrade,
+                relocation: relocation,
+                localizer: localizer
+            )
         }
     }
 }

@@ -29,6 +29,7 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
     private let windowCoordinator: ControlCenterWindowCoordinator
     private let relocation: ApplicationRelocationController
     private let updates: ReleaseUpdateController
+    private let runtimeUpgrade: RuntimeUpgradeController
     private let statusBar: NSStatusBar
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
@@ -40,6 +41,7 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
         windowCoordinator: ControlCenterWindowCoordinator,
         relocation: ApplicationRelocationController,
         updates: ReleaseUpdateController,
+        runtimeUpgrade: RuntimeUpgradeController,
         statusBar: NSStatusBar = .system
     ) {
         self.model = model
@@ -47,6 +49,7 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
         self.windowCoordinator = windowCoordinator
         self.relocation = relocation
         self.updates = updates
+        self.runtimeUpgrade = runtimeUpgrade
         self.statusBar = statusBar
         self.statusItem = statusBar.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
@@ -256,7 +259,8 @@ final class RelayStatusItemCoordinator: NSObject, NSPopoverDelegate {
             model: model,
             localization: localization,
             relocation: relocation,
-            updates: updates
+            updates: updates,
+            runtimeUpgrade: runtimeUpgrade
         )
     }
 }
