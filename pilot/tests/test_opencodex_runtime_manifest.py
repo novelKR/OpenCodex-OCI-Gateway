@@ -80,7 +80,7 @@ def sbom_document():
     }
 
 
-def provenance_document(platform):
+def provenance_document(builder_platform="linux/amd64"):
     return {
         "builder": {"id": ""},
         "buildType": "https://mobyproject.org/buildkit@v1",
@@ -92,20 +92,20 @@ def provenance_document(platform):
         ],
         "invocation": {
             "parameters": {"frontend": "dockerfile.v0"},
-            "environment": {"platform": platform},
+            "environment": {"platform": builder_platform},
         },
         "buildConfig": {"llbDefinition": [{"id": "step0", "op": {}}]},
         "metadata": {
             "completeness": {
                 "parameters": True,
                 "environment": True,
-                "materials": True,
+                "materials": False,
             }
         },
     }
 
 
-def provenance_v1_document():
+def provenance_v1_document(builder_platform="linux/amd64"):
     return {
         "buildDefinition": {
             "buildType": (
@@ -116,6 +116,7 @@ def provenance_v1_document():
                 "request": {"frontend": "dockerfile.v0", "locals": []}
             },
             "internalParameters": {
+                "builderPlatform": builder_platform,
                 "buildConfig": {
                     "llbDefinition": [{"id": "step0", "op": {}}]
                 }
@@ -315,62 +316,67 @@ class RuntimeManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             paths = []
-            for platform, suffix in (("linux/amd64", "amd64"), ("linux/arm64", "arm64")):
+            for suffix in ("amd64", "arm64"):
                 sbom = root / f"sbom-{suffix}.json"
                 provenance = root / f"provenance-{suffix}.json"
                 sbom.write_text(json.dumps(sbom_document()), encoding="utf-8")
                 provenance.write_text(
-                    json.dumps(provenance_document(platform)), encoding="utf-8"
+                    json.dumps(provenance_document()), encoding="utf-8"
                 )
                 paths.extend((sbom, provenance))
             self.assertEqual(
-                runtime.inspect_attestations(*paths),
+                runtime.inspect_attestations(*paths, "linux/amd64"),
                 {
                     "sbom": "spdx",
                     "provenance": "buildkit-max",
                     "platforms": "linux/amd64,linux/arm64",
                 },
             )
+            with self.assertRaisesRegex(runtime.ContractError, "builder platform is invalid"):
+                runtime.inspect_attestations(*paths, "linux/s390x")
 
             bad_sbom = sbom_document()
             bad_sbom.pop("SPDXID")
             paths[0].write_text(json.dumps(bad_sbom), encoding="utf-8")
             with self.assertRaisesRegex(runtime.ContractError, "SPDX"):
-                runtime.inspect_attestations(*paths)
+                runtime.inspect_attestations(*paths, "linux/amd64")
 
             paths[0].write_text(json.dumps(sbom_document()), encoding="utf-8")
-            provenance_only = provenance_document("linux/amd64")
+            provenance_only = provenance_document()
             paths[0].write_text(json.dumps(provenance_only), encoding="utf-8")
             with self.assertRaisesRegex(runtime.ContractError, "SPDX"):
-                runtime.inspect_attestations(*paths)
+                runtime.inspect_attestations(*paths, "linux/amd64")
 
             paths[0].write_text(json.dumps(sbom_document()), encoding="utf-8")
-            wrong_platform = provenance_document("linux/arm64")
-            paths[1].write_text(json.dumps(wrong_platform), encoding="utf-8")
-            with self.assertRaisesRegex(runtime.ContractError, "max provenance"):
-                runtime.inspect_attestations(*paths)
-
-            paths[1].write_text(
-                json.dumps(provenance_document("linux/amd64")), encoding="utf-8"
-            )
-            incomplete = provenance_document("linux/arm64")
+            incomplete = provenance_document()
             incomplete["metadata"]["completeness"]["parameters"] = False
             paths[3].write_text(json.dumps(incomplete), encoding="utf-8")
             with self.assertRaisesRegex(runtime.ContractError, "incomplete"):
-                runtime.inspect_attestations(*paths)
+                runtime.inspect_attestations(*paths, "linux/amd64")
 
             paths[3].write_text(
                 json.dumps(provenance_v1_document()), encoding="utf-8"
             )
             self.assertEqual(
-                runtime.inspect_attestations(*paths)["provenance"],
+                runtime.inspect_attestations(*paths, "linux/amd64")["provenance"],
                 "buildkit-max",
             )
             v1_min = provenance_v1_document()
             v1_min["buildDefinition"].pop("internalParameters")
             paths[3].write_text(json.dumps(v1_min), encoding="utf-8")
             with self.assertRaisesRegex(runtime.ContractError, "incomplete"):
-                runtime.inspect_attestations(*paths)
+                runtime.inspect_attestations(*paths, "linux/amd64")
+
+            paths[3].write_text(
+                json.dumps(provenance_document("linux/arm64")), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(runtime.ContractError, "builder platform"):
+                runtime.inspect_attestations(*paths, "linux/amd64")
+
+            wrong_v1_builder = provenance_v1_document(builder_platform="linux/arm64")
+            paths[3].write_text(json.dumps(wrong_v1_builder), encoding="utf-8")
+            with self.assertRaisesRegex(runtime.ContractError, "builder platform"):
+                runtime.inspect_attestations(*paths, "linux/amd64")
 
     def test_verify_expectations_do_not_accept_rollback_or_digest_substitution(self):
         document = manifest_document()

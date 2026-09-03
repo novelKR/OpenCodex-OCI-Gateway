@@ -290,6 +290,7 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertEqual(workflow.count("docker/build-push-action@"), 1)
         self.assertIn("subject-digest: ${{ steps.build.outputs.digest }}", candidate)
         self.assertIn("create-candidate", candidate)
+        self.assertEqual(candidate.count("--builder-platform linux/amd64"), 1)
         for platform in ("linux/amd64", "linux/arm64"):
             self.assertIn(f'(index .SBOM "{platform}").SPDX', candidate)
             self.assertIn(f'(index .Provenance "{platform}").SLSA', candidate)

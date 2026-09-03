@@ -328,6 +328,7 @@ jobs:
             --source-revision "$GITHUB_SHA" \
             --workflow-run-id "$GITHUB_RUN_ID" \
             --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --builder-platform linux/amd64 \
             --sbom-amd64 "$output/sbom-amd64.json" \
             --provenance-amd64 "$output/provenance-amd64.json" \
             --sbom-arm64 "$output/sbom-arm64.json" \

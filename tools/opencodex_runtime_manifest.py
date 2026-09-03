@@ -468,13 +468,17 @@ def validate_spdx_sbom(document: Any, platform: str) -> None:
         fail(f"{platform} BuildKit SPDX SBOM creation metadata is invalid")
 
 
-def validate_buildkit_provenance(document: Any, platform: str) -> None:
+def validate_buildkit_provenance(
+    document: Any, target_platform: str, builder_platform: str
+) -> None:
     if not isinstance(document, dict):
-        fail(f"{platform} BuildKit provenance predicate is invalid")
+        fail(f"{target_platform} BuildKit provenance predicate is invalid")
     if "buildDefinition" in document or "runDetails" in document:
-        validate_buildkit_provenance_v1(document, platform)
+        validate_buildkit_provenance_v1(
+            document, target_platform, builder_platform
+        )
         return
-    validate_buildkit_provenance_v02(document, platform)
+    validate_buildkit_provenance_v02(document, target_platform, builder_platform)
 
 
 def validate_materials(materials: Any, platform: str) -> None:
@@ -498,9 +502,11 @@ def validate_materials(materials: Any, platform: str) -> None:
             fail(f"{platform} BuildKit provenance material is invalid")
 
 
-def validate_buildkit_provenance_v02(document: dict[str, Any], platform: str) -> None:
+def validate_buildkit_provenance_v02(
+    document: dict[str, Any], target_platform: str, builder_platform: str
+) -> None:
     if document.get("buildType") != "https://mobyproject.org/buildkit@v1":
-        fail(f"{platform} BuildKit provenance build type is invalid")
+        fail(f"{target_platform} BuildKit provenance build type is invalid")
     builder = document.get("builder")
     invocation = document.get("invocation")
     metadata = document.get("metadata")
@@ -515,33 +521,41 @@ def validate_buildkit_provenance_v02(document: dict[str, Any], platform: str) ->
         or not isinstance(build_config.get("llbDefinition"), list)
         or not build_config["llbDefinition"]
     ):
-        fail(f"{platform} BuildKit provenance structure is invalid")
+        fail(f"{target_platform} BuildKit provenance structure is invalid")
     environment = invocation.get("environment")
     parameters = invocation.get("parameters")
     completeness = metadata.get("completeness")
+    # BuildKit records the current build machine here, not the result platform.
+    # The target stays independently bound by the target-specific Buildx
+    # selection and the exact index's child-attestation descriptors.
     if (
         not isinstance(environment, dict)
-        or environment.get("platform") != platform
-        or not isinstance(parameters, dict)
+        or environment.get("platform") != builder_platform
+    ):
+        fail(f"{target_platform} BuildKit provenance builder platform is invalid")
+    if (
+        not isinstance(parameters, dict)
         or not parameters
         or not isinstance(completeness, dict)
         or completeness.get("parameters") is not True
         or completeness.get("environment") is not True
     ):
-        fail(f"{platform} BuildKit max provenance is incomplete")
-    validate_materials(materials, platform)
+        fail(f"{target_platform} BuildKit max provenance is incomplete")
+    validate_materials(materials, target_platform)
 
 
-def validate_buildkit_provenance_v1(document: dict[str, Any], platform: str) -> None:
+def validate_buildkit_provenance_v1(
+    document: dict[str, Any], target_platform: str, builder_platform: str
+) -> None:
     build_definition = document.get("buildDefinition")
     run_details = document.get("runDetails")
     if not isinstance(build_definition, dict) or not isinstance(run_details, dict):
-        fail(f"{platform} BuildKit SLSA v1 provenance structure is invalid")
+        fail(f"{target_platform} BuildKit SLSA v1 provenance structure is invalid")
     if build_definition.get("buildType") != (
         "https://github.com/moby/buildkit/blob/master/docs/attestations/"
         "slsa-definitions.md"
     ):
-        fail(f"{platform} BuildKit provenance build type is invalid")
+        fail(f"{target_platform} BuildKit provenance build type is invalid")
     external = build_definition.get("externalParameters")
     internal = build_definition.get("internalParameters")
     dependencies = build_definition.get("resolvedDependencies")
@@ -568,8 +582,10 @@ def validate_buildkit_provenance_v1(document: dict[str, Any], platform: str) -> 
         or not isinstance(completeness, dict)
         or completeness.get("request") is not True
     ):
-        fail(f"{platform} BuildKit max provenance is incomplete")
-    validate_materials(dependencies, platform)
+        fail(f"{target_platform} BuildKit max provenance is incomplete")
+    if internal.get("builderPlatform") != builder_platform:
+        fail(f"{target_platform} BuildKit provenance builder platform is invalid")
+    validate_materials(dependencies, target_platform)
 
 
 def inspect_attestations(
@@ -577,7 +593,10 @@ def inspect_attestations(
     provenance_amd64: pathlib.Path,
     sbom_arm64: pathlib.Path,
     provenance_arm64: pathlib.Path,
+    builder_platform: str,
 ) -> dict[str, str]:
+    if builder_platform not in {"linux/amd64", "linux/arm64"}:
+        fail("BuildKit builder platform is invalid")
     files = {
         "linux/amd64": (sbom_amd64, provenance_amd64),
         "linux/arm64": (sbom_arm64, provenance_arm64),
@@ -602,7 +621,7 @@ def inspect_attestations(
             MAX_ATTESTATION_BYTES,
         )
         validate_spdx_sbom(sbom, platform)
-        validate_buildkit_provenance(provenance, platform)
+        validate_buildkit_provenance(provenance, platform, builder_platform)
     return {
         "sbom": "spdx",
         "provenance": "buildkit-max",
@@ -629,6 +648,7 @@ def command_inspect_attestations(arguments: argparse.Namespace) -> int:
                 arguments.provenance_amd64,
                 arguments.sbom_arm64,
                 arguments.provenance_arm64,
+                arguments.builder_platform,
             ),
             separators=(",", ":"),
             sort_keys=True,
@@ -653,6 +673,7 @@ def command_create_candidate(arguments: argparse.Namespace) -> int:
         arguments.provenance_amd64,
         arguments.sbom_arm64,
         arguments.provenance_arm64,
+        arguments.builder_platform,
     )
     document = {
         "schema": 1,
@@ -741,6 +762,7 @@ def command_verify(arguments: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     def add_attestation_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--builder-platform", required=True)
         command.add_argument("--sbom-amd64", type=pathlib.Path, required=True)
         command.add_argument("--provenance-amd64", type=pathlib.Path, required=True)
         command.add_argument("--sbom-arm64", type=pathlib.Path, required=True)
