@@ -19,11 +19,14 @@ import (
 )
 
 const (
-	Authority            = "127.0.0.1:10210"
-	CredentialHeader     = "X-OpenCodex-API-Key"
-	AuthorizationTimeout = 5 * time.Second
-	maximumHeaderBytes   = 64 << 10
-	maximumTokenBytes    = 4 << 10
+	Authority                   = "127.0.0.1:10210"
+	CredentialHeader            = "X-OpenCodex-API-Key"
+	AuthorizationTimeout        = 5 * time.Second
+	maximumHeaderBytes          = 64 << 10
+	maximumTokenBytes           = 4 << 10
+	headerTerminatorBytes       = 4
+	maximumCandidateHeaderBytes = maximumHeaderBytes + headerTerminatorBytes
+	maximumEncodedHeaderBytes   = maximumHeaderBytes + maximumTokenBytes + len(CredentialHeader) + 8
 )
 
 var ErrBinding = errors.New("OpenCodex loopback credential binding failed")
@@ -86,6 +89,7 @@ func (t *Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 	transport.IdleConnTimeout = 0
 	requestContext := clone.Context()
 	var dialed atomic.Bool
+	var boundConnection atomic.Pointer[credentialConn]
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		if !dialed.CompareAndSwap(false, true) {
 			return nil, ErrBinding
@@ -103,13 +107,31 @@ func (t *Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 			_ = connection.Close()
 			return nil, ErrBinding
 		}
-		return newCredentialConn(connection, authorization, lease.Close), nil
+		credentialConnection := newCredentialConn(connection, authorization, lease.Close)
+		boundConnection.Store(credentialConnection)
+		return credentialConnection, nil
 	}
 	response, err := transport.RoundTrip(clone)
 	transport.CloseIdleConnections()
 	if err != nil {
 		_ = lease.Close()
 		return nil, ErrBinding
+	}
+	if response.StatusCode == http.StatusSwitchingProtocols {
+		readWriteBody, ok := response.Body.(io.ReadWriteCloser)
+		connection := boundConnection.Load()
+		if !ok || connection == nil {
+			_ = response.Body.Close()
+			_ = lease.Close()
+			return nil, ErrBinding
+		}
+		// Go 1.26 exposes CloseWrite on its 101 response body, while the Go
+		// 1.24 toolchain used by CI only exposes io.ReadWriteCloser. Preserve
+		// the TCP half-close contract explicitly and consistently.
+		response.Body = &upgradeResponseBody{
+			ReadWriteCloser: readWriteBody,
+			connection:      connection,
+		}
 	}
 	return response, nil
 }
@@ -164,6 +186,18 @@ type credentialConn struct {
 	failed        bool
 }
 
+type upgradeResponseBody struct {
+	io.ReadWriteCloser
+	connection *credentialConn
+}
+
+func (b *upgradeResponseBody) CloseWrite() error {
+	if b == nil || b.connection == nil {
+		return ErrBinding
+	}
+	return b.connection.CloseWrite()
+}
+
 func newCredentialConn(connection net.Conn, authorization Authorization, release func() error) *credentialConn {
 	return newCredentialConnWithTimeout(connection, authorization, release, AuthorizationTimeout)
 }
@@ -190,7 +224,10 @@ func (c *credentialConn) Write(value []byte) (int, error) {
 	}
 
 	previous := len(c.header)
-	remaining := maximumHeaderBytes + len(headerTerminator) - previous
+	if previous > maximumHeaderBytes {
+		return c.failLocked()
+	}
+	remaining := maximumCandidateHeaderBytes - previous
 	if remaining <= 0 {
 		return c.failLocked()
 	}
@@ -198,12 +235,15 @@ func (c *credentialConn) Write(value []byte) (int, error) {
 	if prefixLength > remaining {
 		prefixLength = remaining
 	}
-	candidate := make([]byte, previous+prefixLength)
-	copy(candidate, c.header)
-	copy(candidate[previous:], value[:prefixLength])
+	// Both staging buffers use constant, reviewed capacities. Besides making
+	// the protocol's memory bound explicit, this avoids deriving allocation
+	// sizes from caller-controlled write lengths.
+	candidate := make([]byte, 0, maximumCandidateHeaderBytes)
+	candidate = append(candidate, c.header...)
+	candidate = append(candidate, value[:prefixLength]...)
 	separator := bytes.Index(candidate, headerTerminator)
 	if separator < 0 {
-		if previous+len(value) > maximumHeaderBytes {
+		if len(value) > maximumHeaderBytes-previous {
 			zero(candidate)
 			return c.failLocked()
 		}
@@ -215,12 +255,12 @@ func (c *credentialConn) Write(value []byte) (int, error) {
 		zero(candidate)
 		return c.failLocked()
 	}
-	bodyOffset := separator + len(headerTerminator) - previous
+	bodyOffset := separator + headerTerminatorBytes - previous
 	if bodyOffset < 0 || bodyOffset > len(value) {
 		zero(candidate)
 		return c.failLocked()
 	}
-	encoded := make([]byte, 0, separator+len(c.token)+len(CredentialHeader)+8)
+	encoded := make([]byte, 0, maximumEncodedHeaderBytes)
 	encoded = append(encoded, candidate[:separator]...)
 	encoded = append(encoded, '\r', '\n')
 	encoded = append(encoded, CredentialHeader...)

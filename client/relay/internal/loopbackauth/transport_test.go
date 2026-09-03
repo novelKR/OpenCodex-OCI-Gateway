@@ -249,6 +249,30 @@ func TestCredentialConnBoundsBlockedAuthenticatedHeaderWriteAndReleasesLease(t *
 	}
 }
 
+func TestCredentialConnRejectsImpossibleBufferedHeaderWithoutWriting(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	var releases atomic.Int64
+	connection := newCredentialConn(
+		client,
+		Authorization{Token: []byte("bound-token")},
+		func() error {
+			releases.Add(1)
+			return nil
+		},
+	)
+	connection.header = make([]byte, maximumHeaderBytes+1)
+	if count, err := connection.Write([]byte("x")); count != 0 || !errors.Is(err, ErrBinding) {
+		t.Fatalf("Write = %d, %v", count, err)
+	}
+	if releases.Load() != 1 {
+		t.Fatalf("impossible header released lease %d times", releases.Load())
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTransportRejectsCallerCredentialAndUnsafeToken(t *testing.T) {
 	template := &http.Transport{}
 	transport, _ := NewTransport(template, noOpLease, func(context.Context) (Authorization, error) {
