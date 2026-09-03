@@ -8,6 +8,7 @@ struct SettingsControlCenterPage: View {
     @ObservedObject var relocation: ApplicationRelocationController
     @ObservedObject var updates: ReleaseUpdateController
     @ObservedObject var runtimeUpgrade: RuntimeUpgradeController
+    @ObservedObject var containerRuntime: ContainerRuntimeController
     @Binding var languageSelection: AppLanguageSelection
     let languageDescriptors: [AppLanguageDescriptor]
     let localizer: AppLocalizer
@@ -86,6 +87,13 @@ struct SettingsControlCenterPage: View {
 
             RuntimeUpgradeCard(
                 controller: runtimeUpgrade,
+                model: model,
+                relocation: relocation,
+                localizer: localizer
+            )
+
+            ContainerRuntimeCard(
+                controller: containerRuntime,
                 model: model,
                 relocation: relocation,
                 localizer: localizer

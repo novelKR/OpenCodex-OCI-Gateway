@@ -161,6 +161,18 @@ func (systemAppBundleValidator) Validate(
 	if err != nil || keyID != trustKeyID {
 		return BundleValidation{}, errors.New("bundled trust key fingerprint")
 	}
+	runtimeKey := filepath.Join(appPath, "Contents", "Resources", "RuntimeTrust", "opencodex-runtime-release-ed25519.pub")
+	metadata, err = os.Lstat(runtimeKey)
+	if err != nil || !metadata.Mode().IsRegular() || metadata.Mode()&os.ModeSymlink != 0 || metadata.Size() < 1 || metadata.Size() > 8192 {
+		return BundleValidation{}, errors.New("bundled runtime trust key identity")
+	}
+	runtimeKeyBytes, err := os.ReadFile(runtimeKey)
+	if err != nil {
+		return BundleValidation{}, errors.New("bundled runtime trust key read")
+	}
+	if _, err := publicKeyID(runtimeKeyBytes); err != nil {
+		return BundleValidation{}, errors.New("bundled runtime trust key format")
+	}
 	fingerprint, err := BundleFingerprint(appPath)
 	if err != nil {
 		return BundleValidation{}, err

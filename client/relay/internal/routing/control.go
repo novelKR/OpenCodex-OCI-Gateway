@@ -2,6 +2,7 @@ package routing
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -16,7 +17,7 @@ import (
 )
 
 const (
-	controlSchemaVersion = 1
+	controlSchemaVersion = 2
 	maxControlBytes      = 16 << 10
 )
 
@@ -31,33 +32,68 @@ var (
 func ControlPath(configPath string) string {
 	path := filepath.Clean(configPath) + ".routing-control.sock"
 	// sockaddr_un is deliberately small on macOS. Keep the normal adjacent
-	// path for inspectability, but use an owner-verified short /tmp name when
-	// a long custom CODEX_HOME/config directory would make ListenUnix fail.
+	// path for inspectability, but use the user's process temp directory for a
+	// bounded hashed name when a custom CODEX_HOME would exceed that limit.
 	if len(path) <= 96 {
 		return path
 	}
 	hash := sha256.Sum256([]byte(filepath.Clean(configPath)))
-	return filepath.Join("/tmp", fmt.Sprintf("pw-ocx-routing-%x.sock", hash[:12]))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("pw-ocx-routing-%x.sock", hash[:12]))
 }
 
+type ControlOperation string
+
+const (
+	ControlOperationApply               ControlOperation = "apply"
+	ControlOperationMaintenanceStatus   ControlOperation = "runtime_maintenance_status"
+	ControlOperationMaintenancePrepare  ControlOperation = "runtime_maintenance_prepare"
+	ControlOperationMaintenanceCommit   ControlOperation = "runtime_maintenance_commit"
+	ControlOperationMaintenanceRollback ControlOperation = "runtime_maintenance_rollback"
+)
+
 type ControlRequest struct {
-	Schema     int     `json:"schema"`
-	Generation uint64  `json:"generation"`
-	Backend    Backend `json:"backend"`
+	Schema     int                 `json:"schema"`
+	Operation  ControlOperation    `json:"operation"`
+	Generation uint64              `json:"generation,omitempty"`
+	Backend    Backend             `json:"backend,omitempty"`
+	Intent     *MaintenanceIntent  `json:"intent,omitempty"`
+	Witness    *MaintenanceWitness `json:"witness,omitempty"`
 }
 
 func (r ControlRequest) validate() error {
-	if r.Schema != controlSchemaVersion || r.Generation == 0 || !validBackend(r.Backend) {
+	if r.Schema != controlSchemaVersion {
+		return ErrControlRequest
+	}
+	switch r.Operation {
+	case ControlOperationApply:
+		if r.Generation == 0 || !validBackend(r.Backend) || r.Intent != nil || r.Witness != nil {
+			return ErrControlRequest
+		}
+	case ControlOperationMaintenanceStatus:
+		if r.Generation != 0 || r.Backend != "" || r.Intent != nil || r.Witness != nil {
+			return ErrControlRequest
+		}
+	case ControlOperationMaintenancePrepare:
+		if r.Generation == 0 || r.Backend != BackendLocalAppleContainer || r.Intent == nil || r.Intent.validate() != nil || r.Witness != nil {
+			return ErrControlRequest
+		}
+	case ControlOperationMaintenanceCommit, ControlOperationMaintenanceRollback:
+		if r.Generation != 0 || r.Backend != "" || r.Intent != nil || r.Witness == nil || r.Witness.validate() != nil {
+			return ErrControlRequest
+		}
+	default:
 		return ErrControlRequest
 	}
 	return nil
 }
 
 type ControlResponse struct {
-	OK         bool    `json:"ok"`
-	Generation uint64  `json:"generation,omitempty"`
-	Backend    Backend `json:"backend,omitempty"`
-	Code       string  `json:"code,omitempty"`
+	OK          bool                      `json:"ok"`
+	Generation  uint64                    `json:"generation,omitempty"`
+	Backend     Backend                   `json:"backend,omitempty"`
+	Maintenance *MaintenanceRoutingStatus `json:"maintenance,omitempty"`
+	Witness     *MaintenanceWitness       `json:"witness,omitempty"`
+	Code        string                    `json:"code,omitempty"`
 }
 
 // RuntimeControl is deliberately narrower than a general RPC interface. It
@@ -79,17 +115,101 @@ func (c *SocketRuntimeControl) Apply(ctx context.Context, generation uint64, bac
 	if c == nil || c.path == "" {
 		return ErrControlUnavailable
 	}
-	request := ControlRequest{Schema: controlSchemaVersion, Generation: generation, Backend: backend}
-	if err := request.validate(); err != nil {
+	response, err := roundTripControl(ctx, c.path, ControlRequest{
+		Schema: controlSchemaVersion, Operation: ControlOperationApply, Generation: generation, Backend: backend,
+	})
+	if err != nil {
 		return err
 	}
-	if err := validateControlSocket(c.path); err != nil {
-		return ErrControlUnavailable
+	if !response.OK || response.Generation != generation || response.Backend != backend {
+		return controlResponseError(response)
+	}
+	return nil
+}
+
+// SocketRuntimeMaintenance is the lifecycle manager's narrow same-user
+// client. It cannot supply a URL, credential, path, or command to the relay.
+type SocketRuntimeMaintenance struct{ path string }
+
+func NewSocketRuntimeMaintenance(configPath string) *SocketRuntimeMaintenance {
+	return &SocketRuntimeMaintenance{path: ControlPath(configPath)}
+}
+
+func (c *SocketRuntimeMaintenance) Status(ctx context.Context) (MaintenanceRoutingStatus, error) {
+	if c == nil || c.path == "" {
+		return MaintenanceRoutingStatus{}, ErrControlUnavailable
+	}
+	response, err := roundTripControl(ctx, c.path, ControlRequest{
+		Schema: controlSchemaVersion, Operation: ControlOperationMaintenanceStatus,
+	})
+	if err != nil {
+		return MaintenanceRoutingStatus{}, err
+	}
+	if !response.OK || response.Maintenance == nil || response.Maintenance.Validate() != nil ||
+		response.Generation != response.Maintenance.RoutingGeneration || response.Backend != response.Maintenance.Backend {
+		return MaintenanceRoutingStatus{}, controlResponseError(response)
+	}
+	return *response.Maintenance, nil
+}
+
+func (c *SocketRuntimeMaintenance) Prepare(ctx context.Context, expectedRoutingGeneration uint64, intent MaintenanceIntent) (MaintenanceWitness, error) {
+	if c == nil || c.path == "" || expectedRoutingGeneration == 0 || intent.validate() != nil {
+		return MaintenanceWitness{}, ErrMaintenanceWitness
+	}
+	response, err := roundTripControl(ctx, c.path, ControlRequest{
+		Schema:     controlSchemaVersion,
+		Operation:  ControlOperationMaintenancePrepare,
+		Generation: expectedRoutingGeneration,
+		Backend:    BackendLocalAppleContainer,
+		Intent:     &intent,
+	})
+	if err != nil {
+		return MaintenanceWitness{}, err
+	}
+	if !response.OK || response.Witness == nil || response.Witness.validate() != nil ||
+		response.Witness.OriginRoutingGeneration != expectedRoutingGeneration || response.Witness.Intent != intent ||
+		response.Generation != response.Witness.PreparedRoutingGeneration || response.Backend != BackendLocalAppleContainer {
+		return MaintenanceWitness{}, controlResponseError(response)
+	}
+	return *response.Witness, nil
+}
+
+func (c *SocketRuntimeMaintenance) Commit(ctx context.Context, witness MaintenanceWitness) error {
+	return c.finish(ctx, ControlOperationMaintenanceCommit, witness)
+}
+
+func (c *SocketRuntimeMaintenance) Rollback(ctx context.Context, witness MaintenanceWitness) error {
+	return c.finish(ctx, ControlOperationMaintenanceRollback, witness)
+}
+
+func (c *SocketRuntimeMaintenance) finish(ctx context.Context, operation ControlOperation, witness MaintenanceWitness) error {
+	if c == nil || c.path == "" || witness.validate() != nil ||
+		(operation != ControlOperationMaintenanceCommit && operation != ControlOperationMaintenanceRollback) {
+		return ErrMaintenanceWitness
+	}
+	response, err := roundTripControl(ctx, c.path, ControlRequest{
+		Schema: controlSchemaVersion, Operation: operation, Witness: &witness,
+	})
+	if err != nil {
+		return err
+	}
+	if !response.OK || response.Generation != witness.FinalRoutingGeneration || response.Backend != BackendLocalAppleContainer {
+		return controlResponseError(response)
+	}
+	return nil
+}
+
+func roundTripControl(ctx context.Context, path string, request ControlRequest) (ControlResponse, error) {
+	if err := request.validate(); err != nil {
+		return ControlResponse{}, err
+	}
+	if err := validateControlSocket(path); err != nil {
+		return ControlResponse{}, ErrControlUnavailable
 	}
 	dialer := net.Dialer{}
-	connection, err := dialer.DialContext(ctx, "unix", c.path)
+	connection, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
-		return ErrControlUnavailable
+		return ControlResponse{}, ErrControlUnavailable
 	}
 	defer connection.Close()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -98,16 +218,147 @@ func (c *SocketRuntimeControl) Apply(ctx context.Context, generation uint64, bac
 		_ = connection.SetDeadline(time.Now().Add(35 * time.Second))
 	}
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
-		return ErrControlUnavailable
+		return ControlResponse{}, ErrControlUnavailable
 	}
-	decoder := json.NewDecoder(io.LimitReader(connection, maxControlBytes))
-	decoder.DisallowUnknownFields()
 	var response ControlResponse
-	if err := decoder.Decode(&response); err != nil {
+	if err := readControlJSON(bufio.NewReaderSize(connection, maxControlBytes+1), &response); err != nil {
+		return ControlResponse{}, ErrControlUnavailable
+	}
+	if !response.OK {
+		return response, controlResponseError(response)
+	}
+	if !validControlResponse(request, response) {
+		return ControlResponse{}, ErrControlUnavailable
+	}
+	return response, nil
+}
+
+func validControlResponse(request ControlRequest, response ControlResponse) bool {
+	if !response.OK || response.Code != "" {
+		return false
+	}
+	switch request.Operation {
+	case ControlOperationApply:
+		return response.Generation == request.Generation && response.Backend == request.Backend &&
+			response.Maintenance == nil && response.Witness == nil
+	case ControlOperationMaintenanceStatus:
+		return response.Maintenance != nil && response.Witness == nil &&
+			response.Maintenance.Validate() == nil &&
+			response.Generation == response.Maintenance.RoutingGeneration &&
+			response.Backend == response.Maintenance.Backend
+	case ControlOperationMaintenancePrepare:
+		return response.Maintenance == nil && response.Witness != nil &&
+			response.Witness.validate() == nil && response.Witness.Intent == *request.Intent &&
+			response.Generation == response.Witness.PreparedRoutingGeneration &&
+			response.Backend == BackendLocalAppleContainer
+	case ControlOperationMaintenanceCommit, ControlOperationMaintenanceRollback:
+		return response.Maintenance == nil && response.Witness == nil &&
+			response.Generation == request.Witness.FinalRoutingGeneration &&
+			response.Backend == BackendLocalAppleContainer
+	default:
+		return false
+	}
+}
+
+func controlResponseError(response ControlResponse) error {
+	switch response.Code {
+	case "conflict":
+		return ErrMaintenanceConflict
+	case "recovery_required":
+		return ErrMaintenanceRecoveryRequired
+	case "invalid_request", "invalid_witness":
+		return ErrMaintenanceWitness
+	default:
 		return ErrControlUnavailable
 	}
-	if !response.OK || response.Generation != generation || response.Backend != backend {
-		return ErrControlUnavailable
+}
+
+// readControlJSON consumes one newline-delimited, size-bounded JSON object.
+// Both client and server use it so unknown fields, duplicate keys, trailing
+// values, and oversized receipts fail closed at the same boundary.
+func readControlJSON(reader *bufio.Reader, destination any) error {
+	if reader == nil || destination == nil {
+		return ErrControlRequest
+	}
+	line, err := reader.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) || len(line) > maxControlBytes {
+		return ErrControlRequest
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ErrControlRequest
+	}
+	payload := bytes.TrimSpace(line)
+	if len(payload) == 0 || len(payload) > maxControlBytes || rejectDuplicateJSONKeys(payload) != nil {
+		return ErrControlRequest
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return ErrControlRequest
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return ErrControlRequest
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	var walk func() error
+	walk = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := map[string]struct{}{}
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return ErrControlRequest
+				}
+				if _, duplicate := seen[key]; duplicate {
+					return ErrControlRequest
+				}
+				seen[key] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim('}') {
+				return ErrControlRequest
+			}
+		case '[':
+			for decoder.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim(']') {
+				return ErrControlRequest
+			}
+		default:
+			return ErrControlRequest
+		}
+		return nil
+	}
+	if err := walk(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return ErrControlRequest
 	}
 	return nil
 }
@@ -179,10 +430,8 @@ func (s *ControlServer) serveConnection(parent context.Context, connection *net.
 		_ = json.NewEncoder(connection).Encode(ControlResponse{Code: "unauthorized"})
 		return
 	}
-	decoder := json.NewDecoder(io.LimitReader(bufio.NewReader(connection), maxControlBytes))
-	decoder.DisallowUnknownFields()
 	var request ControlRequest
-	if err := decoder.Decode(&request); err != nil || request.validate() != nil {
+	if err := readControlJSON(bufio.NewReaderSize(connection, maxControlBytes+1), &request); err != nil || request.validate() != nil {
 		_ = json.NewEncoder(connection).Encode(ControlResponse{Code: "invalid_request"})
 		return
 	}
@@ -193,12 +442,25 @@ func (s *ControlServer) serveConnection(parent context.Context, connection *net.
 		// Raw errors can include local config/transport details. The socket
 		// response carries only a finite error code; relayctl maps it to a safe
 		// status rather than surfacing the text in the MenuBar.
-		response = ControlResponse{Code: "apply_failed"}
+		response = responseForControlError(err)
 	}
-	if response.OK && (response.Generation != request.Generation || response.Backend != request.Backend) {
+	if response.OK && !validControlResponse(request, response) {
 		response = ControlResponse{Code: "invalid_response"}
 	}
 	_ = json.NewEncoder(connection).Encode(response)
+}
+
+func responseForControlError(err error) ControlResponse {
+	switch {
+	case errors.Is(err, ErrMaintenanceConflict):
+		return ControlResponse{Code: "conflict"}
+	case errors.Is(err, ErrMaintenanceRecoveryRequired):
+		return ControlResponse{Code: "recovery_required"}
+	case errors.Is(err, ErrMaintenanceWitness), errors.Is(err, ErrControlRequest):
+		return ControlResponse{Code: "invalid_witness"}
+	default:
+		return ControlResponse{Code: "apply_failed"}
+	}
 }
 
 func (s *ControlServer) Close() error {

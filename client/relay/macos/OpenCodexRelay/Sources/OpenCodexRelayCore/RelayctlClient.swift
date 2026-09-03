@@ -12,15 +12,18 @@ public struct RelayctlExecutionPolicy: Equatable, Sendable {
     public let timeout: TimeInterval
     public let terminationGracePeriod: TimeInterval
     public let maximumOutputBytes: Int
+    public let forceKillAfterGracePeriod: Bool
 
     public init(
         timeout: TimeInterval = 5,
         terminationGracePeriod: TimeInterval = 0.25,
-        maximumOutputBytes: Int = 64 * 1024
+        maximumOutputBytes: Int = 64 * 1024,
+        forceKillAfterGracePeriod: Bool = true
     ) {
         self.timeout = max(timeout, 0.05)
         self.terminationGracePeriod = max(terminationGracePeriod, 0)
         self.maximumOutputBytes = max(maximumOutputBytes, 1024)
+        self.forceKillAfterGracePeriod = forceKillAfterGracePeriod
     }
 }
 
@@ -750,7 +753,9 @@ final class RelayctlProcessOperation: @unchecked Sendable {
         while process.isRunning, Date() < deadline {
             Thread.sleep(forTimeInterval: 0.01)
         }
-        if process.isRunning, process.processIdentifier > 0 {
+        if policy.forceKillAfterGracePeriod,
+           process.isRunning,
+           process.processIdentifier > 0 {
             // The timeout runner owns this exact Process PID. SIGKILL is only
             // a final reaping mechanism for relayctl, never for Codex Desktop.
             _ = Darwin.kill(process.processIdentifier, SIGKILL)

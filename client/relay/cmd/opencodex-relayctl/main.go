@@ -18,6 +18,7 @@ import (
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/codexconfig"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/containerruntime"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/integration"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/legacymigration"
@@ -62,6 +63,8 @@ func main() {
 		lifecycleCommand(os.Args[2:])
 	case "release":
 		releaseCommand(os.Args[2:])
+	case "container-runtime":
+		containerRuntimeCommand(os.Args[2:])
 	case "version", "--version", "-version":
 		fmt.Println(version)
 	default:
@@ -154,6 +157,20 @@ func writeUsage(writer io.Writer) {
   opencodex-relayctl release stage --channel stable|preview --current-version VERSION
       --release-id ID --tag TAG --expected-manifest-sha256 SHA256
       --public-key ABSOLUTE_PATH --json
+  opencodex-relayctl container-runtime inspect|check --json
+  opencodex-relayctl container-runtime stage --expected-manifest-sha256 SHA256
+      --expected-state-digest SHA256 --expected-routing-generation N --json
+  opencodex-relayctl container-runtime activate --expected-state-digest SHA256
+      --expected-routing-generation N --confirm-desktop-exited --json
+  opencodex-relayctl container-runtime stop --expected-state-digest SHA256
+      --expected-routing-generation N --confirm-desktop-exited --json
+  opencodex-relayctl container-runtime park --expected-state-digest SHA256
+      --expected-routing-generation N --json # internal Desktop-restart fail-closed path
+  opencodex-relayctl container-runtime recover --expected-state-digest SHA256
+      --confirm-desktop-exited --json
+  opencodex-relayctl container-runtime oauth providers --json
+  opencodex-relayctl container-runtime oauth start --provider ID --kind generic|codex --json
+  opencodex-relayctl container-runtime oauth status|submit|cancel --operation-id SHA256 --json
 `)
 }
 
@@ -175,11 +192,12 @@ func defaultPaths() (string, string) {
 // static local_opencodex topology deliberately has no runtime manager/socket;
 // retain its pre-existing controller behavior instead of making the new
 // macOS-only mechanism a breaking Linux dependency.
-func routingController(configPath, codexPath string) (*routing.Controller, error) {
+func routingController(configPath, codexPath string, additionalOptions ...routing.ControllerOption) (*routing.Controller, error) {
 	return routingControllerWithRecoveryGate(
 		configPath,
 		codexPath,
 		func() error { return handoff.RemovalRoutingGate(configPath) },
+		additionalOptions...,
 	)
 }
 
@@ -1026,6 +1044,8 @@ func parseBackendRequest(value string) (routing.Backend, error) {
 		return routing.BackendExternal, nil
 	case "local_opencodex":
 		return routing.BackendLocalOpenCodex, nil
+	case "local_apple_container":
+		return routing.BackendUnknown, errorsNew("local_apple_container is lifecycle-only; use container-runtime activate")
 	default:
 		return routing.BackendUnknown, errorsNew("mode request requires native, external, local_opencodex, or relay")
 	}
@@ -1197,7 +1217,8 @@ func (preparation removalRoutingRecoveryPreparation) routingGenerationMatches(co
 	}
 	state, legacy, err := store.Read()
 	_, transactionErr := store.HasPendingTransaction()
-	return err == nil && !legacy && transactionErr == nil &&
+	maintenancePending, maintenanceErr := store.HasPendingMaintenance()
+	return err == nil && !legacy && transactionErr == nil && maintenanceErr == nil && !maintenancePending &&
 		state.Generation == preparation.gateState.allowedGeneration
 }
 
@@ -1411,6 +1432,7 @@ func releaseRecoveredRemovalRoutingToken(
 	}
 	state, legacy, err := store.Read()
 	pendingTransaction, transactionErr := store.HasPendingTransaction()
+	pendingMaintenance, maintenanceErr := store.HasPendingMaintenance()
 	committedGeneration := preparation.expectedRoutingGeneration
 	if !preparation.alreadyRecovered {
 		if preparation.gateState == nil ||
@@ -1420,7 +1442,7 @@ func releaseRecoveredRemovalRoutingToken(
 		committedGeneration = preparation.gateState.allowedGeneration
 	}
 	if err != nil || legacy || state.ValidateForCodexConfig(configPath, codexPath) != nil ||
-		transactionErr != nil || pendingTransaction ||
+		transactionErr != nil || pendingTransaction || maintenanceErr != nil || pendingMaintenance ||
 		state.Generation != committedGeneration ||
 		!safeRemovalRoutingRecoveryState(state) ||
 		(state.Phase != routing.PhaseRelayActive && state.Phase != routing.PhaseNativeActive) {
@@ -1717,6 +1739,9 @@ func preflightHandoffRoutingState(store *routing.Store, state routing.State) err
 		return routing.ErrRecoveryRequired
 	}
 	if pending, err := store.HasPendingTransaction(); err != nil || pending {
+		return routing.ErrRecoveryRequired
+	}
+	if pending, err := store.HasPendingMaintenance(); err != nil || pending {
 		return routing.ErrRecoveryRequired
 	}
 	if state.Phase == routing.PhaseApplying ||
@@ -2413,6 +2438,7 @@ func requireReleaseStageLifecycleClean(home string) error {
 		filepath.Join(home, "Library", "Application Support", "OpenCodexRelay", "application-relocation.json"),
 		filepath.Join(home, "Library", "Application Support", "OpenCodexRelay", "integration-journal.json"),
 		routing.TransactionPath(productionConfig),
+		routing.MaintenancePath(productionConfig),
 		handoff.RemovalCleanupPath(productionConfig),
 		handoff.RemovalCleanupPath(standaloneAnchor),
 	}
@@ -2574,6 +2600,30 @@ func safeOperationError(err error) operationErrorEnvelope {
 		payload.Code = "routing_recovery_required"
 		payload.MessageKey = payload.Code
 		payload.RecommendedAction = "open_recovery"
+	case errors.Is(err, containerruntime.ErrInvalidRequest):
+		payload.Code = "container_runtime_invalid_request"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "review_request"
+	case errors.Is(err, containerruntime.ErrStateChanged), errors.Is(err, containerruntime.ErrRoutingChanged):
+		payload.Code = "container_runtime_changed"
+		payload.MessageKey = payload.Code
+		payload.RecommendedAction = "refresh_status"
+	case errors.Is(err, containerruntime.ErrRecoveryRequired), errors.Is(err, containerruntime.ErrUnsafeState),
+		errors.Is(err, containerruntime.ErrForeignResource):
+		payload.Code = "container_runtime_recovery_required"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "open_recovery"
+	case errors.Is(err, containerruntime.ErrCredential):
+		payload.Code = "container_runtime_credential_unavailable"
+		payload.MessageKey = payload.Code
+		payload.Retryable = false
+		payload.RecommendedAction = "activate_runtime"
+	case errors.Is(err, containerruntime.ErrUnavailable):
+		payload.Code = "container_runtime_unavailable"
+		payload.MessageKey = payload.Code
+		payload.RecommendedAction = "refresh_status"
 	case errors.Is(err, routing.ErrGatewayInvalidAddress):
 		payload.Code = "invalid_address"
 		payload.MessageKey = payload.Code

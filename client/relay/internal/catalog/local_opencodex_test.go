@@ -2,14 +2,20 @@ package catalog
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 type localRoundTrip func(*http.Request) (*http.Response, error)
@@ -52,6 +58,56 @@ func TestLocalOpenCodexRefreshUsesVerifiedLoopbackWithoutCredentialsOrProxy(t *t
 	}
 	if strings.Contains(string(payload), "hidden") || !strings.Contains(string(payload), "local-visible") {
 		t.Fatalf("local catalog payload = %s", payload)
+	}
+}
+
+func TestAppleContainerCatalogUsesFixedAPIAuthenticationAndGuestIdentityPort(t *testing.T) {
+	catalogPath := filepath.Join(t.TempDir(), "apple-catalog.json")
+	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	var loads atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Host != "127.0.0.1:10210" || request.Header.Get("CF-Access-Client-Id") != "" || request.Header.Get("X-OpenCodex-Relay") != "" {
+			t.Fatalf("unsafe Apple catalog request: url=%s headers=%#v", request.URL, request.Header)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/healthz":
+			if request.Header.Get("X-OpenCodex-API-Key") != "" {
+				t.Fatalf("Apple health request sent API key: %#v", request.Header)
+			}
+			_, _ = io.WriteString(response, `{"service":"opencodex","status":"ok","port":10100}`)
+		case "/v1/models":
+			if request.Header.Get("X-OpenCodex-API-Key") != apiToken {
+				t.Fatalf("Apple models key = %q", request.Header.Get("X-OpenCodex-API-Key"))
+			}
+			_, _ = io.WriteString(response, `{"data":[{"id":"apple-visible"}]}`)
+		default:
+			t.Fatalf("Apple catalog path = %q", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	fetcher := LocalOpenCodexFetcher{
+		BaseURL:               "http://127.0.0.1:10210/v1",
+		CatalogPath:           catalogPath,
+		ExpectedServicePort:   10100,
+		AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
+		ConnectionLease: func(context.Context) (func() error, error) {
+			return func() error { return nil }, nil
+		},
+		AuthorizeConnection: func(context.Context) (loopbackauth.Authorization, error) {
+			loads.Add(1)
+			return loopbackauth.Authorization{Token: []byte(apiToken)}, nil
+		},
+		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp4", server.Listener.Addr().String())
+		}}},
+	}
+	result, err := fetcher.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed || result.Count != 1 || loads.Load() != 1 || !Pending(catalogPath) {
+		t.Fatalf("Apple catalog result=%#v loads=%d pending=%t", result, loads.Load(), Pending(catalogPath))
 	}
 }
 

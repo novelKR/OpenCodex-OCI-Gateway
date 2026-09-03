@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "image_revision": 1,
+  "repository": "lidge-jun/opencodex",
+  "release": {
+    "id": 381148440,
+    "tag": "v2.40.0",
+    "published_at": "2026-09-02T10:08:02Z"
+  },
+  "version": "2.40.0",
+  "revision": "35ff3a462e786bd5efc394dfb1a8a5cc946e454f",
+  "npm": {
+    "package": "@bitkyc08/opencodex",
+    "version": "2.40.0",
+    "integrity": "sha512-Tc/Q60gjsBUMHjQ65VshJAv+zpeHkIIbu6qltAA8skq07rA69IHiSvXKAwRBRId4lc+vSvVO/qa/cuOny8MJkg==",
+    "tarball": "https://registry.npmjs.org/@bitkyc08/opencodex/-/opencodex-2.40.0.tgz"
+  }
+}

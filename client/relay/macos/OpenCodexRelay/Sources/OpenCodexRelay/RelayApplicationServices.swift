@@ -13,6 +13,7 @@ final class RelayApplicationServices: ObservableObject {
     let relocation: ApplicationRelocationController
     let updates: ReleaseUpdateController
     let runtimeUpgrade: RuntimeUpgradeController
+    let containerRuntime: ContainerRuntimeController
 
     private let launchRequest: ApplicationRelocationLaunchRequest?
     private var statusItemCoordinator: RelayStatusItemCoordinator?
@@ -23,16 +24,37 @@ final class RelayApplicationServices: ObservableObject {
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
         let launchRequest = ApplicationRelocationLaunchRequest.parse(arguments)
         let localization = LocalizationStore()
-        let model = MenuBarModel(localization: localization)
+        let distributionFlavor = DistributionFlavor.current
+        let runtimeMode = RelayRuntimeMode.current
+        let bindingURL = RoutingBindingReader.defaultURL(
+            distributionFlavor: distributionFlavor
+        )
+        let helperURL = RelayctlHelperLocation.resolve()
+        let model = MenuBarModel(
+            bindingURL: bindingURL,
+            helperURL: helperURL,
+            distributionFlavor: distributionFlavor,
+            runtimeMode: runtimeMode,
+            localization: localization
+        )
         let updates = ReleaseUpdateController()
         let runtimeUpgrade = RuntimeUpgradeController()
+        let containerRuntime = ContainerRuntimeController(
+            client: ProcessContainerRuntimeClient(
+                executableURL: helperURL,
+                bindingURL: bindingURL,
+                runtimeMode: runtimeMode,
+                distributionFlavor: distributionFlavor
+            )
+        )
         self.localization = localization
         self.model = model
         self.updates = updates
         self.runtimeUpgrade = runtimeUpgrade
+        self.containerRuntime = containerRuntime
         self.windowCoordinator = ControlCenterWindowCoordinator(activityLog: model.activityLog)
         self.relocation = ApplicationRelocationController(
-            runtimeMode: RelayRuntimeMode.current,
+            runtimeMode: runtimeMode,
             resumesDestinationLaunch: launchRequest != nil,
             activityLog: model.activityLog
         )
@@ -45,13 +67,15 @@ final class RelayApplicationServices: ObservableObject {
         model.start()
         updates.start()
         runtimeUpgrade.start()
+        containerRuntime.start()
         statusItemCoordinator = RelayStatusItemCoordinator(
             model: model,
             localization: localization,
             windowCoordinator: windowCoordinator,
             relocation: relocation,
             updates: updates,
-            runtimeUpgrade: runtimeUpgrade
+            runtimeUpgrade: runtimeUpgrade,
+            containerRuntime: containerRuntime
         )
         relocationStateObservation = relocation.$state
             .removeDuplicates()
@@ -80,6 +104,7 @@ final class RelayApplicationServices: ObservableObject {
             relocation: relocation,
             updates: updates,
             runtimeUpgrade: runtimeUpgrade,
+            containerRuntime: containerRuntime,
             section: section
         )
     }

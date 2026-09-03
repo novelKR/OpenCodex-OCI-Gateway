@@ -88,7 +88,7 @@ func gatewayBackupPath(configPath string) string {
 }
 
 func (c *Controller) GatewayInspect(ctx context.Context) (GatewayInspection, error) {
-	if c == nil || c.store == nil || c.recoveryGateActive() {
+	if c == nil || c.store == nil || c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return GatewayInspection{}, ErrRecoveryRequired
 	}
 	if err := validateExistingControlFile(c.store.ConfigPath()); err != nil {
@@ -151,7 +151,7 @@ func (c *Controller) GatewayTest(ctx context.Context, candidate GatewayCandidate
 }
 
 func (c *Controller) gatewayPreflight(ctx context.Context, request GatewayCandidate) (gatewayPreflight, error) {
-	if c == nil || c.store == nil || c.recoveryGateActive() {
+	if c == nil || c.store == nil || c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return gatewayPreflight{}, ErrRecoveryRequired
 	}
 	if err := validateExistingControlFile(c.store.ConfigPath()); err != nil {
@@ -263,7 +263,7 @@ func (c *Controller) GatewayApply(
 		return GatewayApplyReceipt{}, err
 	}
 	defer lock.Close()
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return GatewayApplyReceipt{}, ErrRecoveryRequired
 	}
 	if _, found, journalErr := c.loadJournal(); journalErr != nil || found {

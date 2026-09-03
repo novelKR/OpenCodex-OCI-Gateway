@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/compat"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/responses"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/scheduler"
@@ -83,6 +85,59 @@ func TestRelayInjectsOuterCredentialsAndStreams(t *testing.T) {
 	}
 	if response.Header.Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("content type = %q", response.Header.Get("Content-Type"))
+	}
+}
+
+func TestAppleRuntimeRewriteStripsCallerAdmissionHeadersAndInjectsOnlyAPIKey(t *testing.T) {
+	directory := t.TempDir()
+	codexPath := filepath.Join(directory, "config.toml")
+	canonical, err := config.NewDefault("https://gateway.example.test/v1", config.CredentialsSourceNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	canonical.LocalAppleContainer, err = config.NewLocalAppleContainerProfileForCodexConfig(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := canonical.LocalAppleContainerRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(
+		cfg,
+		func() (credentials.Values, error) { return credentials.Values{}, nil },
+		nil,
+		nil,
+		WithAppleRuntimeConnectionBinding(
+			func(context.Context) (loopbackauth.Authorization, error) {
+				return loopbackauth.Authorization{Token: []byte("apple-api-key")}, nil
+			},
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	incoming.Header.Set("Authorization", "Bearer native")
+	incoming.Header.Set("CF-Access-Client-Id", "caller-id")
+	incoming.Header.Set("CF-Access-Client-Secret", "caller-secret")
+	incoming.Header.Set("Cf-Access-Jwt-Assertion", "caller-jwt")
+	incoming.Header.Set("X-OpenCodex-API-Key", "caller-key")
+	incoming.Header.Set("X-OpenCodex-Relay", "caller-marker")
+	outgoing := incoming.Clone(incoming.Context())
+	server.rewrite(&httputil.ProxyRequest{In: incoming, Out: outgoing})
+	if outgoing.URL.String() != "http://127.0.0.1:10210/v1/models" {
+		t.Fatalf("Apple upstream URL = %q", outgoing.URL.String())
+	}
+	if outgoing.Header.Get("X-OpenCodex-API-Key") != "" || outgoing.Header.Get("X-OpenCodex-Relay") != "pw-local-v1" {
+		t.Fatalf("Apple injected headers = %#v", outgoing.Header)
+	}
+	if outgoing.Header.Get("CF-Access-Client-Id") != "" || outgoing.Header.Get("CF-Access-Client-Secret") != "" || outgoing.Header.Get("Cf-Access-Jwt-Assertion") != "" {
+		t.Fatalf("Apple runtime retained Cloudflare headers: %#v", outgoing.Header)
+	}
+	if outgoing.Header.Get("Authorization") != "Bearer native" {
+		t.Fatalf("Apple runtime changed caller Authorization = %q", outgoing.Header.Get("Authorization"))
 	}
 }
 

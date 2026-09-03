@@ -11,11 +11,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 const (
@@ -42,6 +42,40 @@ type Result struct {
 	ModelCount   int
 }
 
+// Target keeps the host transport endpoint distinct from the service identity
+// reported by the guest. In particular, Apple Container publishes host port
+// 10210 while the OpenCodex health payload must continue to identify guest
+// service port 10100.
+type Target struct {
+	BaseURL               string
+	ExpectedServicePort   int
+	AuthenticationProfile string
+	ConnectionLease       loopbackauth.LeaseAcquirer
+	AuthorizeConnection   loopbackauth.Authorizer
+}
+
+// NativeTarget returns the credentialless host-native OpenCodex contract.
+func NativeTarget(baseURL string) Target {
+	return Target{
+		BaseURL:               baseURL,
+		ExpectedServicePort:   10100,
+		AuthenticationProfile: config.RemoteAuthenticationNone,
+	}
+}
+
+// AppleContainerTarget returns the fixed authenticated Apple Container
+// contract. The API key is used only for /v1/models; /healthz remains
+// credentialless.
+func AppleContainerTarget(lease loopbackauth.LeaseAcquirer, authorize loopbackauth.Authorizer) Target {
+	return Target{
+		BaseURL:               "http://127.0.0.1:10210/v1",
+		ExpectedServicePort:   10100,
+		AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
+		ConnectionLease:       lease,
+		AuthorizeConnection:   authorize,
+	}
+}
+
 func (r Result) Ready() bool { return r.Availability == AvailabilityReady }
 
 // Preflight makes one identity request and one catalog request to the fixed
@@ -49,11 +83,21 @@ func (r Result) Ready() bool { return r.Availability == AvailabilityReady }
 // redirects, credentials, or caller-supplied headers. A fresh non-reusable
 // transport makes net/http's idle-connection retry path unavailable.
 func Preflight(ctx context.Context, upstreamBaseURL string) Result {
-	return preflight(ctx, upstreamBaseURL, newHTTPClient())
+	return PreflightTarget(ctx, NativeTarget(upstreamBaseURL))
 }
 
 func preflight(ctx context.Context, upstreamBaseURL string, client *http.Client) Result {
-	if !config.IsLocalOpenCodexBaseURL(upstreamBaseURL) || client == nil {
+	return preflightTarget(ctx, NativeTarget(upstreamBaseURL), client)
+}
+
+// PreflightTarget performs the bounded typed check for either the native or
+// Apple Container local profile.
+func PreflightTarget(ctx context.Context, target Target) Result {
+	return preflightTarget(ctx, target, newHTTPClient())
+}
+
+func preflightTarget(ctx context.Context, target Target, client *http.Client) Result {
+	if !validTarget(target) || client == nil {
 		return Result{Availability: AvailabilityInvalid}
 	}
 	// Even test/injected clients must retain the protocol's no-redirect and
@@ -67,15 +111,43 @@ func preflight(ctx context.Context, upstreamBaseURL string, client *http.Client)
 	if hardened.Timeout <= 0 || hardened.Timeout > requestTimeout {
 		hardened.Timeout = requestTimeout
 	}
-	healthURL, modelsURL, ok := endpoints(upstreamBaseURL)
+	healthURL, modelsURL, ok := endpoints(target.BaseURL)
 	if !ok {
 		return Result{Availability: AvailabilityInvalid}
 	}
-	if result := checkHealth(ctx, &hardened, healthURL); result != AvailabilityReady {
+	if result := checkHealth(ctx, &hardened, healthURL, target.ExpectedServicePort); result != AvailabilityReady {
 		return Result{Availability: result}
 	}
-	count, availability := checkModels(ctx, &hardened, modelsURL)
+	modelsClient := &hardened
+	if target.AuthenticationProfile == config.LocalAuthenticationOpenCodexAPIKey {
+		base, ok := hardened.Transport.(*http.Transport)
+		if !ok {
+			return Result{Availability: AvailabilityInvalid}
+		}
+		bound, err := loopbackauth.NewTransport(base, target.ConnectionLease, target.AuthorizeConnection)
+		if err != nil {
+			return Result{Availability: AvailabilityInvalid}
+		}
+		copy := hardened
+		copy.Transport = bound
+		modelsClient = &copy
+	}
+	count, availability := checkModels(ctx, modelsClient, modelsURL)
 	return Result{Availability: availability, ModelCount: count}
+}
+
+func validTarget(target Target) bool {
+	if target.ExpectedServicePort != 10100 {
+		return false
+	}
+	switch target.AuthenticationProfile {
+	case config.RemoteAuthenticationNone:
+		return config.IsLocalOpenCodexBaseURL(target.BaseURL) && target.ConnectionLease == nil && target.AuthorizeConnection == nil
+	case config.LocalAuthenticationOpenCodexAPIKey:
+		return config.IsLocalAppleContainerBaseURL(target.BaseURL) && target.ConnectionLease != nil && target.AuthorizeConnection != nil
+	default:
+		return false
+	}
 }
 
 func newHTTPClient() *http.Client {
@@ -111,7 +183,7 @@ func endpoints(upstreamBaseURL string) (healthURL, modelsURL string, ok bool) {
 	return healthURL, modelsURL, true
 }
 
-func checkHealth(ctx context.Context, client *http.Client, endpoint string) Availability {
+func checkHealth(ctx context.Context, client *http.Client, endpoint string, expectedServicePort int) Availability {
 	payload, status, ok := getJSON(ctx, client, endpoint)
 	if !ok {
 		return status
@@ -132,15 +204,7 @@ func checkHealth(ctx context.Context, client *http.Client, endpoint string) Avai
 	if !ok {
 		return AvailabilityInvalid
 	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		return AvailabilityInvalid
-	}
-	expectedPort, err := strconv.Atoi(parsed.Port())
-	if err != nil || expectedPort != 10100 {
-		return AvailabilityInvalid
-	}
-	if service != "opencodex" || healthStatus != "ok" || port != expectedPort {
+	if service != "opencodex" || healthStatus != "ok" || port != expectedServicePort {
 		return AvailabilityForeign
 	}
 	return AvailabilityReady
@@ -228,6 +292,11 @@ func getJSON(ctx context.Context, client *http.Client, endpoint string) ([]byte,
 	}
 	request.Close = true
 	request.Header.Set("Accept", "application/json")
+	request.Header.Del("CF-Access-Client-Id")
+	request.Header.Del("CF-Access-Client-Secret")
+	request.Header.Del("Cf-Access-Jwt-Assertion")
+	request.Header.Del("X-OpenCodex-API-Key")
+	request.Header.Del("X-OpenCodex-Relay")
 	response, err := client.Do(request)
 	if err != nil || response == nil {
 		return nil, AvailabilityUnavailable, false

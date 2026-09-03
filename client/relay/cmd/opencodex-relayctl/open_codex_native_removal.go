@@ -1080,9 +1080,9 @@ func ensureStandaloneRelayAssetsAbsent(home string) error {
 	developmentConfig := filepath.Join(home, ".config", "opencodex-relay", "relay-dev", "relay.json")
 	paths := []string{
 		productionConfig, routing.StatePath(productionConfig), routing.InitializedPath(productionConfig),
-		routing.TransactionPath(productionConfig), handoff.EnrollmentPath(productionConfig), handoff.RemovalCleanupPath(productionConfig),
+		routing.TransactionPath(productionConfig), routing.MaintenancePath(productionConfig), handoff.EnrollmentPath(productionConfig), handoff.RemovalCleanupPath(productionConfig),
 		developmentConfig, routing.StatePath(developmentConfig), routing.InitializedPath(developmentConfig),
-		routing.TransactionPath(developmentConfig), handoff.EnrollmentPath(developmentConfig), handoff.RemovalCleanupPath(developmentConfig),
+		routing.TransactionPath(developmentConfig), routing.MaintenancePath(developmentConfig), handoff.EnrollmentPath(developmentConfig), handoff.RemovalCleanupPath(developmentConfig),
 		filepath.Join(home, ".local", "lib", "opencodex-relay", "relay"),
 		filepath.Join(home, ".local", "lib", "opencodex-relay", "relay-dev"),
 		filepath.Join(home, "Library", "LaunchAgents", "io.github.novelkr.opencodex-relay.plist"),

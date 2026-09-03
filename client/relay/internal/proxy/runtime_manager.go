@@ -18,9 +18,10 @@ import (
 type RuntimeProfile string
 
 const (
-	RuntimeProfileExternal       RuntimeProfile = "external"
-	RuntimeProfileLocalOpenCodex RuntimeProfile = "local_opencodex"
-	RuntimeProfileNone           RuntimeProfile = "none"
+	RuntimeProfileExternal            RuntimeProfile = "external"
+	RuntimeProfileLocalOpenCodex      RuntimeProfile = "local_opencodex"
+	RuntimeProfileLocalAppleContainer RuntimeProfile = "local_apple_container"
+	RuntimeProfileNone                RuntimeProfile = "none"
 )
 
 // LocalAvailability is the bounded, non-secret result of a local OpenCodex
@@ -46,6 +47,7 @@ var (
 	ErrRuntimeManagerClosed       = errors.New("runtime manager is closed")
 	ErrRuntimeDrainTimeout        = errors.New("runtime drain did not complete")
 	ErrLocalOpenCodexUnavailable  = errors.New("local OpenCodex is unavailable")
+	ErrRuntimeMaintenanceState    = errors.New("runtime maintenance state is invalid")
 	ErrInvalidRuntime             = errors.New("runtime is invalid")
 	ErrInvalidRuntimeProfile      = errors.New("runtime profile is invalid")
 	ErrMissingLocalOpenCodexProbe = errors.New("local OpenCodex probe is required")
@@ -68,6 +70,12 @@ func (e *LocalUnavailableError) Unwrap() error { return ErrLocalOpenCodexUnavail
 // availability classification. The runtime manager never assumes a config
 // shape or performs a raw TCP check.
 type LocalProbe func(context.Context) (LocalAvailability, error)
+
+// ConnectionLease is the cross-process read side of the Apple runtime
+// lifecycle boundary. It must be acquired before the resident admission gate
+// so a lifecycle writer can never hold the file lock while waiting for a
+// request that is itself waiting for that lock.
+type ConnectionLease func(context.Context) (func() error, error)
 
 // LocalProbeAllowed is an optional admission check owned by the embedding
 // runtime.  It lets a routing watcher stop periodic loopback identity probes
@@ -143,9 +151,17 @@ func (s *Server) CloseIdleConnections() {
 type RuntimeSpec struct {
 	Profile RuntimeProfile
 
+	// StartParked is reserved for reconstructing an Apple runtime while a
+	// durable runtime-maintenance witness is pending after process restart. It
+	// installs only the health surface: no preflight, catalog worker, monitor,
+	// or data-plane admission starts until the coordinator verifies the selected
+	// container endpoint and calls ResumeMaintenance.
+	StartParked bool
+
 	// LocalProbe is required for the local profile. It is run before a local
 	// profile becomes active and periodically while it remains active.
 	LocalProbe         LocalProbe
+	ConnectionLease    ConnectionLease
 	LocalProbeInterval time.Duration
 	LocalProbeTimeout  time.Duration
 	LocalProbeAllowed  LocalProbeAllowed
@@ -156,12 +172,18 @@ type RuntimeSpec struct {
 }
 
 func (s RuntimeSpec) normalized() (RuntimeSpec, error) {
+	if s.StartParked && s.Profile != RuntimeProfileLocalAppleContainer {
+		return RuntimeSpec{}, fmt.Errorf("%w: only the Apple runtime may start parked", ErrInvalidRuntimeProfile)
+	}
 	switch s.Profile {
 	case RuntimeProfileExternal, RuntimeProfileNone:
 		return s, nil
-	case RuntimeProfileLocalOpenCodex:
+	case RuntimeProfileLocalOpenCodex, RuntimeProfileLocalAppleContainer:
 		if s.LocalProbe == nil {
 			return RuntimeSpec{}, ErrMissingLocalOpenCodexProbe
+		}
+		if s.Profile == RuntimeProfileLocalAppleContainer && s.ConnectionLease == nil {
+			return RuntimeSpec{}, fmt.Errorf("%w: Apple connection lease is required", ErrInvalidRuntimeProfile)
 		}
 		if s.LocalProbeInterval <= 0 {
 			s.LocalProbeInterval = defaultLocalProbeInterval
@@ -304,6 +326,10 @@ type RuntimeManager struct {
 	admission         runtimeAdmission
 	localAvailability LocalAvailability
 	changed           chan struct{}
+
+	maintenanceMu       sync.Mutex
+	maintenancePrepared bool
+	maintenanceSlot     *runtimeSlot
 }
 
 // NewRuntimeManager starts the supplied initial runtime behind stable
@@ -329,7 +355,7 @@ func NewRuntimeManager(ctx context.Context, tracker *Tracker, spec RuntimeSpec, 
 		}
 	}
 	availability := LocalAvailabilityUnknown
-	if spec.Profile == RuntimeProfileLocalOpenCodex {
+	if isLocalRuntimeProfile(spec.Profile) && !spec.StartParked {
 		availability = probeLocal(ctx, spec.LocalProbe)
 		notifyLocalAvailability(spec, availability)
 	}
@@ -354,7 +380,11 @@ func NewRuntimeManager(ctx context.Context, tracker *Tracker, spec RuntimeSpec, 
 		return manager, nil
 	}
 	manager.current = &runtimeSlot{runtime: initial, spec: spec, generation: manager.generation}
-	if spec.Profile == RuntimeProfileLocalOpenCodex && availability != LocalAvailabilityReady {
+	if spec.StartParked {
+		manager.admission = runtimeAdmissionPaused
+		return manager, nil
+	}
+	if isLocalRuntimeProfile(spec.Profile) && availability != LocalAvailabilityReady {
 		// Keep the Local profile visible to the controller and retain the
 		// supplied handlers for loopback health only. Starting either worker
 		// here would resume local catalog/probe egress after a failed bootstrap
@@ -412,20 +442,48 @@ func (m *RuntimeManager) serveHTTP(lane scheduler.Lane, w http.ResponseWriter, r
 		}
 		switch admission {
 		case runtimeAdmissionActive:
+			var connectionLease *runtimeConnectionLease
+			if current != nil && current.spec.Profile == RuntimeProfileLocalAppleContainer {
+				if current.spec.ConnectionLease == nil {
+					writeError(w, http.StatusServiceUnavailable, "upstream_unavailable")
+					return
+				}
+				var leaseErr error
+				release, leaseErr := current.spec.ConnectionLease(r.Context())
+				if leaseErr != nil || release == nil {
+					writeError(w, http.StatusServiceUnavailable, "upstream_unavailable")
+					return
+				}
+				connectionLease = &runtimeConnectionLease{release: release}
+			}
 			m.gate.RLock()
-			admission, current, _ = m.snapshotForHandler()
-			if admission != runtimeAdmissionActive || current == nil {
+			admission, checked, _ := m.snapshotForHandler()
+			if admission != runtimeAdmissionActive || checked == nil || checked != current {
 				m.gate.RUnlock()
+				if connectionLease != nil {
+					_ = connectionLease.Close()
+				}
 				continue
 			}
-			handler := current.runtime.handlerForLane(lane)
+			handler := checked.runtime.handlerForLane(lane)
 			if handler == nil {
 				m.gate.RUnlock()
+				if connectionLease != nil {
+					_ = connectionLease.Close()
+				}
 				writeError(w, http.StatusServiceUnavailable, "upstream_unavailable")
 				return
 			}
-			handler.ServeHTTP(w, r)
-			m.gate.RUnlock()
+			if connectionLease != nil {
+				r = r.WithContext(context.WithValue(r.Context(), runtimeConnectionLeaseContextKey{}, connectionLease))
+			}
+			func() {
+				defer m.gate.RUnlock()
+				if connectionLease != nil {
+					defer connectionLease.Close()
+				}
+				handler.ServeHTTP(w, r)
+			}()
 			return
 		case runtimeAdmissionTransitioning:
 			// A transition deliberately pauses new admission rather than sending
@@ -457,6 +515,38 @@ func (m *RuntimeManager) serveHTTP(lane scheduler.Lane, w http.ResponseWriter, r
 			return
 		}
 	}
+}
+
+type runtimeConnectionLeaseContextKey struct{}
+
+type runtimeConnectionLease struct {
+	once    sync.Once
+	release func() error
+}
+
+func (l *runtimeConnectionLease) Close() error {
+	if l == nil {
+		return nil
+	}
+	var err error
+	l.once.Do(func() {
+		if l.release != nil {
+			err = l.release()
+			l.release = nil
+		}
+	})
+	return err
+}
+
+func requireRuntimeConnectionLease(ctx context.Context) (func() error, error) {
+	if ctx == nil {
+		return nil, ErrRuntimeMaintenanceState
+	}
+	lease, _ := ctx.Value(runtimeConnectionLeaseContextKey{}).(*runtimeConnectionLease)
+	if lease == nil {
+		return nil, ErrRuntimeMaintenanceState
+	}
+	return lease.Close, nil
 }
 
 func (m *RuntimeManager) snapshotForHandler() (runtimeAdmission, *runtimeSlot, <-chan struct{}) {
@@ -510,6 +600,9 @@ func (m *RuntimeManager) Apply(ctx context.Context, spec RuntimeSpec, factory Ru
 	if err != nil {
 		return err
 	}
+	if spec.StartParked {
+		return fmt.Errorf("%w: parked startup is constructor-only", ErrInvalidRuntimeProfile)
+	}
 
 	var candidate Runtime
 	if spec.Profile != RuntimeProfileNone {
@@ -534,6 +627,11 @@ func (m *RuntimeManager) Apply(ctx context.Context, spec RuntimeSpec, factory Ru
 		}
 	}()
 
+	m.maintenanceMu.Lock()
+	defer m.maintenanceMu.Unlock()
+	if m.maintenancePrepared {
+		return ErrRuntimeMaintenanceState
+	}
 	m.changes.Lock()
 	defer m.changes.Unlock()
 	if m.isClosed() {
@@ -541,7 +639,7 @@ func (m *RuntimeManager) Apply(ctx context.Context, spec RuntimeSpec, factory Ru
 	}
 
 	availability := m.localAvailabilitySnapshot()
-	if spec.Profile == RuntimeProfileLocalOpenCodex {
+	if isLocalRuntimeProfile(spec.Profile) {
 		availability = probeLocal(ctx, spec.LocalProbe)
 		m.ObserveLocalAvailability(availability)
 		notifyLocalAvailability(spec, availability)
@@ -551,6 +649,7 @@ func (m *RuntimeManager) Apply(ctx context.Context, spec RuntimeSpec, factory Ru
 	}
 
 	old := m.beginTransition()
+	old.cancelWorkers()
 	if err := m.lockGate(ctx); err != nil {
 		m.parkAfterFailedDrain(old)
 		return err
@@ -663,7 +762,7 @@ func (m *RuntimeManager) commitRuntime(runtime Runtime, spec RuntimeSpec, availa
 	m.generation++
 	slot := &runtimeSlot{runtime: runtime, spec: spec, generation: m.generation}
 	m.current = slot
-	if spec.Profile == RuntimeProfileLocalOpenCodex {
+	if isLocalRuntimeProfile(spec.Profile) {
 		m.localAvailability = LocalAvailabilityReady
 	} else {
 		m.localAvailability = normalizeLocalAvailability(availability)
@@ -686,7 +785,7 @@ func (m *RuntimeManager) startSlot(slot *runtimeSlot) {
 		return
 	}
 	slot.lifecycle = startLifecycle(m.parent, slot.runtime.CatalogLifecycle)
-	if slot.spec.Profile == RuntimeProfileLocalOpenCodex {
+	if isLocalRuntimeProfile(slot.spec.Profile) {
 		slot.monitor = m.startLocalMonitor(slot)
 	}
 }
@@ -742,8 +841,8 @@ func (m *RuntimeManager) ObserveLocalAvailability(availability LocalAvailability
 	if current != nil {
 		observer = current.spec
 	}
-	cancelCatalog := current != nil && current.spec.Profile == RuntimeProfileLocalOpenCodex && availability != LocalAvailabilityReady && current.lifecycle != nil
-	if current != nil && current.spec.Profile == RuntimeProfileLocalOpenCodex && availability != LocalAvailabilityReady && m.admission == runtimeAdmissionActive {
+	cancelCatalog := current != nil && isLocalRuntimeProfile(current.spec.Profile) && availability != LocalAvailabilityReady && current.lifecycle != nil
+	if current != nil && isLocalRuntimeProfile(current.spec.Profile) && availability != LocalAvailabilityReady && m.admission == runtimeAdmissionActive {
 		m.setAdmissionLocked(runtimeAdmissionLocalUnavailable)
 	}
 	m.mu.Unlock()
@@ -756,7 +855,7 @@ func (m *RuntimeManager) ObserveLocalAvailability(availability LocalAvailability
 func (m *RuntimeManager) observeLocalAvailabilityForSlot(slot *runtimeSlot, availability LocalAvailability) {
 	availability = normalizeLocalAvailability(availability)
 	m.mu.Lock()
-	if m.current != slot || slot.spec.Profile != RuntimeProfileLocalOpenCodex {
+	if m.current != slot || !isLocalRuntimeProfile(slot.spec.Profile) {
 		m.mu.Unlock()
 		return
 	}
@@ -793,6 +892,112 @@ func (m *RuntimeManager) setAdmissionLocked(admission runtimeAdmission) {
 	m.changed = make(chan struct{})
 }
 
+// PrepareMaintenance parks both stable listeners, stops the Apple profile's
+// catalog/probe workers, and drains the shared request tracker. Admission stays
+// transitioning across the external container replacement, while the Go locks
+// themselves are released between control requests. This lets process shutdown
+// remain bounded and lets an explicit recovery request resume a runtime that
+// was reconstructed parked after a crash.
+func (m *RuntimeManager) PrepareMaintenance(ctx context.Context) error {
+	if m == nil {
+		return ErrRuntimeManagerClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.maintenanceMu.Lock()
+	defer m.maintenanceMu.Unlock()
+	if m.maintenancePrepared {
+		return nil
+	}
+
+	m.changes.Lock()
+	defer m.changes.Unlock()
+	m.mu.Lock()
+	current := m.current
+	eligible := current != nil && current.spec.Profile == RuntimeProfileLocalAppleContainer &&
+		(m.admission == runtimeAdmissionActive || m.admission == runtimeAdmissionPaused)
+	m.mu.Unlock()
+	if !eligible {
+		return ErrRuntimeMaintenanceState
+	}
+
+	old := m.beginTransition()
+	old.cancelWorkers()
+	if err := m.lockGate(ctx); err != nil {
+		m.parkAfterFailedDrain(old)
+		return err
+	}
+	defer m.gate.Unlock()
+	if err := m.quiesceAndStop(ctx, old); err != nil {
+		m.parkAfterFailedDrain(old)
+		return err
+	}
+	m.maintenancePrepared = true
+	m.maintenanceSlot = old
+	return nil
+}
+
+// VerifyMaintenance discards idle connections retained by the previous
+// container instance and runs the Apple profile's authenticated local probe
+// while admission remains parked. It does not restart catalog work or admit
+// traffic; the routing journal must be committed first.
+func (m *RuntimeManager) VerifyMaintenance(ctx context.Context) error {
+	if m == nil {
+		return ErrRuntimeManagerClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.maintenanceMu.Lock()
+	defer m.maintenanceMu.Unlock()
+	if !m.maintenancePrepared || m.maintenanceSlot == nil ||
+		m.maintenanceSlot.spec.Profile != RuntimeProfileLocalAppleContainer {
+		return ErrRuntimeMaintenanceState
+	}
+	slot := m.maintenanceSlot
+	if slot.runtime.Dispose != nil {
+		slot.runtime.Dispose()
+	}
+	availability := probeLocal(ctx, slot.spec.LocalProbe)
+	if availability != LocalAvailabilityReady {
+		m.mu.Lock()
+		m.localAvailability = availability
+		m.mu.Unlock()
+		notifyLocalAvailability(slot.spec, availability)
+		return &LocalUnavailableError{Availability: availability}
+	}
+	m.mu.Lock()
+	m.localAvailability = LocalAvailabilityReady
+	m.mu.Unlock()
+	notifyLocalAvailability(slot.spec, LocalAvailabilityReady)
+	return nil
+}
+
+// ResumeMaintenance is deliberately no-fail: MaintenanceCoordinator invokes
+// it only after endpoint verification, the final routing state, and journal
+// removal are durable. A call without a live lease is a safe no-op.
+func (m *RuntimeManager) ResumeMaintenance() {
+	if m == nil {
+		return
+	}
+	m.maintenanceMu.Lock()
+	defer m.maintenanceMu.Unlock()
+	if !m.maintenancePrepared || m.maintenanceSlot == nil {
+		return
+	}
+	slot := m.maintenanceSlot
+	m.startSlot(slot)
+	m.mu.Lock()
+	if m.current == slot {
+		m.localAvailability = LocalAvailabilityReady
+		m.setAdmissionLocked(runtimeAdmissionActive)
+	}
+	m.mu.Unlock()
+	m.maintenancePrepared = false
+	m.maintenanceSlot = nil
+}
+
 // Close stops the active lifecycle and prevents further handler admission. It
 // does not close any resident listener; the embedding process still owns that
 // lifecycle. A timed-out drain remains fail-closed.
@@ -803,6 +1008,8 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	m.maintenanceMu.Lock()
+	defer m.maintenanceMu.Unlock()
 	m.changes.Lock()
 	defer m.changes.Unlock()
 	if m.isClosed() {
@@ -829,6 +1036,8 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 	m.current = nil
 	m.setAdmissionLocked(runtimeAdmissionClosed)
 	m.mu.Unlock()
+	m.maintenancePrepared = false
+	m.maintenanceSlot = nil
 	return nil
 }
 
@@ -856,4 +1065,8 @@ func notifyLocalAvailability(spec RuntimeSpec, availability LocalAvailability) {
 	if spec.LocalAvailabilityObserver != nil {
 		spec.LocalAvailabilityObserver(normalizeLocalAvailability(availability))
 	}
+}
+
+func isLocalRuntimeProfile(profile RuntimeProfile) bool {
+	return profile == RuntimeProfileLocalOpenCodex || profile == RuntimeProfileLocalAppleContainer
 }

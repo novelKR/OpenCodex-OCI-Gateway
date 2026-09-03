@@ -22,7 +22,7 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:10100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:10100/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       start_period: 30s

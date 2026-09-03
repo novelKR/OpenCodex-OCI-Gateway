@@ -1,6 +1,6 @@
 # Upstream notices
 
-The image installs @bitkyc08/opencodex 2.33.0 from npm without vendoring its
+The image installs @bitkyc08/opencodex 2.40.0 from npm without vendoring its
 source into this repository. OpenCodex is distributed under the MIT License;
 its installed LICENSE remains in node_modules/@bitkyc08/opencodex/LICENSE.
 

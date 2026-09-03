@@ -52,6 +52,59 @@ func TestAcquireCreatesOwnerOnlyPersistentLockAndSerializes(t *testing.T) {
 	}
 }
 
+func TestSharedReadersCoexistAndBlockWriterUntilLastClose(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "Library", "Application Support"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := acquire(context.Background(), home, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := acquire(context.Background(), home, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	writerContext, cancelWriter := context.WithTimeout(context.Background(), time.Second)
+	defer cancelWriter()
+	writerResult := make(chan error, 1)
+	go func() {
+		writer, writerErr := Acquire(writerContext, home)
+		if writerErr == nil {
+			writerErr = writer.Close()
+		}
+		writerResult <- writerErr
+	}()
+
+	select {
+	case err := <-writerResult:
+		t.Fatalf("writer passed two shared readers: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writerResult:
+		t.Fatalf("writer passed the remaining shared reader: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writerResult:
+		if err != nil {
+			t.Fatalf("writer after readers closed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writer did not acquire after the last shared reader closed")
+	}
+}
+
 func TestAcquireRejectsSymlinkAndLooseDirectory(t *testing.T) {
 	for _, test := range []struct {
 		name  string

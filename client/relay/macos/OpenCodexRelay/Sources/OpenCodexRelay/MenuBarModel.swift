@@ -221,6 +221,20 @@ struct MainAppLoginRegistration: LoginRegistrationManaging {
 
 @MainActor
 final class MenuBarModel: ObservableObject {
+    private enum ContainerRuntimeDesktopMutation: Sendable {
+        case activate
+        case stop
+        case recover
+
+        var activityName: String {
+            switch self {
+            case .activate: "activation"
+            case .stop: "stop"
+            case .recover: "recovery"
+            }
+        }
+    }
+
     private enum InteractiveSurface: Hashable {
         case menuBarPopover
         case controlCenter
@@ -2153,6 +2167,350 @@ final class MenuBarModel: ObservableObject {
 			}
 		}
 	}
+
+    /// Container activation changes the same Codex config and routing state as
+    /// the ordinary mode transactions. Keep the exact selected Desktop exit
+    /// check and the mutation under one UI lease so another routing action
+    /// cannot enter between the final restart check and relayctl's CAS gate.
+    func activateContainerRuntime(_ controller: ContainerRuntimeController) {
+        guard let witness = controller.activationWitness else { return }
+        runContainerRuntimeDesktopMutation(
+            .activate,
+            controller: controller,
+            witness: witness
+        )
+    }
+
+    func stopContainerRuntime(_ controller: ContainerRuntimeController) {
+        guard let witness = controller.stopWitness else { return }
+        runContainerRuntimeDesktopMutation(
+            .stop,
+            controller: controller,
+            witness: witness
+        )
+    }
+
+    func recoverContainerRuntime(_ controller: ContainerRuntimeController) {
+        guard let witness = controller.recoveryWitness else { return }
+        runContainerRuntimeDesktopMutation(
+            .recover,
+            controller: controller,
+            witness: witness
+        )
+    }
+
+    private func runContainerRuntimeDesktopMutation(
+        _ operation: ContainerRuntimeDesktopMutation,
+        controller: ContainerRuntimeController,
+        witness: ContainerRuntimeMutationWitness
+    ) {
+        guard let desktopURL = resolveSelectedDesktopTarget(), !isBusy else { return }
+
+        isBusy = true
+        message = SafeStatusMessage(
+            code: "desktop_quit_requested",
+            key: .messageDesktopQuitRequested,
+            arguments: [.literal(desktopURL.deletingPathExtension().lastPathComponent)]
+        )
+        activityLog.record(
+            category: .operation,
+            code: "container_runtime_\(operation.activityName)_started"
+        )
+        Task { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            defer { self.isBusy = false }
+            guard await self.ensureVerifiedDesktopExited(at: desktopURL) != nil else {
+                self.activityLog.record(
+                    .warning,
+                    category: .operation,
+                    code: "container_runtime_\(operation.activityName)_finished",
+                    fields: ["result_code": self.message?.code ?? "desktop_exit_unverified"]
+                )
+                return
+            }
+
+            let launchObservation = self.desktopApplication.beginLaunchObservation(at: desktopURL)
+            defer { launchObservation.stop() }
+            // Arming the exact-bundle launch notification closes the gap after
+            // the original exit check. This second liveness check covers a
+            // launch that completed just before the observer was installed.
+            guard !self.desktopApplication.isRunning(at: desktopURL) else {
+                self.reportContainerRuntimeDesktopRestart(operation)
+                return
+            }
+
+            let result = await self.runContainerRuntimeMutationGuardedByDesktopLaunch(
+                operation,
+                controller: controller,
+                witness: witness,
+                observation: launchObservation
+            )
+            if result.desktopRestarted || launchObservation.didObserveLaunch ||
+                self.desktopApplication.isRunning(at: desktopURL) {
+                // The guarded operation drains its canceled mutation child
+                // before returning, so relayctl and Apple CLI are reaped before
+                // the controller re-reads and projects recovery_required.
+                await self.parkContainerRuntimeAfterDesktopRestart(
+                    controller,
+                    desktopURL: desktopURL
+                )
+                self.reportContainerRuntimeDesktopRestart(operation)
+                return
+            }
+            let succeeded = result.succeeded
+            guard succeeded else {
+                let code = controller.lastErrorCode ?? "container_runtime_failed"
+                self.message = SafeStatusMessage(
+                    code: code,
+                    key: .messageRoutingOperationFailed
+                )
+                self.activityLog.record(
+                    .error,
+                    category: .operation,
+                    code: "container_runtime_\(operation.activityName)_finished",
+                    fields: ["failure_code": code, "result_code": code]
+                )
+                return
+            }
+
+            guard let relaunchURL = self.revalidateDesktopURL(desktopURL) else { return }
+            // Keep the launch observer armed through the post-mutation trust
+            // revalidation. Only the launch initiated below may follow a
+            // successful mutation.
+            guard !launchObservation.didObserveLaunch,
+                  !self.desktopApplication.isRunning(at: relaunchURL) else {
+                await self.parkContainerRuntimeAfterDesktopRestart(
+                    controller,
+                    desktopURL: desktopURL
+                )
+                self.reportContainerRuntimeDesktopRestart(operation)
+                return
+            }
+            let relaunchWitness: DesktopApplicationRelaunchWitness
+            do {
+                relaunchWitness = try await self.desktopApplication.launchNewInstance(at: relaunchURL)
+            } catch {
+                launchObservation.stop()
+                if launchObservation.didObserveLaunch ||
+                    self.desktopApplication.isRunning(at: relaunchURL) {
+                    await self.parkContainerRuntimeAfterDesktopRestart(
+                        controller,
+                        desktopURL: desktopURL
+                    )
+                    self.reportContainerRuntimeDesktopRestart(operation)
+                    return
+                }
+                self.refreshDesktopTargetState()
+                self.message = SafeStatusMessage(
+                    code: "desktop_relaunch_failed",
+                    key: .messageDesktopRelaunchFailed
+                )
+                return
+            }
+
+            // The real controller requests a new, non-substituted application
+            // instance and returns its exact PID. Keep the observer armed
+            // through launch, then require both the notification history and
+            // the live exact-bundle process set to contain no other instance.
+            await Task.yield()
+            let expectedProcessIdentifiers: Set<Int32> = [relaunchWitness.processIdentifier]
+            var relaunchIsExclusive = launchObservation.observedProcessIdentifiers
+                .subtracting(expectedProcessIdentifiers).isEmpty &&
+                self.desktopApplication.validateRelaunch(relaunchWitness, at: relaunchURL)
+            launchObservation.stop()
+            relaunchIsExclusive = relaunchIsExclusive &&
+                launchObservation.observedProcessIdentifiers
+                    .subtracting(expectedProcessIdentifiers).isEmpty &&
+                self.desktopApplication.validateRelaunch(relaunchWitness, at: relaunchURL)
+            guard relaunchIsExclusive else {
+                await self.parkContainerRuntimeAfterDesktopRestart(
+                    controller,
+                    desktopURL: desktopURL
+                )
+                self.reportContainerRuntimeDesktopRestart(operation)
+                return
+            }
+            self.refreshDesktopTargetState()
+
+            if let client = self.configuredRelayctlClient() {
+                do {
+                    try await self.refreshAfterModeAction(using: client)
+                    self.message = SafeStatusMessage(
+                        code: "routing_applied",
+                        key: .messageRoutingApplied
+                    )
+                } catch {
+                    self.statusError = self.safeMessage(for: error)
+                    self.message = SafeStatusMessage(
+                        code: "routing_applied_refresh_pending",
+                        key: .messageRoutingAppliedRefreshPending
+                    )
+                }
+            }
+            self.activityLog.record(
+                category: .operation,
+                code: "container_runtime_\(operation.activityName)_finished",
+                fields: ["result_code": "routing_applied"]
+            )
+        }
+    }
+
+    private struct ContainerRuntimeDesktopMutationResult: Sendable {
+        let succeeded: Bool
+        let desktopRestarted: Bool
+    }
+
+    private enum ContainerRuntimeDesktopMutationRace: Sendable {
+        case mutationFinished(Bool)
+        case desktopRestarted
+        case observationEnded
+    }
+
+    private enum ContainerRuntimeParkingRace: Sendable {
+        case parked(Bool)
+        case desktopRestarted
+        case observationEnded
+    }
+
+    private func runContainerRuntimeMutationGuardedByDesktopLaunch(
+        _ operation: ContainerRuntimeDesktopMutation,
+        controller: ContainerRuntimeController,
+        witness: ContainerRuntimeMutationWitness,
+        observation: any DesktopApplicationLaunchObserving
+    ) async -> ContainerRuntimeDesktopMutationResult {
+        await withTaskGroup(of: ContainerRuntimeDesktopMutationRace.self) { group in
+            group.addTask {
+                let succeeded: Bool
+                switch operation {
+                case .activate:
+                    succeeded = await controller.activateAfterVerifiedDesktopExit(expected: witness)
+                case .stop:
+                    succeeded = await controller.stopAfterVerifiedDesktopExit(expected: witness)
+                case .recover:
+                    succeeded = await controller.recoverAfterVerifiedDesktopExit(expected: witness)
+                }
+                return .mutationFinished(succeeded)
+            }
+            let events = observation.events
+            group.addTask {
+                for await _ in events {
+                    return .desktopRestarted
+                }
+                return .observationEnded
+            }
+
+            var mutationResult: Bool?
+            var desktopRestarted = false
+            if let first = await group.next() {
+                switch first {
+                case let .mutationFinished(succeeded):
+                    mutationResult = succeeded
+                    // Allow an already-delivered workspace notification to
+                    // reach the observer before ending the race.
+                    await Task.yield()
+                case .desktopRestarted, .observationEnded:
+                    desktopRestarted = true
+                }
+            }
+            group.cancelAll()
+            // Structured cancellation is the reap boundary: do not report or
+            // relaunch until the mutation task has unwound through the Swift
+            // process runner and Go's owned Apple CLI process group.
+            while let outcome = await group.next() {
+                switch outcome {
+                case let .mutationFinished(succeeded):
+                    mutationResult = succeeded
+                case .desktopRestarted:
+                    desktopRestarted = true
+                case .observationEnded:
+                    break
+                }
+            }
+            return ContainerRuntimeDesktopMutationResult(
+                succeeded: mutationResult ?? false,
+                desktopRestarted: desktopRestarted
+            )
+        }
+    }
+
+    private func parkContainerRuntimeAfterDesktopRestart(
+        _ controller: ContainerRuntimeController,
+        desktopURL: URL
+    ) async {
+        var confirmedExited = true
+        if desktopApplication.isRunning(at: desktopURL) {
+            confirmedExited = desktopApplication.requestGracefulQuit(at: desktopURL)
+            if confirmedExited {
+                confirmedExited = await desktopApplication.waitForExit(
+                    at: desktopURL,
+                    timeout: 30
+                )
+            }
+        }
+        guard confirmedExited,
+              let verifiedURL = revalidateDesktopURL(desktopURL),
+              !desktopApplication.isRunning(at: verifiedURL) else {
+            _ = await controller.parkAfterDesktopRestart(confirmDesktopExited: false)
+            return
+        }
+
+        // The first observation is already latched. Arm a fresh exact-bundle
+        // observer for the durable Stop/recovery reconciliation itself.
+        let parkingObservation = desktopApplication.beginLaunchObservation(at: verifiedURL)
+        defer { parkingObservation.stop() }
+        guard !desktopApplication.isRunning(at: verifiedURL) else {
+            _ = await controller.parkAfterDesktopRestart(confirmDesktopExited: false)
+            return
+        }
+        let events = parkingObservation.events
+        await withTaskGroup(of: ContainerRuntimeParkingRace.self) { group in
+            group.addTask {
+                .parked(await controller.parkAfterDesktopRestart(confirmDesktopExited: true))
+            }
+            group.addTask {
+                for await _ in events {
+                    return .desktopRestarted
+                }
+                return .observationEnded
+            }
+            var parked = false
+            var restarted = false
+            if let first = await group.next() {
+                switch first {
+                case let .parked(result): parked = result
+                case .desktopRestarted, .observationEnded: restarted = true
+                }
+            }
+            group.cancelAll()
+            while let outcome = await group.next() {
+                switch outcome {
+                case let .parked(result): parked = result
+                case .desktopRestarted: restarted = true
+                case .observationEnded: break
+                }
+            }
+            if restarted || parkingObservation.didObserveLaunch ||
+                desktopApplication.isRunning(at: verifiedURL) || !parked {
+                _ = await controller.parkAfterDesktopRestart(confirmDesktopExited: false)
+            }
+        }
+    }
+
+    private func reportContainerRuntimeDesktopRestart(
+        _ operation: ContainerRuntimeDesktopMutation
+    ) {
+        refreshDesktopTargetState()
+        message = SafeStatusMessage(
+            code: "desktop_restarted",
+            key: .messageDesktopRestarted
+        )
+        activityLog.record(
+            .warning,
+            category: .operation,
+            code: "container_runtime_\(operation.activityName)_finished",
+            fields: ["failure_code": "desktop_restarted", "result_code": "desktop_restarted"]
+        )
+    }
 
     private func runDesktopExitCheckedCommand(
         command: RelayctlCommand,

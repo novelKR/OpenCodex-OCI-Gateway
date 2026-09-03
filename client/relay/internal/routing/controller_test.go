@@ -370,6 +370,114 @@ func TestLocalOpenCodexRequestAndApplyUseExplicitBackendBoundary(t *testing.T) {
 	}
 }
 
+func TestAppleContainerGenericRequestApplyAndRecoveryAreLifecycleOnly(t *testing.T) {
+	controller, store, codexPath := optionalLocalControllerFixture(t, nil, true)
+	credentialLoads, runtimeApplies := 0, 0
+	controller.loadCredentials = func(config.CredentialsConfig) (credentials.Values, error) {
+		credentialLoads++
+		return credentials.Values{}, errors.New("generic Apple routing must not load credentials")
+	}
+	controller.runtimeControl = runtimeControlFunc(func(context.Context, uint64, Backend) error {
+		runtimeApplies++
+		return nil
+	})
+
+	before, err := NewRelayState(store.ConfigPath())
+	if err == nil {
+		before, err = BindCodexConfig(before, codexPath)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(before); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RequestBackend(context.Background(), BackendLocalAppleContainer); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("generic Apple request error = %v", err)
+	}
+	after, err := store.Load()
+	if err != nil || after != before || credentialLoads != 0 || runtimeApplies != 0 {
+		t.Fatalf("rejected request mutated state or crossed credential/runtime boundary: before=%#v after=%#v loads=%d applies=%d err=%v", before, after, credentialLoads, runtimeApplies, err)
+	}
+
+	legacyPending := before
+	legacyPending.Generation++
+	legacyPending.DesiredBackend = BackendLocalAppleContainer
+	legacyPending.DesiredMode = ModeRelay
+	legacyPending.Phase = PhaseBackendPendingRestart
+	lock, err = store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(legacyPending); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Apply(context.Background(), true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("generic Apple apply error = %v", err)
+	}
+
+	legacyRecovery := legacyPending
+	legacyRecovery.Generation++
+	legacyRecovery.Phase = PhaseRecoveryRequired
+	lock, err = store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(legacyRecovery); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Recover(context.Background(), RecoveryComplete, true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("generic Apple recovery error = %v", err)
+	}
+	if credentialLoads != 0 || runtimeApplies != 0 {
+		t.Fatalf("generic Apple paths crossed credential/runtime boundary: loads=%d applies=%d", credentialLoads, runtimeApplies)
+	}
+
+	stableApple := before
+	stableApple.Generation++
+	stableApple.DesiredBackend = BackendLocalAppleContainer
+	stableApple.AppliedBackend = BackendLocalAppleContainer
+	stableApple.DesiredMode = ModeRelay
+	stableApple.AppliedMode = ModeRelay
+	stableApple.Phase = PhaseRelayActive
+	lock, err = store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(stableApple); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []Backend{BackendExternal, BackendNone, BackendLocalOpenCodex} {
+		if _, err := controller.RequestBackend(context.Background(), target); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("generic request away from Apple to %q error = %v", target, err)
+		}
+	}
+	unchanged, err := store.Load()
+	if err != nil || unchanged != stableApple || credentialLoads != 0 || runtimeApplies != 0 {
+		t.Fatalf("generic request away from Apple mutated state or crossed boundary: state=%#v loads=%d applies=%d err=%v", unchanged, credentialLoads, runtimeApplies, err)
+	}
+}
+
 func TestLocalCatalogBarrierFailsClosedBeforeRuntimeOrCodexConfigMutation(t *testing.T) {
 	controller, store, codexPath := optionalLocalControllerFixture(t, nil, true)
 	controller.localPreflight = func(context.Context, string) localopencodex.Result {
@@ -631,6 +739,45 @@ func TestObservedCanonicalProfileDistinguishesLocalCatalogBinding(t *testing.T) 
 	}
 }
 
+func TestAppleConnectionAuthorizerCancelsContextualCredentialLoad(t *testing.T) {
+	started := make(chan struct{})
+	controller := &Controller{
+		appleRuntimeCredentialGuard: func(context.Context) error { return nil },
+		loadCredentialsContext: func(ctx context.Context, _ config.CredentialsConfig) (credentials.Values, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				return credentials.Values{}, errors.New("Apple credential context is unbounded")
+			}
+			close(started)
+			<-ctx.Done()
+			return credentials.Values{}, ctx.Err()
+		},
+	}
+	cfg := config.Config{Credentials: config.CredentialsConfig{
+		Source:                config.CredentialsSourceKeychain,
+		AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := controller.appleConnectionAuthorizer(cfg)(ctx)
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("contextual Apple credential load did not begin")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrCredentialPreflight) {
+			t.Fatalf("cancelled Apple credential load error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled Apple credential load did not unwind")
+	}
+}
+
 func TestApplyNativeWaitsForParkThenRemovesOnlyManagedRouting(t *testing.T) {
 	controller, store, codexPath := controllerFixture(t, nil)
 	controller.health = stateHealth{store: store, active: 0}
@@ -830,8 +977,8 @@ func TestLegacyInferenceRejectsForeignCatalogOverride(t *testing.T) {
 func TestStatusIsSafeWhenLocalRelayIsUnreachable(t *testing.T) {
 	controller, _, _ := controllerFixture(t, unavailableHealth{})
 	status := controller.Status(context.Background())
-	if status.SchemaVersion != 3 {
-		t.Fatalf("status schema = %d, want 3", status.SchemaVersion)
+	if status.SchemaVersion != 4 {
+		t.Fatalf("status schema = %d, want 4", status.SchemaVersion)
 	}
 	if status.RecoveryCapabilities.CanComplete || status.RecoveryCapabilities.CanRollback ||
 		status.RecoveryCapabilities.CompleteReason != recoveryReasonNotRequired ||
@@ -925,6 +1072,21 @@ func TestSchemaV2JournalRejectsMissingOrMismatchedBackends(t *testing.T) {
 	migrated := normalizeTransactionJournal(legacy)
 	if migrated.TargetBackend != BackendExternal || migrated.OriginBackend != BackendNone || migrated.validate() != nil {
 		t.Fatalf("legacy journal migration = %#v", migrated)
+	}
+
+	v2 := base
+	v2.Schema = explicitBackendSchemaVersion
+	v2.TargetBackend = BackendLocalOpenCodex
+	v2.OriginBackend = BackendNone
+	migrated = normalizeTransactionJournal(v2)
+	if migrated.Schema != SchemaVersion || migrated.TargetBackend != BackendLocalOpenCodex || migrated.OriginBackend != BackendNone || migrated.validate() != nil {
+		t.Fatalf("schema v2 journal migration changed backend meaning = %#v", migrated)
+	}
+
+	v2Future := v2
+	v2Future.TargetBackend = BackendLocalAppleContainer
+	if migrated := normalizeTransactionJournal(v2Future); migrated.validate() == nil {
+		t.Fatalf("schema v2 journal accepted future Apple backend = %#v", migrated)
 	}
 }
 
@@ -1371,7 +1533,7 @@ func (h stateHealth) Read(_ context.Context, _ config.Config) LocalRelay {
 	}
 	active := h.active
 	localAvailability := string(LocalOpenCodexUnknown)
-	if state.AppliedBackend == BackendLocalOpenCodex {
+	if state.AppliedBackend == BackendLocalOpenCodex || state.AppliedBackend == BackendLocalAppleContainer {
 		localAvailability = string(LocalOpenCodexReady)
 	}
 	endpoint := LocalRelayEndpoint{

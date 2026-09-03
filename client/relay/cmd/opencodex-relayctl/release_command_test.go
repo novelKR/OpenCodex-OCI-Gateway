@@ -39,6 +39,7 @@ func TestReleaseStageLifecycleGateRejectsDurableRecoveryArtifacts(t *testing.T) 
 		"Library/Application Support/OpenCodexRelay/application-relocation.json",
 		"Library/Application Support/OpenCodexRelay/integration-journal.json",
 		".config/opencodex-relay/relay.json.routing-transaction.json",
+		".config/opencodex-relay/relay.json.runtime-maintenance.json",
 		".config/opencodex-relay/relay.json.open-codex-removal.json",
 		"Library/Application Support/OpenCodexRelayLifecycle/standalone-native.open-codex-removal.json",
 	} {

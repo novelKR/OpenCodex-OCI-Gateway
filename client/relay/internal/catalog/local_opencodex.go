@@ -12,11 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 // LocalOpenCodexAvailability is safe to include in the relayctl/MenuBar
@@ -40,14 +40,19 @@ var ErrLocalOpenCodexPreflight = errors.New("local OpenCodex preflight failed")
 // allowing an Apply to wait indefinitely.
 const localOpenCodexMaterializationTimeout = 12 * time.Second
 
-// LocalOpenCodexFetcher is deliberately separate from Fetcher: it never asks
-// for credentials, never adds admission headers, and never consults an
-// environment proxy. Callers provide the already policy-validated numeric
+// LocalOpenCodexFetcher is deliberately separate from Fetcher and never
+// consults an environment proxy. Native Local is credentialless; the Apple
+// profile can obtain one API token only through its connection-bound lease
+// and post-dial authorizer. Callers provide the policy-validated numeric
 // loopback /v1 base URL.
 type LocalOpenCodexFetcher struct {
-	BaseURL     string
-	CatalogPath string
-	HTTPClient  *http.Client
+	BaseURL               string
+	CatalogPath           string
+	ExpectedServicePort   int
+	AuthenticationProfile string
+	ConnectionLease       loopbackauth.LeaseAcquirer
+	AuthorizeConnection   loopbackauth.Authorizer
+	HTTPClient            *http.Client
 }
 
 // MaterializeLocalOpenCodexCatalog validates the fixed loopback OpenCodex
@@ -56,9 +61,9 @@ type LocalOpenCodexFetcher struct {
 // resident Local catalog lifecycle: callers use it at the Desktop restart
 // boundary so Codex is never pointed at an absent or unchecked catalog.
 //
-// LocalOpenCodexFetcher deliberately constructs the no-proxy, no-credential,
-// no-redirect client used here.  This helper accepts only the policy-validated
-// numeric loopback endpoint and does not expose any external gateway settings.
+// This native helper deliberately constructs a no-proxy, no-credential,
+// no-redirect client. It accepts only the policy-validated numeric loopback
+// endpoint and does not expose any external gateway settings.
 func MaterializeLocalOpenCodexCatalog(ctx context.Context, baseURL, catalogPath string) (Result, error) {
 	return materializeLocalOpenCodexCatalog(ctx, LocalOpenCodexFetcher{
 		BaseURL:     baseURL,
@@ -111,7 +116,7 @@ func (f LocalOpenCodexFetcher) preflightEntries(ctx context.Context) (LocalOpenC
 		Port    int    `json:"port"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
-	if err := decoder.Decode(&identity); err != nil || identity.Service != "opencodex" || identity.Status != "ok" || identity.Port != endpointPort(endpoint) {
+	if err := decoder.Decode(&identity); err != nil || identity.Service != "opencodex" || identity.Status != "ok" || identity.Port != f.expectedServicePort() {
 		return LocalOpenCodexForeign, nil, fmt.Errorf("%w: health identity", ErrLocalOpenCodexPreflight)
 	}
 	if err := ensureJSONEOF(decoder); err != nil {
@@ -174,6 +179,18 @@ func (f LocalOpenCodexFetcher) fetchEntries(ctx context.Context, client http.Cli
 	if err != nil {
 		return nil, fmt.Errorf("%w: models request", ErrLocalOpenCodexPreflight)
 	}
+	profile := f.authenticationProfile()
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		base, ok := client.Transport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("%w: models authentication", ErrLocalOpenCodexPreflight)
+		}
+		bound, bindErr := loopbackauth.NewTransport(base, f.ConnectionLease, f.AuthorizeConnection)
+		if bindErr != nil {
+			return nil, fmt.Errorf("%w: models authentication", ErrLocalOpenCodexPreflight)
+		}
+		client.Transport = bound
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("%w: models unavailable", ErrLocalOpenCodexPreflight)
@@ -199,7 +216,14 @@ func (f LocalOpenCodexFetcher) fetchEntries(ctx context.Context, client http.Cli
 }
 
 func (f LocalOpenCodexFetcher) endpoint() (*url.URL, error) {
-	if !config.IsLocalOpenCodexBaseURL(f.BaseURL) {
+	profile := f.authenticationProfile()
+	validBaseURL := profile == config.RemoteAuthenticationNone && config.IsLocalOpenCodexBaseURL(f.BaseURL)
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		validBaseURL = config.IsLocalAppleContainerBaseURL(f.BaseURL) && f.ConnectionLease != nil && f.AuthorizeConnection != nil
+	} else if f.ConnectionLease != nil || f.AuthorizeConnection != nil {
+		validBaseURL = false
+	}
+	if !validBaseURL || f.expectedServicePort() != 10100 {
 		return nil, errors.New("invalid local OpenCodex endpoint")
 	}
 	endpoint, err := url.Parse(f.BaseURL)
@@ -207,6 +231,20 @@ func (f LocalOpenCodexFetcher) endpoint() (*url.URL, error) {
 		return nil, errors.New("invalid local OpenCodex endpoint")
 	}
 	return endpoint, nil
+}
+
+func (f LocalOpenCodexFetcher) authenticationProfile() string {
+	if f.AuthenticationProfile == "" {
+		return config.RemoteAuthenticationNone
+	}
+	return f.AuthenticationProfile
+}
+
+func (f LocalOpenCodexFetcher) expectedServicePort() int {
+	if f.ExpectedServicePort == 0 {
+		return 10100
+	}
+	return f.ExpectedServicePort
 }
 
 func (f LocalOpenCodexFetcher) client() http.Client {
@@ -232,17 +270,6 @@ func (f LocalOpenCodexFetcher) client() http.Client {
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return client
-}
-
-func endpointPort(endpoint *url.URL) int {
-	if endpoint == nil {
-		return 0
-	}
-	port, err := strconv.Atoi(endpoint.Port())
-	if err == nil && port > 0 && port <= 65535 {
-		return port
-	}
-	return 0
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

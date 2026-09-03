@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
 
 const newStem = "opencodex-relay"
@@ -56,6 +58,8 @@ type Keychain interface {
 }
 
 type systemKeychain struct{}
+
+var errRuntimeMaintenanceActive = errors.New("runtime maintenance must be recovered before legacy migration")
 
 type mapping struct {
 	Name        string
@@ -104,6 +108,12 @@ func Run(operation string, options Options) (Result, error) {
 	if options.Keychain == nil {
 		options.Keychain = systemKeychain{}
 	}
+	if operation != "inspect" && operation != "apply" && operation != "rollback" {
+		return Result{}, fmt.Errorf("unsupported migration operation %q", operation)
+	}
+	if err := requireRuntimeMaintenanceAbsent(options); err != nil {
+		return Result{}, err
+	}
 	switch operation {
 	case "inspect":
 		return inspect(options)
@@ -114,6 +124,23 @@ func Run(operation string, options Options) (Result, error) {
 	default:
 		return Result{}, fmt.Errorf("unsupported migration operation %q", operation)
 	}
+}
+
+// A runtime-maintenance journal is cross-bound to the exact relay config path
+// and to the container lifecycle journal. It must be recovered in place; the
+// legacy name migration may neither copy it nor reinterpret it as ordinary
+// routing state.
+func requireRuntimeMaintenanceAbsent(options Options) error {
+	oldConfig := filepath.Join(options.Home, ".config", legacyStem(), "relay.json")
+	newConfig := filepath.Join(options.Home, ".config", newStem, "relay.json")
+	for _, path := range []string{routing.MaintenancePath(oldConfig), routing.MaintenancePath(newConfig)} {
+		if _, err := os.Lstat(path); err == nil {
+			return errRuntimeMaintenanceActive
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return errRuntimeMaintenanceActive
+		}
+	}
+	return nil
 }
 
 func paths(options Options) ([]mapping, string) {

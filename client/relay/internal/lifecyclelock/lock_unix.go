@@ -19,7 +19,7 @@ func validateOwner(info os.FileInfo) error {
 	return nil
 }
 
-func lockFile(ctx context.Context, path string) (*os.File, error) {
+func lockFile(ctx context.Context, path string, shared bool) (*os.File, error) {
 	fd := -1
 	for {
 		flags := syscall.O_RDWR | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
@@ -51,8 +51,12 @@ func lockFile(ctx context.Context, path string) (*os.File, error) {
 	if err != nil || validateLockFileInfo(openedInfo) != nil {
 		return closeUnsafe()
 	}
+	operation := syscall.LOCK_EX | syscall.LOCK_NB
+	if shared {
+		operation = syscall.LOCK_SH | syscall.LOCK_NB
+	}
 	for {
-		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		if err := syscall.Flock(int(file.Fd()), operation); err == nil {
 			// A waiter may have opened the former path inode before another
 			// current-user process replaced the directory entry. Match the Swift
 			// participant and prove the locked descriptor is still the inode named

@@ -5,7 +5,7 @@
     "": {
       "name": "opencodex-container-runtime",
       "dependencies": {
-        "@bitkyc08/opencodex": "2.33.0",
+        "@bitkyc08/opencodex": "2.40.0",
       },
     },
   },
@@ -19,7 +19,7 @@
     "ip-address": "^10.4.0",
   },
   "packages": {
-    "@bitkyc08/opencodex": ["@bitkyc08/opencodex@2.33.0", "", { "dependencies": { "@bufbuild/protobuf": "^2.14.0", "@modelcontextprotocol/sdk": "^1.30.0", "@napi-rs/keyring": "1.3.0", "bun": "1.4.0", "zod": "4.4.3" }, "bin": { "opencodex": "bin/ocx.mjs", "ocx": "bin/ocx.mjs" } }, "sha512-lZISJQa+oTiIeyydQ1llUFOYH15FkfTsQdbGku/KPPAmrzYJmOTetDDq0/rZt6SERuP5BY9nXnBUKTlvCoK60A=="],
+    "@bitkyc08/opencodex": ["@bitkyc08/opencodex@2.40.0", "", { "dependencies": { "@bufbuild/protobuf": "^2.14.0", "@modelcontextprotocol/sdk": "^1.30.0", "@napi-rs/keyring": "1.3.0", "bun": "1.4.0", "zod": "4.4.3" }, "bin": { "opencodex": "bin/ocx.mjs", "ocx": "bin/ocx.mjs" } }, "sha512-Tc/Q60gjsBUMHjQ65VshJAv+zpeHkIIbu6qltAA8skq07rA69IHiSvXKAwRBRId4lc+vSvVO/qa/cuOny8MJkg=="],
 
     "@bufbuild/protobuf": ["@bufbuild/protobuf@2.14.0", "", {}, "sha512-C3UGsiCwSprE2NKIIFA3hCDlpXTMCAXRZuEVp88L1GY36Y41+rYL5fryE+nOFhp4p4JPQvdV8PQ4DWgHgeTE+w=="],
 

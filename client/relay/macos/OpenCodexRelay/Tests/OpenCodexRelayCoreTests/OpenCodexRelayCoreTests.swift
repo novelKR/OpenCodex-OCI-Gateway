@@ -634,6 +634,41 @@ final class OpenCodexRelayCoreTests: XCTestCase {
         XCTAssertThrowsError(try contradictory.validated())
     }
 
+    func testSchemaV4AcceptsAppleContainerActiveAndMaintenanceStates() throws {
+        let unavailable = RecoveryCapabilities(
+            canComplete: false,
+            canRollback: false,
+            completeReason: "not_required",
+            rollbackReason: "not_required",
+            target: .unknown,
+            targetConfidence: .unavailable,
+            authoritativeJournal: false
+        )
+        let readyConnection = connection(localOpenCodex: .ready)
+        let active = status(
+            schemaVersion: 4,
+            desiredBackend: .localAppleContainer,
+            appliedBackend: .localAppleContainer,
+            connection: readyConnection,
+            recoveryCapabilities: unavailable
+        )
+        XCTAssertNoThrow(try active.validated())
+
+        let maintenance = status(
+            schemaVersion: 4,
+            desiredBackend: .localAppleContainer,
+            appliedBackend: .localAppleContainer,
+            phase: .applying,
+            relayAdmission: .deny,
+            catalogRefresh: .pause,
+            desktopRestartRequired: false,
+            connection: readyConnection,
+            recoveryCapabilities: unavailable
+        )
+        XCTAssertNoThrow(try maintenance.validated())
+        XCTAssertTrue(maintenance.isDraining == ((maintenance.activeRequests ?? 0) > 0))
+    }
+
     func testOpaqueGatedZeroGenerationIsRenderableButNeverActionable() throws {
         let unavailable = RecoveryCapabilities(
             canComplete: false,
@@ -905,6 +940,11 @@ final class OpenCodexRelayCoreTests: XCTestCase {
             ("native_removal_boundary_changed", true, "refresh_native_removal"),
             ("native_recovery_required", true, "open_recovery"),
             ("custom_codex_home_unsupported", false, "review_request"),
+            ("container_runtime_invalid_request", false, "review_request"),
+            ("container_runtime_changed", true, "refresh_status"),
+            ("container_runtime_recovery_required", false, "open_recovery"),
+            ("container_runtime_credential_unavailable", false, "activate_runtime"),
+            ("container_runtime_unavailable", true, "refresh_status"),
             ("release_stage_invalid_request", false, "check_for_updates"),
             ("release_stage_busy", true, "retry"),
             ("release_stage_verification_failed", false, "open_release"),
@@ -1715,6 +1755,14 @@ final class OpenCodexRelayCoreTests: XCTestCase {
         let production = DistributionFlavor.from(bundleIdentifier: "io.github.novelkr.opencodex-relay", declaredFlavor: "production")
         XCTAssertEqual(production, .production)
         XCTAssertFalse(production.isLocalDevelopment)
+        XCTAssertTrue(
+            RoutingBindingReader.defaultURL(distributionFlavor: production).path
+                .hasSuffix("/Library/Application Support/OpenCodexRelay/routing-binding.json")
+        )
+        XCTAssertTrue(
+            RoutingBindingReader.defaultURL(distributionFlavor: development).path
+                .hasSuffix("/Library/Application Support/OpenCodexRelayDev/routing-binding.json")
+        )
     }
 
     func testRuntimeModeKeepsLegacyBundlesManagedAndUnknownValuesFailClosed() {

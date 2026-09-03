@@ -21,8 +21,11 @@ WORKFLOW_DIRECTORY = ROOT / ".github" / "workflows"
 ACTION_MINIMUM_MAJORS = {
     "actions/attest-build-provenance": 4,
     "actions/checkout": 7,
+    "actions/create-github-app-token": 3,
+    "actions/download-artifact": 8,
     "actions/setup-go": 7,
     "actions/setup-python": 7,
+    "actions/upload-artifact": 7,
     "docker/build-push-action": 7,
     "docker/login-action": 4,
     "docker/setup-buildx-action": 4,
@@ -149,7 +152,7 @@ class PublicCorePublicationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("workflow_dispatch:", ci)
-        self.assertEqual(ci.count("if: github.event.repository.private == false"), 2)
+        self.assertEqual(ci.count("if: github.event.repository.private == false"), 3)
         self.assertIn("workflow_dispatch:", codeql)
         self.assertEqual(
             codeql.count("if: github.event.repository.private == false"), 1
@@ -275,8 +278,22 @@ class PublicCorePublicationTests(unittest.TestCase):
         self.assertIn("current public main commit", workflow)
         self.assertIn("build-release.sh \"$version\"", workflow)
         self.assertIn("Resolve the greatest previous public app build", workflow)
-        self.assertIn("releases?per_page=100&page=1", workflow)
-        self.assertIn("previous public release scan exceeded its one-page bound", workflow)
+        self.assertIn('for page in 1 2 3 4 5; do', workflow)
+        self.assertIn('releases?per_page=100&page=${page}', workflow)
+        self.assertIn("previous public release scan exceeded its five-page bound", workflow)
+        self.assertIn("semver.fullmatch(tag)", workflow)
+        tag_pattern_match = re.search(
+            r'semver = re\.compile\(\s+r"([^"]+)"\s+\)', workflow
+        )
+        self.assertIsNotNone(tag_pattern_match)
+        tag_pattern = re.compile(tag_pattern_match.group(1))
+        self.assertIsNotNone(tag_pattern.fullmatch("0.3.9"))
+        for non_relay_tag in (
+            "v0.3.9",
+            "0.3.9-beta.1",
+            "opencodex-runtime-2.40.0-r1",
+        ):
+            self.assertIsNone(tag_pattern.fullmatch(non_relay_tag))
         self.assertNotIn("gh api --paginate --slurp", workflow)
         self.assertIn("--previous-build-number", workflow)
         self.assertIn("client/relay/RELEASE_BUILD_NUMBER", workflow)

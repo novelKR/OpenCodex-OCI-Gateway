@@ -43,6 +43,9 @@ jobs:
           set -euo pipefail
           version="${INPUT_VERSION:-${GITHUB_REF_NAME}}"
           tools/verify-release-ref.sh "$version"
+          python3 tools/opencodex_upstream.py verify-tree \
+            --container containers/opencodex \
+            --verify-provenance
           opencodex_version="$(
             jq -er '
               .dependencies["@bitkyc08/opencodex"]
@@ -54,16 +57,23 @@ jobs:
           )"
           printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'opencodex=%s\n' "$opencodex_version" >> "$GITHUB_OUTPUT"
+          printf 'opencodex_revision=%s\n' "$(jq -er .revision containers/opencodex/upstream.lock.json)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: build
         with:
           context: containers/opencodex
           file: containers/opencodex/Dockerfile
+          target: gateway
           platforms: linux/amd64,linux/arm64
           push: true
           sbom: true
           provenance: mode=max
           tags: ghcr.io/novelkr/opencodex-oci-gateway:${{ steps.version.outputs.value }}-ocx-${{ steps.version.outputs.opencodex }}
+          build-args: |
+            IMAGE_VERSION=${{ steps.version.outputs.value }}
+            OPENCODEX_VERSION=${{ steps.version.outputs.opencodex }}
+            OPENCODEX_REVISION=${{ steps.version.outputs.opencodex_revision }}
+            PUBLIC_CORE_REVISION=${{ github.sha }}
       - name: Attest image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

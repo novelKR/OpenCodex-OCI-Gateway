@@ -139,6 +139,7 @@ struct RelayControlCenterView: View {
     @ObservedObject var relocation: ApplicationRelocationController
     @ObservedObject var updates: ReleaseUpdateController
     @ObservedObject var runtimeUpgrade: RuntimeUpgradeController
+    @ObservedObject var containerRuntime: ContainerRuntimeController
     @EnvironmentObject private var localization: LocalizationStore
     @StateObject private var codexConfiguration: CodexConfigurationController
     @StateObject private var gatewaySettings: GatewaySettingsController
@@ -154,13 +155,15 @@ struct RelayControlCenterView: View {
         windowCoordinator: ControlCenterWindowCoordinator,
         relocation: ApplicationRelocationController,
         updates: ReleaseUpdateController,
-        runtimeUpgrade: RuntimeUpgradeController
+        runtimeUpgrade: RuntimeUpgradeController,
+        containerRuntime: ContainerRuntimeController
     ) {
         self.model = model
         self.windowCoordinator = windowCoordinator
         self.relocation = relocation
         self.updates = updates
         self.runtimeUpgrade = runtimeUpgrade
+        self.containerRuntime = containerRuntime
         _codexConfiguration = StateObject(
             wrappedValue: model.makeCodexConfigurationController()
         )
@@ -193,6 +196,7 @@ struct RelayControlCenterView: View {
                             model.refresh()
                             gatewaySettings.load()
                             runtimeUpgrade.refresh()
+                            containerRuntime.refresh()
                         } label: {
                             Label {
                                 Text(localizer.text(.menuRefresh))
@@ -358,6 +362,7 @@ struct RelayControlCenterView: View {
                 relocation: relocation,
                 updates: updates,
                 runtimeUpgrade: runtimeUpgrade,
+                containerRuntime: containerRuntime,
                 languageSelection: $localization.selection,
                 languageDescriptors: localization.registry.descriptors,
                 localizer: localizer,

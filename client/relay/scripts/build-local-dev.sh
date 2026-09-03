@@ -11,6 +11,7 @@ readonly KEYCHAIN_HELPER="${SCRIPT_DIR}/keychain-signing-key.swift"
 readonly APP_ROOT="${RELAY_ROOT}/macos/OpenCodexRelay"
 readonly INFO_TEMPLATE="${APP_ROOT}/Resources/Info.local-dev.plist"
 readonly APP_ICON="${APP_ROOT}/Resources/AppIcon.icns"
+readonly RUNTIME_PUBLIC_KEY_SOURCE="${REPO_ROOT}/config/trust/opencodex-runtime-release-ed25519.pub"
 readonly INFO_LOCALIZATIONS="${APP_ROOT}/Resources/InfoPlist.local-dev"
 readonly APP_NAME="OpenCodexRelay Dev.app"
 readonly BUNDLE_FILE="${APP_NAME}.zip"
@@ -120,6 +121,10 @@ command -v openssl >/dev/null || die 'openssl is required'
 command -v base64 >/dev/null || die 'base64 is required'
 [[ -f "$INFO_TEMPLATE" && ! -L "$INFO_TEMPLATE" ]] || die 'local development Info.plist template is unavailable'
 [[ -f "$APP_ICON" && ! -L "$APP_ICON" ]] || die 'local development app icon is unavailable'
+[[ -f "$RUNTIME_PUBLIC_KEY_SOURCE" && ! -L "$RUNTIME_PUBLIC_KEY_SOURCE" ]] || \
+  die 'tracked runtime release public key is unavailable'
+openssl pkey -pubin -in "$RUNTIME_PUBLIC_KEY_SOURCE" -text -noout 2>/dev/null | grep -Eq '^ED25519 Public-Key:' || \
+  die 'tracked runtime release public key must be provisioned as an Ed25519 public PEM'
 [[ -d "$INFO_LOCALIZATIONS" && ! -L "$INFO_LOCALIZATIONS" ]] || die 'local development InfoPlist localization resources are unavailable'
 [[ -f "${RELAY_ROOT}/${NOTICES_FILE}" && ! -L "${RELAY_ROOT}/${NOTICES_FILE}" ]] || die 'third-party notices are unavailable'
 
@@ -160,9 +165,15 @@ bundle_temp="$(mktemp -d "${TMPDIR:-/tmp}/opencodex-relay-local-dev-bundle.XXXXX
 app_dir="${bundle_temp}/${APP_NAME}"
 helpers_dir="${app_dir}/Contents/Library/Helpers"
 guard_helpers_dir="${app_dir}/Contents/Library/HelperTools"
+runtime_trust_dir="${app_dir}/Contents/Resources/RuntimeTrust"
 mkdir -p "${app_dir}/Contents/MacOS" "$helpers_dir" "$guard_helpers_dir" \
-  "${app_dir}/Contents/Resources"
+  "${app_dir}/Contents/Resources" "$runtime_trust_dir"
 install -m 0644 "$APP_ICON" "${app_dir}/Contents/Resources/AppIcon.icns"
+install -m 0644 "$RUNTIME_PUBLIC_KEY_SOURCE" \
+  "${runtime_trust_dir}/opencodex-runtime-release-ed25519.pub"
+cmp -s "$RUNTIME_PUBLIC_KEY_SOURCE" \
+  "${runtime_trust_dir}/opencodex-runtime-release-ed25519.pub" || \
+  die 'bundled runtime public key bytes differ from the tracked trust root'
 
 build_helper() {
   local command="$1"

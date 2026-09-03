@@ -2,3 +2,5 @@
 !Dockerfile
 !package.json
 !bun.lock
+!upstream.lock.json
+!bootstrap.mjs

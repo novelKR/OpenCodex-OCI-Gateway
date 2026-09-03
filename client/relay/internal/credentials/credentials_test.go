@@ -1,12 +1,24 @@
 package credentials
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 )
+
+func TestLoadContextRejectsCancelledCredentialAccessBeforeIO(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LoadContext(ctx, config.CredentialsConfig{
+		Source: config.CredentialsSourceNone,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled credential load error = %v", err)
+	}
+}
 
 func TestLoadNoneDoesNotRequireOuterCredentials(t *testing.T) {
 	values, err := Load(config.CredentialsConfig{Source: config.CredentialsSourceNone})

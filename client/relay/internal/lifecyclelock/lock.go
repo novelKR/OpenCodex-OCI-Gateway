@@ -36,6 +36,26 @@ func Path(home string) (string, error) {
 }
 
 func Acquire(ctx context.Context, home string) (*Lock, error) {
+	return acquire(ctx, home, false)
+}
+
+// AcquireReader holds a shared lifecycle lease from request admission through
+// one authenticated Apple connection's post-dial running proof and credential
+// header write. The resident RuntimeManager gate separately drains the full
+// response before a lifecycle writer can mutate routing or the container.
+func AcquireReader(ctx context.Context, home, reservationToken string) (*Lock, error) {
+	lock, err := acquire(ctx, home, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateSourceInstallReservation(home, reservationToken); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return lock, nil
+}
+
+func acquire(ctx context.Context, home string, shared bool) (*Lock, error) {
 	// Linux has no macOS app-level integration/removal lifecycle to serialize.
 	// Keep existing Linux commands and tests side-effect free instead of
 	// creating a macOS-shaped directory below HOME.
@@ -56,7 +76,7 @@ func Acquire(ctx context.Context, home string) (*Lock, error) {
 	if err := secureDirectory(directory); err != nil {
 		return nil, err
 	}
-	file, err := lockFile(ctx, path)
+	file, err := lockFile(ctx, path, shared)
 	if err != nil {
 		return nil, err
 	}

@@ -736,6 +736,137 @@ func TestNewLocalOpenCodexProfileForCodexConfigUsesSelectedHome(t *testing.T) {
 	}
 }
 
+func TestLocalAppleContainerRuntimeProfileIsFixedAndDoesNotChangeCanonicalTopology(t *testing.T) {
+	directory := t.TempDir()
+	codexConfig := filepath.Join(directory, "config.toml")
+	cfg := mustDefaultConfig(t)
+	cfg.Credentials.Source = CredentialsSourceNone
+	cfg.Credentials.AuthenticationProfile = RemoteAuthenticationNone
+	cfg.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	profile, err := NewLocalAppleContainerProfileForCodexConfig(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.LocalAppleContainer = profile
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	runtimeCfg, err := cfg.LocalAppleContainerRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpstreamMode != UpstreamModeExternalGateway || cfg.Catalog.Path == profile.CatalogPath {
+		t.Fatalf("canonical config was changed: %#v", cfg)
+	}
+	if runtimeCfg.UpstreamMode != UpstreamModeLocalAppleContainer || runtimeCfg.UpstreamBaseURL != "http://127.0.0.1:10210/v1" ||
+		runtimeCfg.Catalog.Owner != CatalogOwnerRelay || runtimeCfg.Catalog.Path != profile.CatalogPath ||
+		runtimeCfg.Credentials.Source != CredentialsSourceKeychain ||
+		runtimeCfg.Credentials.RemoteAuthenticationProfile() != LocalAuthenticationOpenCodexAPIKey {
+		t.Fatalf("derived Apple runtime config = %#v", runtimeCfg)
+	}
+}
+
+func TestNativeAndAppleLocalProfilesCanBeEnrolledAndDerivedIndependently(t *testing.T) {
+	directory := t.TempDir()
+	codexConfig := filepath.Join(directory, "config.toml")
+	cfg := mustDefaultConfig(t)
+	cfg.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	var err error
+	cfg.LocalOpenCodex, err = NewLocalOpenCodexProfileForCodexConfig(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.LocalAppleContainer, err = NewLocalAppleContainerProfileForCodexConfig(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("dual local enrollment rejected: %v", err)
+	}
+	native, err := cfg.LocalOpenCodexRuntimeConfig()
+	if err != nil {
+		t.Fatalf("derive native profile: %v", err)
+	}
+	apple, err := cfg.LocalAppleContainerRuntimeConfig()
+	if err != nil {
+		t.Fatalf("derive Apple profile: %v", err)
+	}
+	if native.LocalOpenCodex == nil || native.LocalAppleContainer != nil || native.UpstreamMode != UpstreamModeLocalOpenCodex {
+		t.Fatalf("native runtime retained competing profile: %#v", native)
+	}
+	if apple.LocalAppleContainer == nil || apple.LocalOpenCodex != nil || apple.UpstreamMode != UpstreamModeLocalAppleContainer {
+		t.Fatalf("Apple runtime retained competing profile: %#v", apple)
+	}
+	if cfg.LocalOpenCodex == nil || cfg.LocalAppleContainer == nil || cfg.UpstreamMode != UpstreamModeExternalGateway {
+		t.Fatalf("derivation mutated canonical enrollment: %#v", cfg)
+	}
+}
+
+func TestNativeAndAppleCatalogArtifactsCannotBeHardLinked(t *testing.T) {
+	directory := t.TempDir()
+	codexConfig := filepath.Join(directory, "config.toml")
+	cfg := mustDefaultConfig(t)
+	cfg.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	var err error
+	cfg.LocalOpenCodex, err = NewLocalOpenCodexProfileForCodexConfig(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.LocalAppleContainer, err = NewLocalAppleContainerProfileForCodexConfig(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.LocalOpenCodex.CatalogPath, []byte("catalog\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(cfg.LocalOpenCodex.CatalogPath, cfg.LocalAppleContainer.CatalogPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("native and Apple profiles accepted hard-linked catalog artifacts")
+	}
+}
+
+func TestLocalAppleContainerRejectsEndpointAndCatalogNamespaceOverrides(t *testing.T) {
+	directory := t.TempDir()
+	codexConfig := filepath.Join(directory, "config.toml")
+	base := mustDefaultConfig(t)
+	base.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	profile, err := NewLocalAppleContainerProfileForCodexConfig(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.LocalAppleContainer = profile
+	if err := base.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongEndpoint := base
+	wrongProfile := *profile
+	wrongProfile.UpstreamBaseURL = "http://127.0.0.1:10211/v1"
+	wrongEndpoint.LocalAppleContainer = &wrongProfile
+	if err := wrongEndpoint.Validate(); err == nil {
+		t.Fatal("Apple profile accepted a configurable endpoint")
+	}
+
+	wrongCatalog := base
+	wrongProfile = *profile
+	wrongProfile.CatalogPath = filepath.Join(directory, "shared-catalog.json")
+	wrongCatalog.LocalAppleContainer = &wrongProfile
+	if err := wrongCatalog.Validate(); err == nil {
+		t.Fatal("Apple profile accepted an unreserved catalog namespace")
+	}
+
+	alias := base
+	aliasProfile := *profile
+	aliasProfile.CatalogPath = filepath.Join(directory, LocalAppleContainerCatalog)
+	alias.Catalog.Path = aliasProfile.CatalogPath
+	alias.LocalAppleContainer = &aliasProfile
+	if err := alias.Validate(); err == nil {
+		t.Fatal("Apple profile accepted a shared external catalog artifact")
+	}
+}
+
 func mustDefaultConfig(t *testing.T) Config {
 	t.Helper()
 	cfg, err := NewDefault("https://gateway.example.test/v1", CredentialsSourceFile)

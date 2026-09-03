@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -607,8 +609,404 @@ func TestRuntimeManagerApplyHonorsGateDeadlineAndParksWorkers(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerAppleMaintenanceParksVerifiesAndResumes(t *testing.T) {
+	tracker := NewTracker()
+	var probes atomic.Int64
+	var lifecycleStarts atomic.Int64
+	runtime := runtimeForTest(tracker, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "apple")
+	})
+	runtime.CatalogLifecycle = func(ctx context.Context) {
+		lifecycleStarts.Add(1)
+		<-ctx.Done()
+	}
+	spec := RuntimeSpec{
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			probes.Add(1)
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}
+	manager, err := NewRuntimeManager(context.Background(), tracker, spec, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRuntimeManager(t, manager)
+	waitForRuntime(t, manager, time.Second, func(snapshot RuntimeSnapshot) bool {
+		return snapshot.Admission == string(runtimeAdmissionActive) && snapshot.CatalogRunning
+	})
+
+	prepareCtx, prepareCancel := context.WithTimeout(context.Background(), time.Second)
+	if err := manager.PrepareMaintenance(prepareCtx); err != nil {
+		prepareCancel()
+		t.Fatal(err)
+	}
+	prepareCancel()
+	if snapshot := manager.Snapshot(); snapshot.Admission != string(runtimeAdmissionTransitioning) || snapshot.CatalogRunning || snapshot.ActiveRequests != 0 {
+		t.Fatalf("prepared Apple runtime = %#v", snapshot)
+	}
+	if err := manager.Apply(context.Background(), RuntimeSpec{Profile: RuntimeProfileExternal}, func(context.Context, *Tracker) (Runtime, error) {
+		return runtimeForTest(tracker, func(http.ResponseWriter, *http.Request) {}), nil
+	}); !errors.Is(err, ErrRuntimeMaintenanceState) {
+		t.Fatalf("apply during maintenance error = %v", err)
+	}
+	if err := manager.VerifyMaintenance(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.ResumeMaintenance()
+	waitForRuntime(t, manager, time.Second, func(snapshot RuntimeSnapshot) bool {
+		return snapshot.Profile == RuntimeProfileLocalAppleContainer && snapshot.Admission == string(runtimeAdmissionActive) &&
+			snapshot.CatalogRunning && lifecycleStarts.Load() == 2
+	})
+	if probes.Load() != 2 {
+		t.Fatalf("Apple preflight calls = %d, want initial + maintenance verification", probes.Load())
+	}
+	if lifecycleStarts.Load() != 2 {
+		t.Fatalf("Apple catalog lifecycle starts = %d, want initial + resumed", lifecycleStarts.Load())
+	}
+}
+
+func TestRuntimeManagerAppleMaintenanceDrainsActiveRequestsAndBlocksNewAdmission(t *testing.T) {
+	tracker := NewTracker()
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	runtime := runtimeForTest(tracker, func(http.ResponseWriter, *http.Request) {
+		finish := tracker.Begin()
+		defer finish()
+		close(requestStarted)
+		<-releaseRequest
+	})
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRuntimeManager(t, manager)
+	requestDone := make(chan struct{})
+	go func() {
+		manager.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		close(requestDone)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not enter runtime")
+	}
+	prepareResult := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		prepareResult <- manager.PrepareMaintenance(ctx)
+	}()
+	waitForRuntime(t, manager, time.Second, func(snapshot RuntimeSnapshot) bool {
+		return snapshot.Admission == string(runtimeAdmissionTransitioning)
+	})
+	select {
+	case err := <-prepareResult:
+		t.Fatalf("maintenance returned before active request drained: %v", err)
+	default:
+	}
+	close(releaseRequest)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not finish")
+	}
+	select {
+	case err := <-prepareResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not finish after drain")
+	}
+
+	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer blockedCancel()
+	blockedRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(blockedCtx)
+	blockedResponse := httptest.NewRecorder()
+	manager.Handler().ServeHTTP(blockedResponse, blockedRequest)
+	if blockedResponse.Code != http.StatusServiceUnavailable || !strings.Contains(blockedResponse.Body.String(), "routing_switch_in_progress") {
+		t.Fatalf("maintenance admission response = %d %q", blockedResponse.Code, blockedResponse.Body.String())
+	}
+}
+
+func TestRuntimeManagerAppleMaintenanceCanRetryAfterDrainTimeout(t *testing.T) {
+	tracker := NewTracker()
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	runtime := runtimeForTest(tracker, func(http.ResponseWriter, *http.Request) {
+		finish := tracker.Begin()
+		defer finish()
+		close(requestStarted)
+		<-releaseRequest
+	})
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRuntimeManager(t, manager)
+	requestDone := make(chan struct{})
+	go func() {
+		manager.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		close(requestDone)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not enter runtime")
+	}
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	err = manager.PrepareMaintenance(firstCtx)
+	firstCancel()
+	if !errors.Is(err, ErrRuntimeDrainTimeout) {
+		t.Fatalf("first maintenance prepare error = %v", err)
+	}
+	if snapshot := manager.Snapshot(); snapshot.Admission != string(runtimeAdmissionPaused) {
+		t.Fatalf("timed-out maintenance runtime = %#v", snapshot)
+	}
+	close(releaseRequest)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not finish")
+	}
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), time.Second)
+	defer retryCancel()
+	if err := manager.PrepareMaintenance(retryCtx); err != nil {
+		t.Fatalf("retry maintenance prepare: %v", err)
+	}
+	if snapshot := manager.Snapshot(); snapshot.Admission != string(runtimeAdmissionTransitioning) || snapshot.ActiveRequests != 0 {
+		t.Fatalf("retried maintenance runtime = %#v", snapshot)
+	}
+}
+
+func TestRuntimeManagerReconstructsPendingAppleMaintenanceParked(t *testing.T) {
+	tracker := NewTracker()
+	var probes atomic.Int64
+	var lifecycleStarts atomic.Int64
+	runtime := runtimeForTest(tracker, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "apple")
+	})
+	runtime.CatalogLifecycle = func(ctx context.Context) {
+		lifecycleStarts.Add(1)
+		<-ctx.Done()
+	}
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile:         RuntimeProfileLocalAppleContainer,
+		StartParked:     true,
+		ConnectionLease: testRuntimeConnectionLease,
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			probes.Add(1)
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRuntimeManager(t, manager)
+	if snapshot := manager.Snapshot(); snapshot.Profile != RuntimeProfileLocalAppleContainer || snapshot.Admission != string(runtimeAdmissionPaused) || snapshot.CatalogRunning {
+		t.Fatalf("reconstructed Apple runtime = %#v", snapshot)
+	}
+	if probes.Load() != 0 || lifecycleStarts.Load() != 0 {
+		t.Fatalf("parked startup performed work: probes=%d lifecycle=%d", probes.Load(), lifecycleStarts.Load())
+	}
+	if err := manager.PrepareMaintenance(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.VerifyMaintenance(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.ResumeMaintenance()
+	waitForRuntime(t, manager, time.Second, func(snapshot RuntimeSnapshot) bool {
+		return snapshot.Admission == string(runtimeAdmissionActive) && snapshot.CatalogRunning && lifecycleStarts.Load() == 1
+	})
+	if probes.Load() != 1 || lifecycleStarts.Load() != 1 {
+		t.Fatalf("recovery work = probes %d lifecycle %d, want 1/1", probes.Load(), lifecycleStarts.Load())
+	}
+}
+
+func TestRuntimeManagerCloseRemainsBoundedWhileMaintenancePrepared(t *testing.T) {
+	tracker := NewTracker()
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtimeForTest(tracker, func(http.ResponseWriter, *http.Request) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.PrepareMaintenance(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Close(closeCtx); err != nil {
+		t.Fatalf("close prepared maintenance: %v", err)
+	}
+	if snapshot := manager.Snapshot(); snapshot.Admission != string(runtimeAdmissionClosed) {
+		t.Fatalf("closed prepared runtime = %#v", snapshot)
+	}
+}
+
+func TestRuntimeManagerReleasesAppleLeaseAndGateWhenHandlerPanics(t *testing.T) {
+	tracker := NewTracker()
+	var acquired, released atomic.Int64
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile: RuntimeProfileLocalAppleContainer,
+		ConnectionLease: func(context.Context) (func() error, error) {
+			acquired.Add(1)
+			return func() error {
+				released.Add(1)
+				return nil
+			}, nil
+		},
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtimeForTest(tracker, func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("panic = %#v", recovered)
+			}
+		}()
+		manager.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	}()
+	if acquired.Load() != 1 || released.Load() != 1 {
+		t.Fatalf("Apple lease acquired=%d released=%d", acquired.Load(), released.Load())
+	}
+	applyCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Apply(applyCtx, RuntimeSpec{Profile: RuntimeProfileExternal}, func(context.Context, *Tracker) (Runtime, error) {
+		return runtimeForTest(tracker, func(response http.ResponseWriter, _ *http.Request) {
+			response.WriteHeader(http.StatusNoContent)
+		}), nil
+	}); err != nil {
+		t.Fatalf("apply after panicking Apple request: %v", err)
+	}
+	closeRuntimeManager(t, manager)
+}
+
+func TestRuntimeManagerTransfersAppleReaderAtHeaderAndKeepsResponseDrainGate(t *testing.T) {
+	tracker := NewTracker()
+	var lifecycle sync.RWMutex
+	headerAuthenticated := make(chan struct{})
+	finishResponse := make(chan struct{})
+	requestDone := make(chan struct{})
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile: RuntimeProfileLocalAppleContainer,
+		ConnectionLease: func(context.Context) (func() error, error) {
+			lifecycle.RLock()
+			return func() error {
+				lifecycle.RUnlock()
+				return nil
+			}, nil
+		},
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtimeForTest(tracker, func(response http.ResponseWriter, request *http.Request) {
+		// This is the transport ownership-transfer point: the authenticated
+		// request header has been written, so the connection-bound reader can
+		// be released. RuntimeManager's in-process gate must still cover the
+		// complete response body/drain.
+		release, leaseErr := requireRuntimeConnectionLease(request.Context())
+		if leaseErr != nil || release == nil {
+			panic("missing Apple connection lease")
+		}
+		if releaseErr := release(); releaseErr != nil {
+			panic(releaseErr)
+		}
+		close(headerAuthenticated)
+		<-finishResponse
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		defer close(requestDone)
+		manager.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	}()
+	select {
+	case <-headerAuthenticated:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not transfer the connection reader")
+	}
+
+	writerAcquired := make(chan struct{})
+	applyDone := make(chan error, 1)
+	go func() {
+		lifecycle.Lock()
+		defer lifecycle.Unlock()
+		close(writerAcquired)
+		applyDone <- manager.Apply(context.Background(), RuntimeSpec{Profile: RuntimeProfileExternal}, func(context.Context, *Tracker) (Runtime, error) {
+			return runtimeForTest(tracker, func(response http.ResponseWriter, _ *http.Request) {
+				response.WriteHeader(http.StatusNoContent)
+			}), nil
+		})
+	}()
+	select {
+	case <-writerAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle writer stayed blocked after authenticated header transfer")
+	}
+	select {
+	case err := <-applyDone:
+		t.Fatalf("runtime apply passed an undrained response: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(finishResponse)
+	select {
+	case err := <-applyDone:
+		if err != nil {
+			t.Fatalf("runtime apply after response drain: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime apply did not continue after response drain")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not finish")
+	}
+	closeRuntimeManager(t, manager)
+}
+
 func runtimeForTest(tracker *Tracker, handler http.HandlerFunc) Runtime {
 	return Runtime{GeneralHandler: handler, InteractiveHandler: handler}
+}
+
+func testRuntimeConnectionLease(context.Context) (func() error, error) {
+	return func() error { return nil }, nil
 }
 
 func waitForRuntime(t *testing.T, manager *RuntimeManager, timeout time.Duration, predicate func(RuntimeSnapshot) bool) {

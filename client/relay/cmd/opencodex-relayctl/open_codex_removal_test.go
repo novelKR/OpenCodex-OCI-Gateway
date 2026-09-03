@@ -89,6 +89,41 @@ func TestSafeOperationErrorMapsRemovalSelectionWithoutDetails(t *testing.T) {
 	}
 }
 
+func TestOpenRemovalBoundaryRejectsRuntimeMaintenanceWitness(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "relay.json")
+	codexPath := filepath.Join(directory, "config.toml")
+	store, err := routing.Open(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := routing.NewRelayState(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = routing.BindCodexConfig(state, codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Save(state); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(routing.MaintenancePath(configPath), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openRemovalBoundary(context.Background(), configPath, codexPath, state.Generation); !errors.Is(err, routing.ErrRecoveryRequired) {
+		t.Fatalf("OpenCodex removal maintenance error = %v", err)
+	}
+}
+
 func TestSafeOperationErrorMapsRelayTeardownFailuresWithoutDetails(t *testing.T) {
 	tests := []struct {
 		err       error

@@ -40,13 +40,86 @@ func TestUpgradeInspectStatesAndRecoveryGate(t *testing.T) {
 		t.Fatalf("downgrade inspection=%#v err=%v", incompatible, err)
 	}
 	manager.Version = "1.2.4"
-	relocation := filepath.Join(filepath.Dir(manager.Paths.Binding), "application-relocation.json")
-	if err := os.WriteFile(relocation, []byte("{}\n"), 0o600); err != nil {
+	for _, recoveryPath := range []string{
+		filepath.Join(filepath.Dir(manager.Paths.Binding), "application-relocation.json"),
+		routing.MaintenancePath(manager.Paths.Config),
+	} {
+		t.Run(filepath.Base(recoveryPath), func(t *testing.T) {
+			if err := os.WriteFile(recoveryPath, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			recovery, err := manager.InspectUpgrade(context.Background())
+			if err != nil || recovery.State != UpgradeRecoveryRequired || !recovery.RestartRequired {
+				t.Fatalf("recovery inspection=%#v err=%v", recovery, err)
+			}
+			if err := os.Remove(recoveryPath); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestApplyUpgradeRejectsRuntimeMaintenanceBeforeMutation(t *testing.T) {
+	manager, runner, cleanup := integrationFixture(t)
+	defer cleanup()
+	installIntegration(t, manager)
+	oldRuntime, err := manager.readInstalledRuntime()
+	if err != nil {
 		t.Fatal(err)
 	}
-	recovery, err := manager.InspectUpgrade(context.Background())
-	if err != nil || recovery.State != UpgradeRecoveryRequired || !recovery.RestartRequired {
-		t.Fatalf("recovery inspection=%#v err=%v", recovery, err)
+	upgradeBundledRuntime(t, manager, "1.2.4")
+	inspection, err := manager.InspectUpgrade(context.Background())
+	if err != nil || inspection.State != UpgradeAvailable {
+		t.Fatalf("inspection=%#v err=%v", inspection, err)
+	}
+	maintenancePath := routing.MaintenancePath(manager.Paths.Config)
+	if err := os.WriteFile(maintenancePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	actionsBefore := len(runner.actions)
+	if _, err := manager.ApplyUpgrade(context.Background(), inspection.StateDigest, true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("apply with runtime maintenance error=%v", err)
+	}
+	installed, err := manager.readInstalledRuntime()
+	if err != nil || installed.Target != oldRuntime.Target {
+		t.Fatalf("runtime maintenance changed installed runtime=%#v err=%v", installed, err)
+	}
+	if len(runner.actions) != actionsBefore {
+		t.Fatalf("runtime maintenance invoked launchctl: before=%d after=%d", actionsBefore, len(runner.actions))
+	}
+	if _, err := os.Lstat(maintenancePath); err != nil {
+		t.Fatalf("runtime maintenance witness was changed: %v", err)
+	}
+	if _, err := os.Lstat(manager.upgradeJournalPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime maintenance admitted upgrade journal: %v", err)
+	}
+}
+
+func TestRecoverUpgradeRejectsRuntimeMaintenanceBeforeMutation(t *testing.T) {
+	manager, runner, cleanup := integrationFixture(t)
+	defer cleanup()
+	installIntegration(t, manager)
+	upgradeBundledRuntime(t, manager, "1.2.4")
+	journal := prepareInterruptedUpgrade(t, manager, "prepared")
+	maintenancePath := routing.MaintenancePath(manager.Paths.Config)
+	if err := os.WriteFile(maintenancePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	actionsBefore := len(runner.actions)
+	if _, err := manager.RecoverUpgrade(context.Background()); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("recover with runtime maintenance error=%v", err)
+	}
+	installed, err := manager.readInstalledRuntime()
+	if err != nil || installed.Target != journal.PreviousTarget {
+		t.Fatalf("runtime maintenance changed installed runtime=%#v err=%v", installed, err)
+	}
+	if len(runner.actions) != actionsBefore {
+		t.Fatalf("runtime maintenance invoked launchctl: before=%d after=%d", actionsBefore, len(runner.actions))
+	}
+	for _, path := range []string{maintenancePath, manager.upgradeJournalPath()} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("runtime maintenance recovery changed %s: %v", filepath.Base(path), err)
+		}
 	}
 }
 
