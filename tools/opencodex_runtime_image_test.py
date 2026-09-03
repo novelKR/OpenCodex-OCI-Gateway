@@ -459,7 +459,7 @@ def main_contract(arguments: argparse.Namespace) -> None:
             if docker("container", "inspect", runtime_name, check=False).returncode == 0:
                 fail("runtime contract container name is unexpectedly occupied")
             docker(
-                "network", "create", "--internal", "--label",
+                "network", "create", "--label",
                 "io.github.novelkr.opencodex.runtime-contract=1", network_name,
             )
             network_created = True
