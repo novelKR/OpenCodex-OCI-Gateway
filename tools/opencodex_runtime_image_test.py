@@ -439,6 +439,7 @@ def main_contract(arguments: argparse.Namespace) -> None:
             "port": 10100,
             "oauthOpenBrowser": False,
             "codexAutoStart": False,
+            "websockets": True,
             "defaultProvider": "runtime-contract",
             "providers": {
                 "runtime-contract": {
