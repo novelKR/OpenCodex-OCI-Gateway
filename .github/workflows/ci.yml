@@ -168,7 +168,6 @@ jobs:
     if: github.event.repository.private == false
     runs-on: ubuntu-24.04
     env:
-      DOCKER_CONFIG: ${{ runner.temp }}/opencodex-runtime-docker-config
       BUILDX_DOWNLOAD_URL: https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-amd64
       BUILDX_SHA256: c37114fcd034025ec68e224657c8a5a850df472ded3ddcbca75ad3a7ebb9710d
       BUILDX_VERSION_OUTPUT: github.com/docker/buildx v0.30.1 9e66234aa13328a5e75b75aa5574e1ca6d6d9c01
@@ -217,6 +216,8 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]
+          export DOCKER_CONFIG="${RUNNER_TEMP}/opencodex-runtime-docker-config"
+          printf 'DOCKER_CONFIG=%s\n' "$DOCKER_CONFIG" >> "$GITHUB_ENV"
           umask 077
           plugin_dir="${DOCKER_CONFIG}/cli-plugins"
           download="${RUNNER_TEMP}/docker-buildx-v0.30.1.download"

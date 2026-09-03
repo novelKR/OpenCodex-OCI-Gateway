@@ -74,6 +74,12 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("docker/login-action", runtime)
         self.assertNotIn("push: true", runtime)
         self.assertNotRegex(runtime, r"docker\s+(?:image\s+)?push")
+        self.assertNotIn("DOCKER_CONFIG: ${{ runner.temp }}", workflow)
+        self.assertIn(
+            'export DOCKER_CONFIG="${RUNNER_TEMP}/opencodex-runtime-docker-config"',
+            runtime,
+        )
+        self.assertIn("$GITHUB_ENV", runtime)
         self.assertIn(
             "BUILDX_DOWNLOAD_URL: https://github.com/docker/buildx/releases/"
             "download/v0.30.1/buildx-v0.30.1.linux-amd64",
@@ -148,6 +154,7 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("digest:", dispatch)
         self.assertNotIn("tag:", dispatch)
         self.assertNotIn("pull_request:", workflow)
+        self.assertNotIn("DOCKER_CONFIG: ${{ runner.temp }}", workflow)
         self.assertEqual(
             re.findall(r"^    runs-on: (.+)$", workflow, flags=re.MULTILINE),
             [
