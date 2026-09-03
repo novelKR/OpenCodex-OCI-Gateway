@@ -3,12 +3,14 @@ package localopencodex
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -43,6 +45,45 @@ func TestPreflightAcceptsOpenCodexIdentityAndVisibleModels(t *testing.T) {
 		if request.Header.Get("Accept") != "application/json" || !request.Close {
 			t.Fatalf("local preflight request is not bounded/no-reuse: %#v close=%t", request.Header, request.Close)
 		}
+	}
+}
+
+func TestAppleContainerPreflightSeparatesHostAndGuestPortsAndUsesOnlyAPIKeyForModels(t *testing.T) {
+	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	values := credentials.Values{LocalOpenCodexAPIKey: apiToken}
+	var calls int
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.URL.Host != "127.0.0.1:10210" {
+			t.Fatalf("Apple preflight host = %q", request.URL.Host)
+		}
+		if request.Header.Get("CF-Access-Client-Id") != "" || request.Header.Get("CF-Access-Client-Secret") != "" || request.Header.Get("X-OpenCodex-Relay") != "" {
+			t.Fatalf("Apple preflight leaked unrelated admission headers: %#v", request.Header)
+		}
+		switch request.URL.Path {
+		case "/healthz":
+			if request.Header.Get("X-OpenCodex-API-Key") != "" {
+				t.Fatalf("health request was authenticated: %#v", request.Header)
+			}
+			return jsonResponse(http.StatusOK, `{"service":"opencodex","status":"ok","port":10100}`), nil
+		case "/v1/models":
+			if request.Header.Get("X-OpenCodex-API-Key") != apiToken {
+				t.Fatalf("models API key = %q", request.Header.Get("X-OpenCodex-API-Key"))
+			}
+			return jsonResponse(http.StatusOK, `{"data":[{"id":"apple-local"}]}`), nil
+		default:
+			t.Fatalf("unexpected Apple preflight path %q", request.URL.Path)
+			return nil, nil
+		}
+	})}
+	result := preflightTarget(context.Background(), AppleContainerTarget(values), client)
+	if !result.Ready() || result.ModelCount != 1 || calls != 2 {
+		t.Fatalf("Apple preflight = %#v calls=%d", result, calls)
+	}
+
+	invalid := AppleContainerTarget(credentials.Values{LocalOpenCodexAPIKey: "not-a-token"})
+	if result := preflightTarget(context.Background(), invalid, client); result.Availability != AvailabilityInvalid || calls != 2 {
+		t.Fatalf("invalid Apple token preflight = %#v calls=%d", result, calls)
 	}
 }
 

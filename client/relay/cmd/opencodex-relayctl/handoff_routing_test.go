@@ -90,6 +90,48 @@ func TestParkHandoffForRecoverySurfacesClosedLockSaveFailure(t *testing.T) {
 	}
 }
 
+func TestHandoffRoutingPreflightsRejectRuntimeMaintenanceWitness(t *testing.T) {
+	relayPath := filepath.Join(t.TempDir(), "relay.json")
+	store, err := routing.Open(relayPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := routing.NewRelayState(relayPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = routing.BindCodexConfig(state, filepath.Join(filepath.Dir(relayPath), "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Save(state); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	preparation := removalRoutingRecoveryPreparation{
+		gateState: &removalRoutingRecoveryGateState{allowedGeneration: state.Generation},
+	}
+	if !preparation.routingGenerationMatches(relayPath) {
+		t.Fatal("removal routing generation rejected a clean stable state")
+	}
+	if err := os.WriteFile(routing.MaintenancePath(relayPath), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightHandoffRoutingState(store, state); !errors.Is(err, routing.ErrRecoveryRequired) {
+		t.Fatalf("handoff maintenance preflight error = %v", err)
+	}
+	if preparation.routingGenerationMatches(relayPath) {
+		t.Fatal("removal routing generation accepted a runtime maintenance witness")
+	}
+}
+
 func removalRoutingRecoveryFixture(
 	t *testing.T,
 	recoveryPending bool,

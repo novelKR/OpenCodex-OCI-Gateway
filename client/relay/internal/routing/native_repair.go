@@ -352,7 +352,7 @@ func (c *Controller) revalidateNativeRepairAttempt(expectedGeneration uint64, in
 }
 
 func (c *Controller) inspectNativeRepairLocked(expectedGeneration uint64) (State, codexconfig.NativeRepairInspection, error) {
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return State{}, codexconfig.NativeRepairInspection{}, ErrNativeRepairUnavailable
 	}
 	if pending, err := c.store.HasPendingTransaction(); err != nil || pending {

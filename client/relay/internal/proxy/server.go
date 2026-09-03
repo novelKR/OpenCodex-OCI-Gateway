@@ -191,7 +191,7 @@ func New(cfg config.Config, loader CredentialLoader, tracker *Tracker, logger *s
 		return nil, err
 	}
 	limits := responses.DefaultLimits()
-	if cfg.UpstreamMode == config.UpstreamModeLocalOpenCodex {
+	if cfg.UpstreamMode == config.UpstreamModeLocalOpenCodex || cfg.UpstreamMode == config.UpstreamModeLocalAppleContainer {
 		limits.MaxEncodedBytes = 256 * responses.MiB
 	}
 	schedulerConfig := cfg.Responses.Scheduler
@@ -418,14 +418,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	values := credentials.Values{}
-	if s.cfg.UpstreamMode == config.UpstreamModeExternalGateway {
+	profile := s.cfg.Credentials.RemoteAuthenticationProfile()
+	if profile != config.RemoteAuthenticationNone {
 		values, err = s.credentials()
 		if err != nil {
 			s.logger.Error("relay credential lookup failed", "method", r.Method, "path", r.URL.Path, "error", err.Error())
 			writeError(w, http.StatusServiceUnavailable, "credential_unavailable")
 			return
 		}
-		if err := values.ValidateForProfile(s.cfg.Credentials.RemoteAuthenticationProfile()); err != nil {
+		if err := values.ValidateForProfile(profile); err != nil {
 			s.logger.Error("relay credential validation failed", "method", r.Method, "path", r.URL.Path, "error", err.Error())
 			writeError(w, http.StatusServiceUnavailable, "credential_unavailable")
 			return
@@ -638,6 +639,7 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	request.Header.Del("CF-Access-Client-Secret")
 	request.Header.Del("Cf-Access-Jwt-Assertion")
 	request.Header.Del("X-OpenCodex-API-Key")
+	request.Header.Del("X-OpenCodex-Relay")
 	profile := s.cfg.Credentials.RemoteAuthenticationProfile()
 	if profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		request.Header.Set("CF-Access-Client-Id", values.CFClientID)
@@ -645,6 +647,9 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	}
 	if profile == config.RemoteAuthenticationGatewayAPIKey || profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		request.Header.Set("X-OpenCodex-API-Key", values.GatewayKey)
+	}
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		request.Header.Set("X-OpenCodex-API-Key", values.LocalOpenCodexAPIKey)
 	}
 	if profile != config.RemoteAuthenticationNone {
 		request.Header.Set("X-OpenCodex-Relay", "pw-local-v1")

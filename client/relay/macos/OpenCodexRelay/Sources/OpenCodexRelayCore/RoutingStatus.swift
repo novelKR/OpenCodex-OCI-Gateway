@@ -6,6 +6,7 @@ public enum RoutingBackend: String, Codable, CaseIterable, Sendable {
 	case unknown
 	case external
     case localOpenCodex = "local_opencodex"
+    case localAppleContainer = "local_apple_container"
     case none
 
     public var displayName: String {
@@ -16,6 +17,8 @@ public enum RoutingBackend: String, Codable, CaseIterable, Sendable {
             return "External gateway"
         case .localOpenCodex:
             return "Local OpenCodex (10100)"
+        case .localAppleContainer:
+            return "OpenCodex (Apple Container)"
         case .none:
             return "Native ChatGPT Codex"
         }
@@ -23,7 +26,7 @@ public enum RoutingBackend: String, Codable, CaseIterable, Sendable {
 
     public var isRelayBacked: Bool {
         switch self {
-		case .external, .localOpenCodex:
+		case .external, .localOpenCodex, .localAppleContainer:
 			return true
 		case .none, .unknown:
             return false
@@ -41,7 +44,7 @@ public enum RoutingMode: String, Codable, Sendable {
 
     public static func forBackend(_ backend: RoutingBackend) -> RoutingMode {
         switch backend {
-        case .external, .localOpenCodex:
+        case .external, .localOpenCodex, .localAppleContainer:
             return .relay
         case .none:
             return .native
@@ -398,12 +401,12 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
         case recoveryCapabilities = "recovery_capabilities"
     }
 
-    /// Enforce the complete v2/v3 state machine before UI code consumes it.
+    /// Enforce the complete v2/v3/v4 state machine before UI code consumes it.
     /// Schema v2 remains readable but cannot authorize recovery actions because
     /// it carries no evidence. An unexpected status is a fail-closed local
     /// control error, never a hint to guess a backend or perform a fallback.
     public func validated() throws -> RoutingStatus {
-        guard (schemaVersion == 2 || schemaVersion == 3),
+        guard (schemaVersion == 2 || schemaVersion == 3 || schemaVersion == 4),
               activeRequests.map({ $0 >= 0 }) ?? true,
               generation > 0 || allowsOpaqueZeroGeneration,
               desiredMode == RoutingMode.forBackend(desiredBackend),
@@ -503,10 +506,14 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
                 throw RelayctlError.invalidStatus
             }
         case .applying:
-            guard desiredBackend != appliedBackend,
+            let runtimeMaintenance = schemaVersion == 4 &&
+                desiredBackend == .localAppleContainer &&
+                appliedBackend == .localAppleContainer &&
+                !desktopRestartRequired
+            guard (desiredBackend != appliedBackend || runtimeMaintenance),
                   relayAdmission == .deny,
                   catalogRefresh == .pause,
-                  desktopRestartRequired else {
+                  (desktopRestartRequired || runtimeMaintenance) else {
                 throw RelayctlError.invalidStatus
             }
         case .recoveryRequired:
@@ -535,7 +542,7 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
     /// non-actionable: no recovery capability or saved-removal predicate may
     /// use it as a generation witness.
     private var allowsOpaqueZeroGeneration: Bool {
-        guard schemaVersion == 3,
+        guard (schemaVersion == 3 || schemaVersion == 4),
               generation == 0,
               phase == .recoveryRequired,
               desiredBackend == .unknown,
@@ -558,7 +565,7 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
     }
 
     public func canRecover(_ action: RoutingRecoveryAction) -> Bool {
-        guard schemaVersion == 3,
+        guard (schemaVersion == 3 || schemaVersion == 4),
               phase == .recoveryRequired,
               let recoveryCapabilities else {
             return false
@@ -586,6 +593,11 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
             // durable state but be parked. It is never silently changed to
             // External and it must not admit or replay a request.
             return relayAdmission == .deny && catalogRefresh == .pause
+        case .localAppleContainer:
+            if connection.localOpenCodex.isReady {
+                return relayAdmission == .allow && catalogRefresh == .run
+            }
+            return relayAdmission == .deny && catalogRefresh == .pause
         case .none:
 			return false
 		case .unknown:
@@ -601,7 +613,8 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
         // The local profile is explicitly fail-closed. This comes before the
         // generic relay-active label so an apparently active durable state is
         // never mistaken for a live 10100 backend.
-        if appliedBackend == .localOpenCodex, !connection.localOpenCodex.isReady {
+        if (appliedBackend == .localOpenCodex || appliedBackend == .localAppleContainer),
+           !connection.localOpenCodex.isReady {
             return .localOpenCodexUnavailable
         }
         if connection.routingSync == .invalid || phase == .recoveryRequired {
@@ -615,11 +628,11 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
         }
         switch phase {
         case .relayActive:
-            return appliedBackend == .localOpenCodex ? .localOpenCodexReady : .externalReady
+            return (appliedBackend == .localOpenCodex || appliedBackend == .localAppleContainer) ? .localOpenCodexReady : .externalReady
         case .nativePendingRestart:
             return .nativePending
         case .relayPendingRestart, .backendPendingRestart:
-            return desiredBackend == .localOpenCodex ? .localOpenCodexPending : .externalPending
+            return (desiredBackend == .localOpenCodex || desiredBackend == .localAppleContainer) ? .localOpenCodexPending : .externalPending
         case .applying:
             return .switching
         case .nativeActive:
@@ -690,7 +703,7 @@ public struct RoutingStatus: Codable, Equatable, Sendable {
     /// projection. The helper independently verifies the saved recovery
     /// witness before it performs any mutation.
     public var canReviewSavedOpenCodexRemovalRecovery: Bool {
-        schemaVersion == 3 &&
+        (schemaVersion == 3 || schemaVersion == 4) &&
             generation > 0 &&
             phase == .recoveryRequired &&
             desiredBackend == .unknown &&
@@ -1001,6 +1014,11 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
     case nativeRemovalBoundaryChanged = "native_removal_boundary_changed"
     case nativeRecoveryRequired = "native_recovery_required"
     case customCodexHomeUnsupported = "custom_codex_home_unsupported"
+    case containerRuntimeInvalidRequest = "container_runtime_invalid_request"
+    case containerRuntimeChanged = "container_runtime_changed"
+    case containerRuntimeRecoveryRequired = "container_runtime_recovery_required"
+    case containerRuntimeCredentialUnavailable = "container_runtime_credential_unavailable"
+    case containerRuntimeUnavailable = "container_runtime_unavailable"
     case teardownUnsupported = "teardown_unsupported"
     case teardownCandidateChanged = "teardown_candidate_changed"
     case teardownPreflightFailed = "teardown_preflight_failed"
@@ -1038,6 +1056,7 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
              .nativeRepairOwnerChanged, .nativeOwnerRepairFailed, .nativeOwnerBusy, .nativeOwnerRestoreFailed, .nativeStateRepairPending,
              .desktopExitConfirmationRequired, .operationTimedOut, .openCodexCandidateChanged,
              .nativeRemovalBoundaryChanged, .nativeRecoveryRequired,
+             .containerRuntimeChanged, .containerRuntimeUnavailable,
              .teardownCandidateChanged, .teardownPreflightFailed,
              .authenticationFailed, .gatewayUnreachable, .configChanged,
              .routingChanged, .transitionPending, .runtimeSwapFailed,
@@ -1048,6 +1067,8 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
              .nativeRoutingUnverified, .nativeRepairUnavailable, .nativeOwnerConfigurationInvalid, .nativeOwnerResultInvalid,
              .openCodexManualRemovalRequired, .openCodexCleanupJournalUnsafe,
              .nativeRemovalBoundaryUnsafe, .customCodexHomeUnsupported,
+             .containerRuntimeInvalidRequest, .containerRuntimeRecoveryRequired,
+             .containerRuntimeCredentialUnavailable,
              .teardownUnsupported, .teardownRefused, .teardownResultInvalid,
              .teardownVerificationFailed, .invalidAddress, .credentialUnavailable,
              .catalogInvalid, .gatewayUnsupported, .integrationAppLocationInvalid,
@@ -1075,6 +1096,10 @@ public enum RelayctlReportedErrorCode: String, Codable, Equatable, Sendable {
              .nativeRemovalBoundaryUnsafe:
             "manual_remediation"
         case .customCodexHomeUnsupported: "review_request"
+        case .containerRuntimeInvalidRequest: "review_request"
+        case .containerRuntimeChanged, .containerRuntimeUnavailable: "refresh_status"
+        case .containerRuntimeRecoveryRequired: "open_recovery"
+        case .containerRuntimeCredentialUnavailable: "activate_runtime"
         case .openCodexCandidateChanged: "rediscover_opencodex"
         case .teardownCandidateChanged: "rediscover_opencodex"
         case .teardownPreflightFailed: "refresh_status"
@@ -1272,6 +1297,16 @@ public enum RelayctlError: LocalizedError, Equatable, Sendable {
                 return "Recover the interrupted standalone Native Codex removal before continuing."
             case .customCodexHomeUnsupported:
                 return "Standalone Native removal supports only the fixed ~/.codex configuration location."
+            case .containerRuntimeInvalidRequest:
+                return "The selected container runtime request is no longer valid. Refresh its status before trying again."
+            case .containerRuntimeChanged:
+                return "Container runtime or routing state changed. Refresh it before trying again."
+            case .containerRuntimeRecoveryRequired:
+                return "Recover the interrupted container runtime operation before continuing."
+            case .containerRuntimeCredentialUnavailable:
+                return "The Apple Container runtime credentials are unavailable. Activate the runtime again after restoring them."
+            case .containerRuntimeUnavailable:
+                return "Apple Container is unavailable or no longer satisfies the required capability checks."
             case .teardownUnsupported:
                 return "This OpenCodex installation does not have a verified Relay preserving teardown adapter."
             case .teardownCandidateChanged:

@@ -12,11 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 )
 
 // LocalOpenCodexAvailability is safe to include in the relayctl/MenuBar
@@ -45,9 +45,12 @@ const localOpenCodexMaterializationTimeout = 12 * time.Second
 // environment proxy. Callers provide the already policy-validated numeric
 // loopback /v1 base URL.
 type LocalOpenCodexFetcher struct {
-	BaseURL     string
-	CatalogPath string
-	HTTPClient  *http.Client
+	BaseURL               string
+	CatalogPath           string
+	ExpectedServicePort   int
+	AuthenticationProfile string
+	Credentials           func() (credentials.Values, error)
+	HTTPClient            *http.Client
 }
 
 // MaterializeLocalOpenCodexCatalog validates the fixed loopback OpenCodex
@@ -111,7 +114,7 @@ func (f LocalOpenCodexFetcher) preflightEntries(ctx context.Context) (LocalOpenC
 		Port    int    `json:"port"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
-	if err := decoder.Decode(&identity); err != nil || identity.Service != "opencodex" || identity.Status != "ok" || identity.Port != endpointPort(endpoint) {
+	if err := decoder.Decode(&identity); err != nil || identity.Service != "opencodex" || identity.Status != "ok" || identity.Port != f.expectedServicePort() {
 		return LocalOpenCodexForeign, nil, fmt.Errorf("%w: health identity", ErrLocalOpenCodexPreflight)
 	}
 	if err := ensureJSONEOF(decoder); err != nil {
@@ -174,6 +177,18 @@ func (f LocalOpenCodexFetcher) fetchEntries(ctx context.Context, client http.Cli
 	if err != nil {
 		return nil, fmt.Errorf("%w: models request", ErrLocalOpenCodexPreflight)
 	}
+	profile := f.authenticationProfile()
+	values := credentials.Values{}
+	if profile != config.RemoteAuthenticationNone {
+		if f.Credentials == nil {
+			return nil, fmt.Errorf("%w: models authentication", ErrLocalOpenCodexPreflight)
+		}
+		values, err = f.Credentials()
+		if err != nil || values.ValidateForProfile(profile) != nil {
+			return nil, fmt.Errorf("%w: models authentication", ErrLocalOpenCodexPreflight)
+		}
+	}
+	applyCredentialHeaders(request.Header, profile, values)
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("%w: models unavailable", ErrLocalOpenCodexPreflight)
@@ -199,7 +214,12 @@ func (f LocalOpenCodexFetcher) fetchEntries(ctx context.Context, client http.Cli
 }
 
 func (f LocalOpenCodexFetcher) endpoint() (*url.URL, error) {
-	if !config.IsLocalOpenCodexBaseURL(f.BaseURL) {
+	profile := f.authenticationProfile()
+	validBaseURL := profile == config.RemoteAuthenticationNone && config.IsLocalOpenCodexBaseURL(f.BaseURL)
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		validBaseURL = config.IsLocalAppleContainerBaseURL(f.BaseURL)
+	}
+	if !validBaseURL || f.expectedServicePort() != 10100 {
 		return nil, errors.New("invalid local OpenCodex endpoint")
 	}
 	endpoint, err := url.Parse(f.BaseURL)
@@ -207,6 +227,20 @@ func (f LocalOpenCodexFetcher) endpoint() (*url.URL, error) {
 		return nil, errors.New("invalid local OpenCodex endpoint")
 	}
 	return endpoint, nil
+}
+
+func (f LocalOpenCodexFetcher) authenticationProfile() string {
+	if f.AuthenticationProfile == "" {
+		return config.RemoteAuthenticationNone
+	}
+	return f.AuthenticationProfile
+}
+
+func (f LocalOpenCodexFetcher) expectedServicePort() int {
+	if f.ExpectedServicePort == 0 {
+		return 10100
+	}
+	return f.ExpectedServicePort
 }
 
 func (f LocalOpenCodexFetcher) client() http.Client {
@@ -232,17 +266,6 @@ func (f LocalOpenCodexFetcher) client() http.Client {
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return client
-}
-
-func endpointPort(endpoint *url.URL) int {
-	if endpoint == nil {
-		return 0
-	}
-	port, err := strconv.Atoi(endpoint.Port())
-	if err == nil && port > 0 && port <= 65535 {
-		return port
-	}
-	return 0
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

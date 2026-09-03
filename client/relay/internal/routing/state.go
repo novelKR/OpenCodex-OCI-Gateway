@@ -17,12 +17,13 @@ import (
 )
 
 const (
-	// SchemaVersion 2 introduces the explicit relay backend selection. The
-	// legacy relay mode remains in the wire state for compatibility, but it is
-	// no longer sufficient to distinguish the external gateway from a local
-	// OpenCodex profile.
-	SchemaVersion       = 2
-	legacySchemaVersion = 1
+	// SchemaVersion 3 adds a durable Apple Container backend while preserving
+	// every v1/v2 backend meaning. The legacy relay mode remains in the wire
+	// state for compatibility, but it is not sufficient to distinguish the
+	// external, host-native, and Apple Container relay profiles.
+	SchemaVersion                = 3
+	legacySchemaVersion          = 1
+	explicitBackendSchemaVersion = 2
 )
 
 const (
@@ -44,10 +45,11 @@ const (
 type Backend string
 
 const (
-	BackendUnknown        Backend = "unknown"
-	BackendExternal       Backend = "external"
-	BackendLocalOpenCodex Backend = "local_opencodex"
-	BackendNone           Backend = "none"
+	BackendUnknown             Backend = "unknown"
+	BackendExternal            Backend = "external"
+	BackendLocalOpenCodex      Backend = "local_opencodex"
+	BackendLocalAppleContainer Backend = "local_apple_container"
+	BackendNone                Backend = "none"
 )
 
 type Phase string
@@ -259,7 +261,8 @@ func (s State) validateForBound(bound string) error {
 		// A gateway URL reload rebuilds the immutable External runtime without
 		// changing the selected backend. The adjacent validated transaction
 		// journal distinguishes this path from an ordinary backend switch.
-		if s.DesiredBackend == BackendExternal && s.AppliedBackend == BackendExternal {
+		if (s.DesiredBackend == BackendExternal && s.AppliedBackend == BackendExternal) ||
+			(s.DesiredBackend == BackendLocalAppleContainer && s.AppliedBackend == BackendLocalAppleContainer) {
 			return nil
 		}
 	case PhaseNativeActive:
@@ -286,16 +289,16 @@ func validRecoveryBackend(backend Backend) bool {
 }
 
 func validBackend(backend Backend) bool {
-	return backend == BackendExternal || backend == BackendLocalOpenCodex || backend == BackendNone
+	return backend == BackendExternal || backend == BackendLocalOpenCodex || backend == BackendLocalAppleContainer || backend == BackendNone
 }
 
 func validRelayBackend(backend Backend) bool {
-	return backend == BackendExternal || backend == BackendLocalOpenCodex
+	return backend == BackendExternal || backend == BackendLocalOpenCodex || backend == BackendLocalAppleContainer
 }
 
 func modeForBackend(backend Backend) Mode {
 	switch backend {
-	case BackendExternal, BackendLocalOpenCodex:
+	case BackendExternal, BackendLocalOpenCodex, BackendLocalAppleContainer:
 		return ModeRelay
 	case BackendNone:
 		return ModeNative
@@ -323,6 +326,15 @@ func decodeState(payload []byte, bound string) (State, error) {
 	}
 	if state.Schema == legacySchemaVersion {
 		state = migrateSchemaV1(state)
+	} else if state.Schema == explicitBackendSchemaVersion {
+		// Schema v2 predates the Apple Container backend. Preserve only labels
+		// that a genuine v2 writer could have emitted; otherwise a crafted or
+		// corrupt old file could opt into a newly privileged local profile merely
+		// by being decoded by newer software.
+		if !validSchemaV2Backend(state.DesiredBackend) || !validSchemaV2Backend(state.AppliedBackend) {
+			return State{}, fmt.Errorf("%w: schema v2 contains a future backend", ErrStateIncompatible)
+		}
+		state.Schema = SchemaVersion
 	}
 	// A persisted v2 file must carry its own explicit backend labels.  Do not
 	// repair a mode/backend disagreement from disk by inferring the old
@@ -371,6 +383,10 @@ func backendForLegacyMode(mode Mode) Backend {
 	default:
 		return BackendUnknown
 	}
+}
+
+func validSchemaV2Backend(backend Backend) bool {
+	return backend == BackendUnknown || backend == BackendExternal || backend == BackendLocalOpenCodex || backend == BackendNone
 }
 
 func encodeState(state State) ([]byte, error) {

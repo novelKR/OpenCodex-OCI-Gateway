@@ -48,6 +48,18 @@ func AppliedRoutingDriftCheck(relayConfigPath string) DriftCheck {
 				"http://"+local.Responses.Scheduler.InteractiveListenAddress+"/v1",
 				local.Catalog.Path,
 			)
+		case BackendLocalAppleContainer:
+			local, localErr := cfg.LocalAppleContainerRuntimeConfig()
+			if localErr != nil {
+				return errors.New("local Apple Container profile is unavailable for routing drift check")
+			}
+			return codexconfig.ValidateManagedRoutingForOwner(
+				state.BoundCodexConfigPath,
+				owner,
+				"http://"+local.ListenAddress+"/v1",
+				"http://"+local.Responses.Scheduler.InteractiveListenAddress+"/v1",
+				local.Catalog.Path,
+			)
 		default:
 			return errors.New("routing backend is unknown")
 		}

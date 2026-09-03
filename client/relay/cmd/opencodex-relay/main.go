@@ -78,7 +78,20 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		control, err = routing.StartControlServer(ctx, configPath, runtime.apply)
+		maintenance, maintenanceErr := routing.NewMaintenanceCoordinator(configPath, routingWatcher, runtime)
+		if maintenanceErr != nil {
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = runtime.Close(shutdown)
+			cancel()
+			fatal(maintenanceErr)
+		}
+		controlHandler := func(controlCtx context.Context, request routing.ControlRequest) (routing.ControlResponse, error) {
+			if request.Operation == routing.ControlOperationApply {
+				return runtime.apply(controlCtx, request)
+			}
+			return maintenance.Handle(controlCtx, request)
+		}
+		control, err = routing.StartControlServer(ctx, configPath, controlHandler)
 		if err != nil {
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = runtime.Close(shutdown)

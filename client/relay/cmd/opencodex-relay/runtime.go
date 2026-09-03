@@ -18,12 +18,13 @@ import (
 // profile and the optional macOS-local profile. It deliberately does not own
 // routing state or Codex TOML: those remain in routing.Controller.
 type relayRuntime struct {
-	configPath     string
-	watcher        *routing.Watcher
-	tracker        *proxy.Tracker
-	logger         *slog.Logger
-	manager        *proxy.RuntimeManager
-	localPreflight localOpenCodexPreflight
+	configPath      string
+	watcher         *routing.Watcher
+	tracker         *proxy.Tracker
+	logger          *slog.Logger
+	manager         *proxy.RuntimeManager
+	localPreflight  localTargetPreflight
+	loadCredentials credentialLoader
 }
 
 // localOpenCodexPreflight is intentionally private. It keeps the runtime's
@@ -31,6 +32,8 @@ type relayRuntime struct {
 // while letting startup tests prove a non-ready persisted Local selection
 // without requiring a listener on 10100.
 type localOpenCodexPreflight func(context.Context, string) localopencodex.Result
+type localTargetPreflight func(context.Context, localopencodex.Target) localopencodex.Result
+type credentialLoader func(config.CredentialsConfig) (credentials.Values, error)
 
 func newRelayRuntime(
 	ctx context.Context,
@@ -40,7 +43,7 @@ func newRelayRuntime(
 	tracker *proxy.Tracker,
 	logger *slog.Logger,
 ) (*relayRuntime, error) {
-	return newRelayRuntimeWithLocalPreflight(ctx, configPath, cfg, watcher, tracker, logger, localopencodex.Preflight)
+	return newRelayRuntimeWithDependencies(ctx, configPath, cfg, watcher, tracker, logger, localopencodex.PreflightTarget, credentials.Load)
 }
 
 func newRelayRuntimeWithLocalPreflight(
@@ -52,18 +55,47 @@ func newRelayRuntimeWithLocalPreflight(
 	logger *slog.Logger,
 	preflight localOpenCodexPreflight,
 ) (*relayRuntime, error) {
+	if preflight == nil {
+		preflight = localopencodex.Preflight
+	}
+	return newRelayRuntimeWithDependencies(
+		ctx, configPath, cfg, watcher, tracker, logger,
+		func(ctx context.Context, target localopencodex.Target) localopencodex.Result {
+			if target.AuthenticationProfile == config.RemoteAuthenticationNone {
+				return preflight(ctx, target.BaseURL)
+			}
+			return localopencodex.PreflightTarget(ctx, target)
+		},
+		credentials.Load,
+	)
+}
+
+func newRelayRuntimeWithDependencies(
+	ctx context.Context,
+	configPath string,
+	cfg config.Config,
+	watcher *routing.Watcher,
+	tracker *proxy.Tracker,
+	logger *slog.Logger,
+	preflight localTargetPreflight,
+	loadCredentials credentialLoader,
+) (*relayRuntime, error) {
 	if cfg.UpstreamMode != config.UpstreamModeExternalGateway {
 		return nil, errors.New("runtime profile switching requires an external_gateway canonical config")
 	}
 	if preflight == nil {
-		preflight = localopencodex.Preflight
+		preflight = localopencodex.PreflightTarget
+	}
+	if loadCredentials == nil {
+		loadCredentials = credentials.Load
 	}
 	runtime := &relayRuntime{
-		configPath:     configPath,
-		watcher:        watcher,
-		tracker:        tracker,
-		logger:         logger,
-		localPreflight: preflight,
+		configPath:      configPath,
+		watcher:         watcher,
+		tracker:         tracker,
+		logger:          logger,
+		localPreflight:  preflight,
+		loadCredentials: loadCredentials,
 	}
 
 	// A durable Local selection must never restart as External merely because
@@ -71,21 +103,41 @@ func newRelayRuntimeWithLocalPreflight(
 	// watcher’s *applied* backend; pending/applying/native/recovery snapshots
 	// start parked and expose only health until an explicit controller apply.
 	initialBackend := initialRuntimeBackend(watcher.Snapshot())
-	if initialBackend == routing.BackendLocalOpenCodex && (gort.GOOS != "darwin" || gort.GOARCH != "arm64") {
+	startParked := false
+	if initialBackend == routing.BackendNone {
+		store, storeErr := routing.Open(configPath)
+		if storeErr == nil {
+			if _, pending, maintenanceErr := store.MaintenanceRecoveryState(); maintenanceErr == nil && pending {
+				initialBackend = routing.BackendLocalAppleContainer
+				startParked = true
+			}
+		}
+	}
+	if (initialBackend == routing.BackendLocalOpenCodex || initialBackend == routing.BackendLocalAppleContainer) &&
+		(gort.GOOS != "darwin" || gort.GOARCH != "arm64") {
 		initialBackend = routing.BackendNone
+		startParked = false
 	}
 
-	if initialBackend == routing.BackendLocalOpenCodex {
-		localCfg, localErr := cfg.LocalOpenCodexRuntimeConfig()
+	if initialBackend == routing.BackendLocalOpenCodex || initialBackend == routing.BackendLocalAppleContainer {
+		var localCfg config.Config
+		var localErr error
+		if initialBackend == routing.BackendLocalOpenCodex {
+			localCfg, localErr = cfg.LocalOpenCodexRuntimeConfig()
+		} else {
+			localCfg, localErr = cfg.LocalAppleContainerRuntimeConfig()
+		}
 		if localErr == nil {
-			initial, observation, buildErr := runtime.build(ctx, localCfg, routing.BackendLocalOpenCodex)
+			initial, observation, buildErr := runtime.build(ctx, localCfg, initialBackend)
 			if buildErr != nil {
 				return nil, buildErr
 			}
+			spec := runtime.specFor(localCfg, initialBackend, func() *proxy.ConnectionObservation { return observation })
+			spec.StartParked = startParked
 			manager, managerErr := proxy.NewRuntimeManager(
 				ctx,
 				tracker,
-				runtime.specFor(localCfg, routing.BackendLocalOpenCodex, func() *proxy.ConnectionObservation { return observation }),
+				spec,
 				initial,
 			)
 			if managerErr != nil {
@@ -141,7 +193,9 @@ func initialRuntimeBackend(snapshot routing.Snapshot) routing.Backend {
 	if snapshot.Invalid || !snapshot.AllowsDataPlane() {
 		return routing.BackendNone
 	}
-	if snapshot.State.AppliedBackend == routing.BackendExternal || snapshot.State.AppliedBackend == routing.BackendLocalOpenCodex {
+	if snapshot.State.AppliedBackend == routing.BackendExternal ||
+		snapshot.State.AppliedBackend == routing.BackendLocalOpenCodex ||
+		snapshot.State.AppliedBackend == routing.BackendLocalAppleContainer {
 		return snapshot.State.AppliedBackend
 	}
 	return routing.BackendNone
@@ -153,7 +207,7 @@ func (r *relayRuntime) build(ctx context.Context, cfg config.Config, backend rou
 	}
 	observation := proxy.NewConnectionObservation(cfg.UpstreamMode)
 	loader := func() (credentials.Values, error) {
-		return credentials.Load(cfg.Credentials)
+		return r.loadCredentials(cfg.Credentials)
 	}
 	server, err := proxy.New(
 		cfg,
@@ -174,8 +228,8 @@ func (r *relayRuntime) build(ctx context.Context, cfg config.Config, backend rou
 		switch backend {
 		case routing.BackendExternal:
 			runCatalogLifecycle(lifecycleCtx, cfg, loader, r.tracker, r.logger, r.watcher, observation)
-		case routing.BackendLocalOpenCodex:
-			runLocalOpenCodexCatalogLifecycle(lifecycleCtx, cfg, r.tracker, r.logger, r.watcher, observation)
+		case routing.BackendLocalOpenCodex, routing.BackendLocalAppleContainer:
+			runLocalOpenCodexCatalogLifecycle(lifecycleCtx, cfg, loader, r.tracker, r.logger, r.watcher, observation)
 		default:
 			observation.SetCatalogLifecycle(proxy.CatalogLifecyclePaused)
 		}
@@ -192,22 +246,35 @@ func (r *relayRuntime) specFor(cfg config.Config, backend routing.Backend, obser
 	switch backend {
 	case routing.BackendExternal:
 		spec.Profile = proxy.RuntimeProfileExternal
-	case routing.BackendLocalOpenCodex:
-		spec.Profile = proxy.RuntimeProfileLocalOpenCodex
+	case routing.BackendLocalOpenCodex, routing.BackendLocalAppleContainer:
+		selectedBackend := backend
+		if selectedBackend == routing.BackendLocalOpenCodex {
+			spec.Profile = proxy.RuntimeProfileLocalOpenCodex
+		} else {
+			spec.Profile = proxy.RuntimeProfileLocalAppleContainer
+		}
 		spec.LocalProbeAllowed = func() bool {
 			// A request transition may intentionally retain the current Local
 			// profile until Desktop-safe Apply, but applying/native/recovery must
 			// not create another 10100 probe or local catalog egress.
 			snapshot := r.watcher.Snapshot()
 			return !snapshot.Invalid && snapshot.State.AllowsDataPlane() &&
-				snapshot.State.AppliedBackend == routing.BackendLocalOpenCodex
+				snapshot.State.AppliedBackend == selectedBackend
 		}
 		spec.LocalProbe = func(ctx context.Context) (proxy.LocalAvailability, error) {
 			preflight := r.localPreflight
 			if preflight == nil {
-				preflight = localopencodex.Preflight
+				preflight = localopencodex.PreflightTarget
 			}
-			result := preflight(ctx, cfg.UpstreamBaseURL)
+			values, err := r.loadCredentials(cfg.Credentials)
+			if err != nil {
+				return proxy.LocalAvailabilityUnknown, err
+			}
+			target := localopencodex.NativeTarget(cfg.UpstreamBaseURL)
+			if selectedBackend == routing.BackendLocalAppleContainer {
+				target = localopencodex.AppleContainerTarget(values)
+			}
+			result := preflight(ctx, target)
 			return localAvailabilityForRuntime(result.Availability), nil
 		}
 		spec.LocalAvailabilityObserver = func(value proxy.LocalAvailability) {
@@ -264,6 +331,14 @@ func (r *relayRuntime) apply(ctx context.Context, request routing.ControlRequest
 		if err != nil {
 			return routing.ControlResponse{}, err
 		}
+	case routing.BackendLocalAppleContainer:
+		if gort.GOOS != "darwin" || gort.GOARCH != "arm64" {
+			return routing.ControlResponse{}, errors.New("Apple Container runtime profile is macOS Apple Silicon only")
+		}
+		runtimeCfg, err = canonical.LocalAppleContainerRuntimeConfig()
+		if err != nil {
+			return routing.ControlResponse{}, err
+		}
 	case routing.BackendNone:
 		// No candidate server is needed. RuntimeManager retains a retired
 		// handler only for health while all data-plane requests are parked.
@@ -285,6 +360,26 @@ func (r *relayRuntime) apply(ctx context.Context, request routing.ControlRequest
 		return routing.ControlResponse{}, fmt.Errorf("apply runtime: %w", err)
 	}
 	return routing.ControlResponse{OK: true, Generation: request.Generation, Backend: request.Backend}, nil
+}
+
+func (r *relayRuntime) Prepare(ctx context.Context) error {
+	if r == nil || r.manager == nil {
+		return proxy.ErrRuntimeManagerClosed
+	}
+	return r.manager.PrepareMaintenance(ctx)
+}
+
+func (r *relayRuntime) Verify(ctx context.Context, _ routing.ControlOperation) error {
+	if r == nil || r.manager == nil {
+		return proxy.ErrRuntimeManagerClosed
+	}
+	return r.manager.VerifyMaintenance(ctx)
+}
+
+func (r *relayRuntime) Resume() {
+	if r != nil && r.manager != nil {
+		r.manager.ResumeMaintenance()
+	}
 }
 
 func (r *relayRuntime) Handler() *proxy.RuntimeManager {

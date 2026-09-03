@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -83,6 +84,55 @@ func TestRelayInjectsOuterCredentialsAndStreams(t *testing.T) {
 	}
 	if response.Header.Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("content type = %q", response.Header.Get("Content-Type"))
+	}
+}
+
+func TestAppleRuntimeRewriteStripsCallerAdmissionHeadersAndInjectsOnlyAPIKey(t *testing.T) {
+	directory := t.TempDir()
+	codexPath := filepath.Join(directory, "config.toml")
+	canonical, err := config.NewDefault("https://gateway.example.test/v1", config.CredentialsSourceNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	canonical.LocalAppleContainer, err = config.NewLocalAppleContainerProfileForCodexConfig(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := canonical.LocalAppleContainerRuntimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(cfg, func() (credentials.Values, error) { return credentials.Values{}, nil }, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	incoming.Header.Set("Authorization", "Bearer native")
+	incoming.Header.Set("CF-Access-Client-Id", "caller-id")
+	incoming.Header.Set("CF-Access-Client-Secret", "caller-secret")
+	incoming.Header.Set("Cf-Access-Jwt-Assertion", "caller-jwt")
+	incoming.Header.Set("X-OpenCodex-API-Key", "caller-key")
+	incoming.Header.Set("X-OpenCodex-Relay", "caller-marker")
+	incoming = incoming.WithContext(context.WithValue(incoming.Context(), credentialContextKey{}, credentials.Values{
+		CFClientID:           "must-not-be-used",
+		CFClientSecret:       "must-not-be-used",
+		GatewayKey:           "must-not-be-used",
+		LocalOpenCodexAPIKey: "apple-api-key",
+	}))
+	outgoing := incoming.Clone(incoming.Context())
+	server.rewrite(&httputil.ProxyRequest{In: incoming, Out: outgoing})
+	if outgoing.URL.String() != "http://127.0.0.1:10210/v1/models" {
+		t.Fatalf("Apple upstream URL = %q", outgoing.URL.String())
+	}
+	if outgoing.Header.Get("X-OpenCodex-API-Key") != "apple-api-key" || outgoing.Header.Get("X-OpenCodex-Relay") != "pw-local-v1" {
+		t.Fatalf("Apple injected headers = %#v", outgoing.Header)
+	}
+	if outgoing.Header.Get("CF-Access-Client-Id") != "" || outgoing.Header.Get("CF-Access-Client-Secret") != "" || outgoing.Header.Get("Cf-Access-Jwt-Assertion") != "" {
+		t.Fatalf("Apple runtime retained Cloudflare headers: %#v", outgoing.Header)
+	}
+	if outgoing.Header.Get("Authorization") != "Bearer native" {
+		t.Fatalf("Apple runtime changed caller Authorization = %q", outgoing.Header.Get("Authorization"))
 	}
 }
 

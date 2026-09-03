@@ -1,0 +1,307 @@
+name: Watch immutable OpenCodex releases
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: opencodex-upstream-watch
+  cancel-in-progress: false
+
+env:
+  RELEASE_REPOSITORY: novelKR/OpenCodex-OCI-Gateway
+  UPSTREAM_LOCK: containers/opencodex/upstream.lock.json
+
+jobs:
+  detect:
+    if: github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.detect.outputs.status }}
+      version: ${{ steps.detect.outputs.version }}
+      revision: ${{ steps.detect.outputs.revision }}
+      release_id: ${{ steps.detect.outputs.release_id }}
+      candidate_sha256: ${{ steps.detect.outputs.candidate_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Detect and cross-verify the greatest immutable release
+        id: detect
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          candidate="${RUNNER_TEMP}/opencodex-upstream-candidate.json"
+          receipt="${RUNNER_TEMP}/opencodex-upstream-receipt.json"
+          python3 tools/opencodex_upstream.py detect \
+            --lock "$UPSTREAM_LOCK" \
+            --candidate-output "$candidate" > "$receipt"
+          python3 - "$receipt" "$GITHUB_OUTPUT" "$candidate" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
+
+          receipt = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          status = receipt.get("status")
+          if status not in {"up-to-date", "awaiting-npm", "update-available"}:
+              raise SystemExit("detector emitted an unsupported status")
+          lines = [f"status={status}"]
+          if status == "update-available":
+              version = receipt.get("version")
+              revision = receipt.get("revision")
+              release_id = receipt.get("release_id")
+              if not isinstance(version, str) or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+                  raise SystemExit("detector version is invalid")
+              if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+                  raise SystemExit("detector revision is invalid")
+              if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id < 1:
+                  raise SystemExit("detector release ID is invalid")
+              candidate_path = pathlib.Path(sys.argv[3])
+              if not candidate_path.is_file() or candidate_path.is_symlink():
+                  raise SystemExit("detector candidate output is unavailable")
+              candidate_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+              lines.extend((
+                  f"version={version}",
+                  f"revision={revision}",
+                  f"release_id={release_id}",
+                  f"candidate_sha256={candidate_sha256}",
+              ))
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write("\n".join(lines) + "\n")
+          PY
+      - name: Preserve the verified candidate for the scoped writer
+        if: steps.detect.outputs.status == 'update-available'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opencodex-upstream-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-upstream-candidate.json
+          if-no-files-found: error
+          retention-days: 1
+
+  propose:
+    needs: detect
+    if: needs.detect.outputs.status == 'update-available'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: upstream-watch
+    permissions:
+      contents: read
+    steps:
+      - name: Mint the repository-scoped writer token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OPENCODEX_UPSTREAM_WATCH_APP_ID }}
+          private-key: ${{ secrets.OPENCODEX_UPSTREAM_WATCH_APP_PRIVATE_KEY }}
+          owner: novelKR
+          repositories: OpenCodex-OCI-Gateway
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: ${{ github.sha }}
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: opencodex-upstream-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-upstream-candidate
+      - name: Generate the deterministic four-file update
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EXPECTED_VERSION: ${{ needs.detect.outputs.version }}
+          EXPECTED_REVISION: ${{ needs.detect.outputs.revision }}
+          EXPECTED_RELEASE_ID: ${{ needs.detect.outputs.release_id }}
+          EXPECTED_CANDIDATE_SHA256: ${{ needs.detect.outputs.candidate_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$(gh api "repos/${RELEASE_REPOSITORY}/commits/main" --jq .sha)" == "$GITHUB_SHA" ]] || {
+            printf 'ERROR: public main advanced after release detection; retry from the new main\n' >&2
+            exit 1
+          }
+          candidate="${RUNNER_TEMP}/opencodex-upstream-candidate/opencodex-upstream-candidate.json"
+          [[ "$EXPECTED_CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ && \
+             "$(sha256sum "$candidate" | awk '{print $1}')" == "$EXPECTED_CANDIDATE_SHA256" ]] || {
+            printf 'ERROR: downloaded candidate bytes differ from the detector witness\n' >&2
+            exit 1
+          }
+          python3 - "$candidate" "$EXPECTED_VERSION" "$EXPECTED_REVISION" "$EXPECTED_RELEASE_ID" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              value.get("version") != sys.argv[2]
+              or value.get("revision") != sys.argv[3]
+              or value.get("release", {}).get("id") != int(sys.argv[4])
+              or value.get("image_revision") != 1
+          ):
+              raise SystemExit("downloaded candidate differs from detector outputs")
+          PY
+          python3 tools/opencodex_upstream.py apply \
+            --lock "$UPSTREAM_LOCK" \
+            --candidate "$candidate" \
+            --package-json containers/opencodex/package.json \
+            --notices containers/opencodex/UPSTREAM_NOTICES.md
+
+          bun_image='oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb'
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/bun-home \
+            --env BUN_INSTALL_CACHE_DIR=/tmp/bun-cache \
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/containers/opencodex,target=/workspace" \
+            --workdir /workspace \
+            "$bun_image" install --lockfile-only --ignore-scripts
+          first_lock_hash="$(sha256sum containers/opencodex/bun.lock | awk '{print $1}')"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp/bun-home \
+            --env BUN_INSTALL_CACHE_DIR=/tmp/bun-cache \
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/containers/opencodex,target=/workspace" \
+            --workdir /workspace \
+            "$bun_image" install --lockfile-only --ignore-scripts
+          [[ "$(sha256sum containers/opencodex/bun.lock | awk '{print $1}')" == "$first_lock_hash" ]] || {
+            printf 'ERROR: Bun lock regeneration is not deterministic\n' >&2
+            exit 1
+          }
+          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+
+          expected = {
+              "containers/opencodex/UPSTREAM_NOTICES.md",
+              "containers/opencodex/bun.lock",
+              "containers/opencodex/package.json",
+              "containers/opencodex/upstream.lock.json",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines())
+          changed.update(
+              subprocess.check_output(
+                  ["git", "ls-files", "--others", "--exclude-standard"], text=True
+              ).splitlines()
+          )
+          if changed != expected:
+              raise SystemExit(f"upstream update changed an unsupported path set: {sorted(changed)}")
+          PY
+          git diff --check
+      - name: Reuse an identical PR or create a review-only PR
+        id: pull-request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          REVISION: ${{ needs.detect.outputs.revision }}
+          RELEASE_ID: ${{ needs.detect.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          branch="automation/opencodex-${VERSION}-r1"
+          remote_ref="refs/heads/${branch}"
+          existing_ref="${RUNNER_TEMP}/existing-ref.txt"
+          body="${RUNNER_TEMP}/upstream-pr-body.md"
+          {
+            printf 'Updates the immutable external OpenCodex input after GitHub/npm/tarball cross-verification.\n\n'
+            printf -- '- Upstream version: `%s`\n' "$VERSION"
+            printf -- '- Upstream commit: `%s`\n' "$REVISION"
+            printf -- '- GitHub release ID: `%s`\n' "$RELEASE_ID"
+            printf -- '- Image revision: `1`\n\n'
+            printf 'This PR is intentionally not auto-merged. The runtime-image check must pass before review.\n'
+          } > "$body"
+          set +e
+          git ls-remote --exit-code --heads origin "$remote_ref" > "$existing_ref"
+          reference_status=$?
+          set -e
+          if [[ "$reference_status" -eq 0 ]]; then
+            git fetch --no-tags origin "${remote_ref}:refs/remotes/origin/upstream-watch-existing"
+            mapfile -t changed < <(git diff --name-only "$GITHUB_SHA" refs/remotes/origin/upstream-watch-existing)
+            expected=(
+              containers/opencodex/UPSTREAM_NOTICES.md
+              containers/opencodex/bun.lock
+              containers/opencodex/package.json
+              containers/opencodex/upstream.lock.json
+            )
+            [[ "${changed[*]}" == "${expected[*]}" ]] || {
+              printf 'ERROR: existing automation branch is divergent\n' >&2
+              exit 1
+            }
+            for path in "${expected[@]}"; do
+              cmp -s <(git show "refs/remotes/origin/upstream-watch-existing:${path}") "$path" || {
+                printf 'ERROR: existing automation branch does not contain the verified tuple\n' >&2
+                exit 1
+              }
+            done
+            remote_sha="$(awk 'NR == 1 {print $1}' "$existing_ref")"
+            pr_json="$(gh pr list --repo "$RELEASE_REPOSITORY" --head "$branch" --state open \
+              --limit 2 --json number,url,headRefOid,headRefName,baseRefName,isCrossRepository,autoMergeRequest)"
+            pr_count="$(jq 'length' <<<"$pr_json")"
+            [[ "$pr_count" == 0 || "$pr_count" == 1 ]] || {
+              printf 'ERROR: identical automation branch has multiple open pull requests\n' >&2
+              exit 1
+            }
+            if [[ "$pr_count" == 0 ]]; then
+              url="$(gh pr create --repo "$RELEASE_REPOSITORY" \
+                --base main --head "$branch" \
+                --title "chore(runtime): update OpenCodex to ${VERSION}" \
+                --body-file "$body")"
+              printf 'url=%s\n' "$url" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            jq -e --arg branch "$branch" '
+              .[0].headRefName == $branch
+              and .[0].baseRefName == "main"
+              and .[0].isCrossRepository == false
+              and .[0].autoMergeRequest == null
+            ' <<<"$pr_json" >/dev/null || {
+              printf 'ERROR: existing automation pull request crossed its review boundary\n' >&2
+              exit 1
+            }
+            [[ "$(jq -r '.[0].headRefOid' <<<"$pr_json")" == "$remote_sha" ]] || {
+              printf 'ERROR: existing pull request head changed during verification\n' >&2
+              exit 1
+            }
+            printf 'url=%s\n' "$(jq -r '.[0].url' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$reference_status" -eq 2 ]] || {
+            printf 'ERROR: unable to prove the automation branch is absent\n' >&2
+            exit 1
+          }
+
+          git switch -c "$branch"
+          bot_id="$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)"
+          [[ "$bot_id" =~ ^[1-9][0-9]*$ ]] || {
+            printf 'ERROR: GitHub App bot identity is invalid\n' >&2
+            exit 1
+          }
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git add -- \
+            containers/opencodex/UPSTREAM_NOTICES.md \
+            containers/opencodex/bun.lock \
+            containers/opencodex/package.json \
+            containers/opencodex/upstream.lock.json
+          git commit -m "chore(runtime): update OpenCodex to ${VERSION}"
+          git push origin "HEAD:${remote_ref}"
+          url="$(gh pr create --repo "$RELEASE_REPOSITORY" \
+            --base main --head "$branch" \
+            --title "chore(runtime): update OpenCodex to ${VERSION}" \
+            --body-file "$body")"
+          printf 'url=%s\n' "$url" >> "$GITHUB_OUTPUT"
+      - name: Record the review boundary
+        run: |
+          printf 'Automated PR (no direct write, force-push, or auto-merge): %s\n' '${{ steps.pull-request.outputs.url }}'

@@ -4,6 +4,7 @@ package credentials
 
 import (
 	"bufio"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -21,15 +22,17 @@ const (
 	CFClientSecretName = "CF_ACCESS_CLIENT_SECRET"
 	GatewayKeyName     = "OPENCODEX_GATEWAY_API_KEY"
 
-	CFClientIDService     = "opencodex-relay-cf-access-client-id"
-	CFClientSecretService = "opencodex-relay-cf-access-client-secret"
-	GatewayKeyService     = "opencodex-relay-gateway-api-key"
+	CFClientIDService           = "opencodex-relay-cf-access-client-id"
+	CFClientSecretService       = "opencodex-relay-cf-access-client-secret"
+	GatewayKeyService           = "opencodex-relay-gateway-api-key"
+	LocalOpenCodexAPIKeyService = "opencodex-relay-apple-container-api-auth-token"
 )
 
 type Values struct {
-	CFClientID     string
-	CFClientSecret string
-	GatewayKey     string
+	CFClientID           string
+	CFClientSecret       string
+	GatewayKey           string
+	LocalOpenCodexAPIKey string
 }
 
 func (v Values) Validate() error {
@@ -48,6 +51,11 @@ func (v Values) ValidateForProfile(profile string) error {
 		if v.CFClientID == "" || v.CFClientSecret == "" || v.GatewayKey == "" {
 			return errors.New("all Cloudflare and gateway credentials are required")
 		}
+	case config.LocalAuthenticationOpenCodexAPIKey:
+		decoded, err := base64.RawURLEncoding.DecodeString(v.LocalOpenCodexAPIKey)
+		if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != v.LocalOpenCodexAPIKey {
+			return errors.New("local OpenCodex API key must be an unpadded base64url-encoded 32-byte value")
+		}
 	default:
 		return errors.New("unknown authentication profile")
 	}
@@ -65,6 +73,12 @@ func Load(cfg config.CredentialsConfig) (Values, error) {
 	case config.CredentialsSourceKeychain:
 		if runtime.GOOS != "darwin" {
 			return Values{}, errors.New("keychain credentials are supported only on macOS")
+		}
+		if profile == config.LocalAuthenticationOpenCodexAPIKey {
+			current, currentErr := user.Current()
+			if currentErr != nil || current.Username == "" || (cfg.Account != "" && cfg.Account != current.Username) {
+				return Values{}, errors.New("local OpenCodex API key account must be the current user")
+			}
 		}
 		values, err = loadKeychain(cfg.Account, profile)
 	case config.CredentialsSourceFile:
@@ -127,6 +141,12 @@ func loadKeychain(account, profile string) (Values, error) {
 	}
 	if profile == config.RemoteAuthenticationGatewayAPIKey || profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		values.GatewayKey, err = read(GatewayKeyService)
+		if err != nil {
+			return Values{}, err
+		}
+	}
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		values.LocalOpenCodexAPIKey, err = read(LocalOpenCodexAPIKeyService)
 		if err != nil {
 			return Values{}, err
 		}

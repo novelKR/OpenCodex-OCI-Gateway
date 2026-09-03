@@ -452,6 +452,7 @@ func (m *Manager) externalUpgradeRecoveryPresent() bool {
 		m.Paths.Journal,
 		filepath.Join(filepath.Dir(m.Paths.Binding), "application-relocation.json"),
 		routing.TransactionPath(m.Paths.Config),
+		routing.MaintenancePath(m.Paths.Config),
 		handoff.RemovalCleanupPath(m.Paths.Config),
 		handoff.RemovalCleanupPath(anchor),
 	}

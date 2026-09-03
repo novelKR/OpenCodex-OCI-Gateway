@@ -179,14 +179,40 @@ ensure_local_dev_install_root() {
 }
 
 require_local_dev_config_leaves_or_absent() {
-  local config="$1" leaf
+  local config="$1" leaf maintenance
+  maintenance="${config}.runtime-maintenance.json"
   for leaf in \
     "$config" \
     "${config}.routing-state.json" \
     "${config}.routing-initialized" \
-    "${config}.routing-transaction.json"; do
+    "${config}.routing-transaction.json" \
+    "$maintenance"; do
     require_regular_or_absent "$leaf"
   done
+  [[ ! -e "$maintenance" && ! -L "$maintenance" ]] || \
+    die 'runtime maintenance must be recovered before changing the local development installation'
+}
+
+snapshot_runtime_maintenance_absence() {
+  local path="$1" snapshot="$2"
+  [[ ! -e "$path" && ! -L "$path" ]] || \
+    die 'runtime maintenance must be recovered before changing the local development installation'
+  [[ ! -e "${snapshot}.state" && ! -L "${snapshot}.state" && \
+     ! -e "${snapshot}.data" && ! -L "${snapshot}.data" ]] || \
+    die 'runtime maintenance rollback snapshot destination is unsafe'
+  printf 'present=false\n' > "${snapshot}.state"
+  chmod 0600 "${snapshot}.state"
+}
+
+verify_runtime_maintenance_absence_snapshot() {
+  local path="$1" snapshot="$2" present
+  [[ -f "${snapshot}.state" && ! -L "${snapshot}.state" && \
+     ! -e "${snapshot}.data" && ! -L "${snapshot}.data" ]] || return 1
+  present="$(sed -nE 's/^present=(true|false)$/\1/p' "${snapshot}.state")"
+  [[ "$present" == false ]] || return 1
+  # Never remove a maintenance journal which appeared while the installer was
+  # active. Its own recovery protocol, not installer rollback, owns that leaf.
+  [[ ! -e "$path" && ! -L "$path" ]]
 }
 
 local_dev_config_leaves_present() {
@@ -195,7 +221,8 @@ local_dev_config_leaves_present() {
     "$config" \
     "${config}.routing-state.json" \
     "${config}.routing-initialized" \
-    "${config}.routing-transaction.json"; do
+    "${config}.routing-transaction.json" \
+    "${config}.runtime-maintenance.json"; do
     [[ -e "$leaf" || -L "$leaf" ]] && return 0
   done
   return 1
@@ -385,6 +412,10 @@ verify_bundle_shape() {
     die 'local development bundle Codex Desktop identifier is not reviewed'
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenCodexTrustedCodexTeamIdentifier' "${app}/Contents/Info.plist" 2>/dev/null)" == "$TRUSTED_CODEX_TEAM_ID" ]] || \
     die 'local development bundle Codex Desktop Team ID is not reviewed'
+  local runtime_public_key="${app}/Contents/Resources/RuntimeTrust/opencodex-runtime-release-ed25519.pub"
+  [[ -f "$runtime_public_key" && ! -L "$runtime_public_key" ]] || \
+    die 'local development runtime release trust key is unavailable or unsafe'
+  require_ed25519_public_key "$runtime_public_key"
   [[ -x "${app}/Contents/MacOS/OpenCodexRelay" && ! -L "${app}/Contents/MacOS/OpenCodexRelay" && \
      -x "${app}/Contents/Library/Helpers/opencodex-relay" && ! -L "${app}/Contents/Library/Helpers/opencodex-relay" && \
      -x "${app}/Contents/Library/Helpers/opencodex-relayctl" && ! -L "${app}/Contents/Library/Helpers/opencodex-relayctl" ]] || die 'local development bundle helper shape is invalid'
@@ -571,6 +602,156 @@ wait_for_parked_health() {
     jq -e '.ok == true and .relay_admission == "deny" and .catalog_refresh == "pause"' <<< "$health" >/dev/null || die 'local development relay did not reach parked health state'
   done
 }
+
+active_local_dev_runtime_is_acknowledged() {
+  local config="$1"
+  local relayctl="$2"
+  local codex_path="$3"
+  local status
+
+  # This upgrade exception is deliberately status-only. The candidate helper
+  # validates the durable routing/config witnesses and the resident relay
+  # supplies the health projection; the installer neither reads nor forwards
+  # the Apple Container API/Admin tokens.
+  [[ -x "$relayctl" && -n "$codex_path" ]] || return 1
+  status="$("$relayctl" mode status --config "$config" --codex-config "$codex_path" --json 2>/dev/null)" || return 1
+  jq -er --slurpfile cfg "$config" '
+    ($cfg[0]) as $c
+    | ($c.local_opencodex // null) as $local
+    | ($c.local_apple_container // null) as $apple
+    | select(
+        $c.installation_scope == "local_development"
+        and $c.listen_address == "127.0.0.1:18190"
+        and $c.responses.scheduler.interactive_listen_address == "127.0.0.1:18192"
+        and $c.upstream_mode == "external_gateway"
+        and (($c.catalog.owner // "relay") == "relay")
+        and .schema_version == 4
+        and .phase == "relay_active"
+        and .relay_admission == "allow"
+        and .catalog_refresh == "run"
+        and .relay_running == true
+        and .connection.local_relay == "healthy"
+        and .connection.routing_sync == "acknowledged"
+        and .connection.local_opencodex == "ready"
+        and .connection.catalog == "running"
+      )
+    | if (
+        .desired_backend == "local_opencodex"
+        and .applied_backend == "local_opencodex"
+        and ($local | type == "object")
+        and ($local.upstream_base_url == "http://127.0.0.1:10100/v1" or $local.upstream_base_url == "http://[::1]:10100/v1")
+        and ($local.catalog_path | type == "string" and startswith("/") and endswith("/opencodex-relay-dev-local-catalog.json") and . != $c.catalog.path)
+        and (($apple == null) or $local.catalog_path != $apple.catalog_path)
+      ) then
+        "local_opencodex"
+      elif (
+        .desired_backend == "local_apple_container"
+        and .applied_backend == "local_apple_container"
+        and ($apple | type == "object")
+        and $apple.upstream_base_url == "http://127.0.0.1:10210/v1"
+        and ($apple.catalog_path | type == "string" and startswith("/") and endswith("/opencodex-relay-dev-apple-container-catalog.json") and . != $c.catalog.path)
+        and (($local == null) or $apple.catalog_path != $local.catalog_path)
+        and (($apple.credential_account // "") | type == "string")
+      ) then
+        "local_apple_container"
+      else
+        empty
+      end
+  ' <<< "$status"
+}
+
+local_dev_health_matches_listener_lane() {
+  local health="$1"
+  local config="$2"
+  local expected_lane="$3"
+  local runtime_profile="$4"
+  jq -e --slurpfile cfg "$config" \
+    --arg lane "$expected_lane" \
+    --arg runtime_profile "$runtime_profile" '
+      def nonnegative_integer:
+        type == "number" and floor == . and . >= 0;
+      def go_zero_default($fallback):
+        if . == null or . == 0 then $fallback else . end;
+      def go_empty_default($fallback):
+        if . == null or . == "" then $fallback else . end;
+      ($cfg[0]) as $c
+      | ($c.local_opencodex // null) as $local
+      | ($c.local_apple_container // null) as $apple
+      | ($c.responses.scheduler // {}) as $s
+      | .ok == true
+      and .listener_lane == $lane
+      and .general_listener == "127.0.0.1:18190"
+      and .interactive_listener == "127.0.0.1:18192"
+      and (
+        if $runtime_profile == "local_opencodex" then
+          .upstream_mode == "local_opencodex"
+          and .upstream_base_url == $local.upstream_base_url
+          and .catalog_owner == "relay"
+        elif $runtime_profile == "local_apple_container" then
+          .upstream_mode == "local_apple_container"
+          and .upstream_base_url == $apple.upstream_base_url
+          and .catalog_owner == "relay"
+        else
+          false
+        end
+      )
+      and .responses_websocket_mode == ($c.responses.websocket_mode | go_empty_default("passthrough"))
+      and ((.responses_models // []) | sort) == ((($c.responses.model_modes // {}) | keys) | sort)
+      and .responses_normalizer == (((($c.responses.model_modes // {}) | length) > 0))
+      and (.active_requests | nonnegative_integer)
+      and (.active_classifications | nonnegative_integer)
+      and (.pending_requests | nonnegative_integer)
+      and (.pending_encoded_bytes | nonnegative_integer)
+      and (.active_general_upstream | nonnegative_integer)
+      and (.active_interactive_upstream | nonnegative_integer)
+      and (.active_transforms | nonnegative_integer)
+      and (.active_deliveries | nonnegative_integer)
+      and (.capacity_rejections | nonnegative_integer)
+      and (.scheduler_limits.max_classifications == ($s.max_classifications | go_zero_default(8)))
+      and (.scheduler_limits.max_pending_requests == ($s.max_pending_requests | go_zero_default(24)))
+      and (.scheduler_limits.max_pending_encoded_bytes == ($s.max_pending_encoded_bytes | go_zero_default(536870912)))
+      and (.scheduler_limits.queue_timeout_ms == ($s.queue_timeout_ms | go_zero_default(60000)))
+      and (.scheduler_limits.max_general_upstream == ($s.max_general_upstream | go_zero_default(4)))
+      and (.scheduler_limits.interactive_reserved_upstream == ($s.interactive_reserved_upstream | go_zero_default(1)))
+      and (.scheduler_limits.max_concurrent_transforms == ($s.max_concurrent_transforms | go_zero_default(2)))
+      and (.scheduler_limits.max_open_deliveries == ($s.max_open_deliveries | go_zero_default(16)))
+    ' <<< "$health" >/dev/null
+}
+
+verify_active_local_dev_runtime_health_once() {
+  local config="$1"
+  local relayctl="$2"
+  local codex_path="$3"
+  local expected_profile="$4"
+  local observed_profile
+  local general_health
+  local interactive_health
+  observed_profile="$(active_local_dev_runtime_is_acknowledged "$config" "$relayctl" "$codex_path")" || return 1
+  [[ "$observed_profile" == "$expected_profile" ]] || return 1
+  general_health="$(curl --fail --silent --show-error --noproxy '*' --max-time 2 \
+    'http://127.0.0.1:18190/__relay/healthz' 2>/dev/null)" || return 1
+  interactive_health="$(curl --fail --silent --show-error --noproxy '*' --max-time 2 \
+    'http://127.0.0.1:18192/__relay/healthz' 2>/dev/null)" || return 1
+  local_dev_health_matches_listener_lane "$general_health" "$config" general "$expected_profile" && \
+    local_dev_health_matches_listener_lane "$interactive_health" "$config" interactive "$expected_profile"
+}
+
+wait_for_active_local_dev_runtime_health() {
+  local config="$1"
+  local relayctl="$2"
+  local codex_path="$3"
+  local expected_profile="$4"
+  local attempt
+  for attempt in {1..20}; do
+    if verify_active_local_dev_runtime_health_once "$config" "$relayctl" "$codex_path" "$expected_profile"; then
+      printf 'relay_dual_listener_health=ready runtime_profile=%s attempts=%s\n' "$expected_profile" "$attempt"
+      return 0
+    fi
+    sleep 1
+  done
+  die 'local development relay did not preserve the acknowledged Local runtime health contract'
+}
+
 prepare_existing_homebrew_guard_for_replacement() {
   local replacement_app="${1:-}"
   guard_restore_helper=""
@@ -759,6 +940,27 @@ rollback_install() {
       rollback_failed=true
     fi
   done
+  if ! verify_runtime_maintenance_absence_snapshot \
+    "${config_path}.runtime-maintenance.json" "${transaction_dir}/runtime-maintenance"; then
+    printf 'CRITICAL: runtime maintenance appeared during local-development install; it was retained for recovery.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_file "$local_runtime_catalog_path" "${transaction_dir}/local-runtime-catalog"; then
+    printf 'CRITICAL: unable to restore the prior local-development OpenCodex catalog.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_file "$local_runtime_catalog_pending_path" "${transaction_dir}/local-runtime-catalog-pending"; then
+    printf 'CRITICAL: unable to restore the prior local-development OpenCodex catalog marker.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_file "$apple_runtime_catalog_path" "${transaction_dir}/apple-runtime-catalog"; then
+    printf 'CRITICAL: unable to restore the prior local-development Apple Container catalog.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_file "$apple_runtime_catalog_pending_path" "${transaction_dir}/apple-runtime-catalog-pending"; then
+    printf 'CRITICAL: unable to restore the prior local-development Apple Container catalog marker.\n' >&2
+    rollback_failed=true
+  fi
   if ! restore_link "${INSTALL_ROOT}/current" "${transaction_dir}/current"; then
     printf 'CRITICAL: unable to restore the prior local-development current target.\n' >&2
     rollback_failed=true
@@ -924,6 +1126,8 @@ install_local_dev() {
   local source_install_reservation_root_created=false source_install_reservation_relayctl=""
   local source_install_reservation_recovery_path=""
   local source_uninstall_destructive_active=false
+  local local_runtime_catalog_path="" local_runtime_catalog_pending_path=""
+  local apple_runtime_catalog_path="" apple_runtime_catalog_pending_path=""
   config_path="$DEFAULT_CONFIG"
   local codex_config="$DEFAULT_CODEX_CONFIG" catalog_path="" codex_executable=""
   while [[ $# -gt 0 ]]; do
@@ -1039,10 +1243,41 @@ install_local_dev() {
   transaction_dir="$(mktemp -d "${INSTALL_ROOT}/.transaction.${version}.XXXXXX")"
   staging_dir="${INSTALL_ROOT}/.stage.${version}.XXXXXX"
   mkdir -p "$staging_dir"
+  # Keep unenrolled catalog rollback slots transaction-local. An enrolled
+  # profile is strict-loaded again by relayctl before it can be preserved, but
+  # resolve its fixed, non-secret catalog leaf now so every candidate-start
+  # mutation has a rollback snapshot before the transaction trap is armed.
+  local_runtime_catalog_path="${transaction_dir}/unconfigured-local-catalog"
+  apple_runtime_catalog_path="${transaction_dir}/unconfigured-apple-catalog"
+  if [[ -f "$config_path" ]]; then
+    local configured_runtime_catalog configured_apple_runtime_catalog
+    configured_runtime_catalog="$(jq -er '.local_opencodex.catalog_path // empty' "$config_path" 2>/dev/null || true)"
+    if [[ -n "$configured_runtime_catalog" ]]; then
+      [[ "$(basename -- "$configured_runtime_catalog")" == opencodex-relay-dev-local-catalog.json ]] && \
+        safe_absolute_path "$configured_runtime_catalog" || \
+        die 'existing local development OpenCodex catalog path is unsafe'
+      local_runtime_catalog_path="$configured_runtime_catalog"
+    fi
+    configured_apple_runtime_catalog="$(jq -er '.local_apple_container.catalog_path // empty' "$config_path" 2>/dev/null || true)"
+    if [[ -n "$configured_apple_runtime_catalog" ]]; then
+      [[ "$(basename -- "$configured_apple_runtime_catalog")" == opencodex-relay-dev-apple-container-catalog.json ]] && \
+        safe_absolute_path "$configured_apple_runtime_catalog" || \
+        die 'existing local development Apple Container catalog path is unsafe'
+      apple_runtime_catalog_path="$configured_apple_runtime_catalog"
+    fi
+  fi
+  local_runtime_catalog_pending_path="${local_runtime_catalog_path}.restart-pending"
+  apple_runtime_catalog_pending_path="${apple_runtime_catalog_path}.restart-pending"
   snapshot_file "$config_path" "${transaction_dir}/config"
   snapshot_file "${config_path}.routing-state.json" "${transaction_dir}/routing-state"
   snapshot_file "${config_path}.routing-initialized" "${transaction_dir}/routing-initialized"
   snapshot_file "${config_path}.routing-transaction.json" "${transaction_dir}/routing-journal"
+  snapshot_runtime_maintenance_absence \
+    "${config_path}.runtime-maintenance.json" "${transaction_dir}/runtime-maintenance"
+  snapshot_file "$local_runtime_catalog_path" "${transaction_dir}/local-runtime-catalog"
+  snapshot_file "$local_runtime_catalog_pending_path" "${transaction_dir}/local-runtime-catalog-pending"
+  snapshot_file "$apple_runtime_catalog_path" "${transaction_dir}/apple-runtime-catalog"
+  snapshot_file "$apple_runtime_catalog_pending_path" "${transaction_dir}/apple-runtime-catalog-pending"
   snapshot_file "$BINDING_PATH" "${transaction_dir}/binding"
   snapshot_file "$SERVICE_PLIST" "${transaction_dir}/service"
   snapshot_link "${INSTALL_ROOT}/current" "${transaction_dir}/current"
@@ -1063,36 +1298,49 @@ install_local_dev() {
     "$relayctl_bin" "${init_args[@]}"
   fi
   local install_routing_state="native_parked"
+  local expected_runtime_profile="native_parked"
   if ! "$relayctl_bin" mode seed-native --config "$config_path" --codex-config "$codex_config" --json >/dev/null 2>&1; then
-    # An existing local-development bundle may be upgraded specifically so its
-    # Control Center can repair an orphaned recovery epoch. Never reseed or
-    # rewrite that epoch. Accept it only when the new helper independently
-    # validates the exact bound status and value-free native-repair inspection.
-    local recovery_status="${tmp}/recovery-status.json"
-    local repair_inspection="${tmp}/native-repair-inspection.json"
-    "$relayctl_bin" mode status --config "$config_path" --codex-config "$codex_config" --json > "$recovery_status" || \
-      die 'existing local development routing state is not upgradeable'
-    local recovery_generation
-    recovery_generation="$(jq -er '
-      select(.schema_version == 3 and .phase == "recovery_required"
-        and .generation > 0 and .relay_admission == "deny"
-        and .catalog_refresh == "pause") | .generation
-    ' "$recovery_status")" || die 'existing local development routing state is not safely parked for repair'
-    "$relayctl_bin" mode inspect-native-repair \
-      --expected-routing-generation "$recovery_generation" \
-      --config "$config_path" --codex-config "$codex_config" --json > "$repair_inspection" || \
-      die 'existing local development recovery state is not eligible for bounded native repair'
-    jq -e --argjson generation "$recovery_generation" '
-      .schema_version == 1 and .generation == $generation
-      and .phase == "recovery_required"
-      and (.kind == "state_only" or .kind == "local_relay"
-        or .kind == "opencodex" or .kind == "unavailable")
-      and (.openai_base_url | type == "boolean")
-      and (.model_catalog_json | type == "boolean")
-      and (.reason | type == "string")
-    ' "$repair_inspection" >/dev/null || \
-      die 'existing local development native repair inspection is invalid'
-    install_routing_state="recovery_preserved"
+    local preserved_runtime_profile=""
+    if preserved_runtime_profile="$(active_local_dev_runtime_is_acknowledged "$config_path" "$relayctl_bin" "$codex_config")"; then
+      case "$preserved_runtime_profile" in
+        local_opencodex|local_apple_container)
+          expected_runtime_profile="$preserved_runtime_profile"
+          install_routing_state="${preserved_runtime_profile}_preserved"
+          ;;
+        *) die 'existing local development routing state returned an unsupported Local runtime profile' ;;
+      esac
+    else
+      # An existing local-development bundle may also be upgraded specifically
+      # so its Control Center can repair an orphaned recovery epoch. Never
+      # reseed or rewrite that epoch. Accept it only when the new helper
+      # independently validates the exact bound status and value-free
+      # native-repair inspection.
+      local recovery_status="${tmp}/recovery-status.json"
+      local repair_inspection="${tmp}/native-repair-inspection.json"
+      "$relayctl_bin" mode status --config "$config_path" --codex-config "$codex_config" --json > "$recovery_status" || \
+        die 'existing local development routing state is not upgradeable'
+      local recovery_generation
+      recovery_generation="$(jq -er '
+        select(.schema_version == 4 and .phase == "recovery_required"
+          and .generation > 0 and .relay_admission == "deny"
+          and .catalog_refresh == "pause") | .generation
+      ' "$recovery_status")" || die 'existing local development routing state is not safely parked for repair'
+      "$relayctl_bin" mode inspect-native-repair \
+        --expected-routing-generation "$recovery_generation" \
+        --config "$config_path" --codex-config "$codex_config" --json > "$repair_inspection" || \
+        die 'existing local development recovery state is not eligible for bounded native repair'
+      jq -e --argjson generation "$recovery_generation" '
+        .schema_version == 1 and .generation == $generation
+        and .phase == "recovery_required"
+        and (.kind == "state_only" or .kind == "local_relay"
+          or .kind == "opencodex" or .kind == "unavailable")
+        and (.openai_base_url | type == "boolean")
+        and (.model_catalog_json | type == "boolean")
+        and (.reason | type == "string")
+      ' "$repair_inspection" >/dev/null || \
+        die 'existing local development native repair inspection is invalid'
+      install_routing_state="recovery_preserved"
+    fi
   fi
 
   local install_dir="${INSTALL_ROOT}/${version}/darwin-arm64"
@@ -1110,7 +1358,14 @@ install_local_dev() {
   ln -s "${version}/darwin-arm64/${APP_NAME}/Contents/Library/Helpers" "$current_candidate"
   mv -fh "$current_candidate" "${INSTALL_ROOT}/current"
   "$SERVICE_HELPER" install --relay-bin "${INSTALL_ROOT}/current/opencodex-relay" --config "$config_path"
-  wait_for_parked_health "$config_path"
+  case "$expected_runtime_profile" in
+    native_parked) wait_for_parked_health "$config_path" ;;
+    local_opencodex|local_apple_container)
+      wait_for_active_local_dev_runtime_health \
+        "$config_path" "$relayctl_bin" "$codex_config" "$expected_runtime_profile"
+      ;;
+    *) die 'local development installer lost its expected routing health profile' ;;
+  esac
 
   if [[ -e "$BINDING_DIR" || -L "$BINDING_DIR" ]]; then
     [[ -d "$BINDING_DIR" && ! -L "$BINDING_DIR" ]] || die 'local development binding directory is unsafe'
@@ -1299,7 +1554,8 @@ uninstall_local_dev() {
     rm -f -- "$BINDING_PATH"
   fi
   rmdir "$BINDING_DIR" 2>/dev/null || true
-  rm -f -- "$config_path" "${config_path}.routing-state.json" "${config_path}.routing-initialized" "${config_path}.routing-transaction.json"
+  rm -f -- "$config_path" "${config_path}.routing-state.json" "${config_path}.routing-initialized" \
+    "${config_path}.routing-transaction.json" "${config_path}.runtime-maintenance.json"
   if [[ -e "$INSTALL_ROOT" || -L "$INSTALL_ROOT" ]]; then
     [[ -d "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]] || die 'local development install root is unsafe'
     clear_local_dev_install_root_preserving_reservation || \

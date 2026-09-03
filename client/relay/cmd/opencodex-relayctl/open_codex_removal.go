@@ -497,6 +497,9 @@ func openRemovalBoundary(ctx context.Context, configPath, codexPath string, expe
 	if pending, transactionErr := store.HasPendingTransaction(); transactionErr != nil || pending {
 		return fail(routing.ErrRecoveryRequired)
 	}
+	if pending, maintenanceErr := store.HasPendingMaintenance(); maintenanceErr != nil || pending {
+		return fail(routing.ErrRecoveryRequired)
+	}
 	cleanup, cleanupExists, cleanupErr := handoff.ReadRemovalCleanup(configPath)
 	if cleanupErr != nil {
 		return fail(errorsNew("OpenCodex removal cleanup journal is not safe"))

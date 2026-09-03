@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 )
 
 type localRoundTrip func(*http.Request) (*http.Response, error)
@@ -52,6 +56,49 @@ func TestLocalOpenCodexRefreshUsesVerifiedLoopbackWithoutCredentialsOrProxy(t *t
 	}
 	if strings.Contains(string(payload), "hidden") || !strings.Contains(string(payload), "local-visible") {
 		t.Fatalf("local catalog payload = %s", payload)
+	}
+}
+
+func TestAppleContainerCatalogUsesFixedAPIAuthenticationAndGuestIdentityPort(t *testing.T) {
+	catalogPath := filepath.Join(t.TempDir(), "apple-catalog.json")
+	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	loads := 0
+	fetcher := LocalOpenCodexFetcher{
+		BaseURL:               "http://127.0.0.1:10210/v1",
+		CatalogPath:           catalogPath,
+		ExpectedServicePort:   10100,
+		AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
+		Credentials: func() (credentials.Values, error) {
+			loads++
+			return credentials.Values{LocalOpenCodexAPIKey: apiToken}, nil
+		},
+		HTTPClient: &http.Client{Transport: localRoundTrip(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Host != "127.0.0.1:10210" || request.Header.Get("CF-Access-Client-Id") != "" || request.Header.Get("X-OpenCodex-Relay") != "" {
+				t.Fatalf("unsafe Apple catalog request: url=%s headers=%#v", request.URL, request.Header)
+			}
+			switch request.URL.Path {
+			case "/healthz":
+				if request.Header.Get("X-OpenCodex-API-Key") != "" {
+					t.Fatalf("Apple health request sent API key: %#v", request.Header)
+				}
+				return localJSON(http.StatusOK, `{"service":"opencodex","status":"ok","port":10100}`), nil
+			case "/v1/models":
+				if request.Header.Get("X-OpenCodex-API-Key") != apiToken {
+					t.Fatalf("Apple models key = %q", request.Header.Get("X-OpenCodex-API-Key"))
+				}
+				return localJSON(http.StatusOK, `{"data":[{"id":"apple-visible"}]}`), nil
+			default:
+				t.Fatalf("Apple catalog path = %q", request.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+	result, err := fetcher.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed || result.Count != 1 || loads != 1 || !Pending(catalogPath) {
+		t.Fatalf("Apple catalog result=%#v loads=%d pending=%t", result, loads, Pending(catalogPath))
 	}
 }
 

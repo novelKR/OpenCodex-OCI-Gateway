@@ -138,6 +138,8 @@ func TestStandaloneRelayAssetGateRejectsPartialCanonicalAssets(t *testing.T) {
 		".codex/opencodex-relay-dev-local-catalog.json",
 		".codex/opencodex-relay-dev-local-catalog.json.restart-pending",
 		".config/opencodex-relay/credentials.env",
+		".config/opencodex-relay/relay.json.runtime-maintenance.json",
+		".config/opencodex-relay/relay-dev/relay.json.runtime-maintenance.json",
 	} {
 		t.Run(relative, func(t *testing.T) {
 			home := t.TempDir()

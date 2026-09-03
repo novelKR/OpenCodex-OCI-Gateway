@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -367,6 +368,123 @@ func TestLocalOpenCodexRequestAndApplyUseExplicitBackendBoundary(t *testing.T) {
 	content, err := os.ReadFile(codexPath)
 	if err != nil || !strings.Contains(string(content), cfg.LocalOpenCodex.CatalogPath) {
 		t.Fatalf("local apply did not bind local catalog: %q err=%v", content, err)
+	}
+}
+
+func TestAppleContainerRequestAndApplyUseAuthenticatedFixedProfile(t *testing.T) {
+	directory := t.TempDir()
+	relayPath := filepath.Join(directory, "relay.json")
+	codexPath := filepath.Join(directory, "config.toml")
+	cfg, err := config.NewDefault("https://gateway.example.test/v1", config.CredentialsSourceNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	cfg.LocalAppleContainer, err = config.NewLocalAppleContainerProfileForCodexConfig(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Write(relayPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexPath, []byte("model = \"gpt\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := codexconfig.EnableWithInteractiveProfile(codexPath, "http://127.0.0.1:18180/v1", "http://127.0.0.1:18182/v1", cfg.Catalog.Path); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(relayPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	var applied []Backend
+	var materialized []config.Config
+	var targets []localopencodex.Target
+	controller, err := NewController(
+		relayPath,
+		codexPath,
+		WithTransitionTiming(time.Second, time.Millisecond),
+		withLocalProfileAllowed(true),
+		withCredentialLoader(func(cfg config.CredentialsConfig) (credentials.Values, error) {
+			if cfg.Source != config.CredentialsSourceKeychain || cfg.RemoteAuthenticationProfile() != config.LocalAuthenticationOpenCodexAPIKey {
+				t.Fatalf("Apple credential config = %#v", cfg)
+			}
+			return credentials.Values{LocalOpenCodexAPIKey: apiToken}, nil
+		}),
+		withLocalTargetPreflight(func(_ context.Context, target localopencodex.Target) localopencodex.Result {
+			targets = append(targets, target)
+			if target.BaseURL != "http://127.0.0.1:10210/v1" || target.ExpectedServicePort != 10100 ||
+				target.AuthenticationProfile != config.LocalAuthenticationOpenCodexAPIKey || target.Credentials.LocalOpenCodexAPIKey != apiToken {
+				t.Fatalf("Apple preflight target = %#v", target)
+			}
+			return localopencodex.Result{Availability: localopencodex.AvailabilityReady, ModelCount: 1}
+		}),
+		withLocalCatalogMaterializer(func(_ context.Context, local config.Config) error {
+			materialized = append(materialized, local)
+			if local.UpstreamMode != config.UpstreamModeLocalAppleContainer ||
+				local.UpstreamBaseURL != "http://127.0.0.1:10210/v1" ||
+				local.Credentials.RemoteAuthenticationProfile() != config.LocalAuthenticationOpenCodexAPIKey ||
+				local.Catalog.Owner != config.CatalogOwnerRelay {
+				t.Fatalf("Apple catalog barrier received unsafe runtime config: %#v", local)
+			}
+			return nil
+		}),
+		WithRuntimeControl(runtimeControlFunc(func(_ context.Context, _ uint64, backend Backend) error {
+			applied = append(applied, backend)
+			return nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.health = stateHealth{store: store, active: 0}
+
+	requested, err := controller.RequestBackend(context.Background(), BackendLocalAppleContainer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requested.Phase != PhaseBackendPendingRestart || requested.DesiredBackend != BackendLocalAppleContainer || requested.AppliedBackend != BackendExternal {
+		t.Fatalf("Apple request status = %#v", requested)
+	}
+	completed, err := controller.Apply(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Phase != PhaseRelayActive || completed.DesiredBackend != BackendLocalAppleContainer ||
+		completed.AppliedBackend != BackendLocalAppleContainer || completed.RelayAdmission != "allow" {
+		t.Fatalf("Apple apply status = %#v", completed)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("Apple target preflight calls = %d, want request + apply", len(targets))
+	}
+	if len(materialized) != 1 || materialized[0].Catalog.Path != cfg.LocalAppleContainer.CatalogPath {
+		t.Fatalf("Apple catalog barrier calls = %#v", materialized)
+	}
+	if len(applied) != 1 || applied[0] != BackendLocalAppleContainer {
+		t.Fatalf("Apple runtime apply calls = %#v", applied)
+	}
+	content, err := os.ReadFile(codexPath)
+	if err != nil || !strings.Contains(string(content), cfg.LocalAppleContainer.CatalogPath) {
+		t.Fatalf("Apple apply did not bind Apple catalog: %q err=%v", content, err)
+	}
+
+	// Production installers preserve the already-applied backend with a
+	// same-mode request. That path must remain witness-only: it may not turn an
+	// otherwise healthy release replacement into another Keychain/token read or
+	// authenticated runtime preflight.
+	credentialLoads := 0
+	controller.loadCredentials = func(config.CredentialsConfig) (credentials.Values, error) {
+		credentialLoads++
+		return credentials.Values{}, errors.New("credential access is forbidden for a same-backend request")
+	}
+	reselected, err := controller.RequestBackend(context.Background(), BackendLocalAppleContainer)
+	if err != nil {
+		t.Fatalf("same Apple backend request failed: %v", err)
+	}
+	if reselected.Generation != completed.Generation || reselected.Phase != PhaseRelayActive ||
+		reselected.AppliedBackend != BackendLocalAppleContainer || credentialLoads != 0 || len(targets) != 2 {
+		t.Fatalf("same Apple backend request mutated or re-read credentials: status=%#v loads=%d targets=%d", reselected, credentialLoads, len(targets))
 	}
 }
 
@@ -830,8 +948,8 @@ func TestLegacyInferenceRejectsForeignCatalogOverride(t *testing.T) {
 func TestStatusIsSafeWhenLocalRelayIsUnreachable(t *testing.T) {
 	controller, _, _ := controllerFixture(t, unavailableHealth{})
 	status := controller.Status(context.Background())
-	if status.SchemaVersion != 3 {
-		t.Fatalf("status schema = %d, want 3", status.SchemaVersion)
+	if status.SchemaVersion != 4 {
+		t.Fatalf("status schema = %d, want 4", status.SchemaVersion)
 	}
 	if status.RecoveryCapabilities.CanComplete || status.RecoveryCapabilities.CanRollback ||
 		status.RecoveryCapabilities.CompleteReason != recoveryReasonNotRequired ||
@@ -925,6 +1043,21 @@ func TestSchemaV2JournalRejectsMissingOrMismatchedBackends(t *testing.T) {
 	migrated := normalizeTransactionJournal(legacy)
 	if migrated.TargetBackend != BackendExternal || migrated.OriginBackend != BackendNone || migrated.validate() != nil {
 		t.Fatalf("legacy journal migration = %#v", migrated)
+	}
+
+	v2 := base
+	v2.Schema = explicitBackendSchemaVersion
+	v2.TargetBackend = BackendLocalOpenCodex
+	v2.OriginBackend = BackendNone
+	migrated = normalizeTransactionJournal(v2)
+	if migrated.Schema != SchemaVersion || migrated.TargetBackend != BackendLocalOpenCodex || migrated.OriginBackend != BackendNone || migrated.validate() != nil {
+		t.Fatalf("schema v2 journal migration changed backend meaning = %#v", migrated)
+	}
+
+	v2Future := v2
+	v2Future.TargetBackend = BackendLocalAppleContainer
+	if migrated := normalizeTransactionJournal(v2Future); migrated.validate() == nil {
+		t.Fatalf("schema v2 journal accepted future Apple backend = %#v", migrated)
 	}
 }
 
@@ -1371,7 +1504,7 @@ func (h stateHealth) Read(_ context.Context, _ config.Config) LocalRelay {
 	}
 	active := h.active
 	localAvailability := string(LocalOpenCodexUnknown)
-	if state.AppliedBackend == BackendLocalOpenCodex {
+	if state.AppliedBackend == BackendLocalOpenCodex || state.AppliedBackend == BackendLocalAppleContainer {
 		localAvailability = string(LocalOpenCodexReady)
 	}
 	endpoint := LocalRelayEndpoint{

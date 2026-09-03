@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/containerruntime"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/integration"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
@@ -59,6 +60,14 @@ func TestSafeOperationErrorMapsRecoveryWithoutRawDetails(t *testing.T) {
 		{routing.ErrNativeRepairGenerationStale, "routing_generation_changed", true, "refresh_status"},
 		{integration.ErrUpgradeIncompatible, "runtime_upgrade_incompatible", false, "manual_remediation"},
 		{integration.ErrRestartConfirmationNeeded, "relay_restart_confirmation_required", false, "confirm_restart"},
+		{containerruntime.ErrInvalidRequest, "container_runtime_invalid_request", false, "review_request"},
+		{containerruntime.ErrStateChanged, "container_runtime_changed", true, "refresh_status"},
+		{containerruntime.ErrRoutingChanged, "container_runtime_changed", true, "refresh_status"},
+		{containerruntime.ErrRecoveryRequired, "container_runtime_recovery_required", false, "open_recovery"},
+		{containerruntime.ErrUnsafeState, "container_runtime_recovery_required", false, "open_recovery"},
+		{containerruntime.ErrForeignResource, "container_runtime_recovery_required", false, "open_recovery"},
+		{containerruntime.ErrCredential, "container_runtime_credential_unavailable", false, "activate_runtime"},
+		{containerruntime.ErrUnavailable, "container_runtime_unavailable", true, "refresh_status"},
 	} {
 		result := safeOperationError(test.err)
 		if result.Error.Code != test.code || result.Error.Retryable != test.retryable || result.Error.RecommendedAction != test.action {
@@ -81,5 +90,35 @@ func TestJSONOutputRequestedRecognizesOnlyExplicitJSONFlag(t *testing.T) {
 		if jsonOutputRequested(args) {
 			t.Fatalf("non-JSON invocation was recognized: %#v", args)
 		}
+	}
+}
+
+func TestParseBackendRequestIncludesAppleContainerWithoutChangingAliases(t *testing.T) {
+	tests := []struct {
+		value string
+		want  routing.Backend
+	}{
+		{"native", routing.BackendNone},
+		{"external", routing.BackendExternal},
+		{"relay", routing.BackendExternal},
+		{"local_opencodex", routing.BackendLocalOpenCodex},
+		{"local_apple_container", routing.BackendLocalAppleContainer},
+	}
+	for _, test := range tests {
+		t.Run(test.value, func(t *testing.T) {
+			got, err := parseBackendRequest(test.value)
+			if err != nil || got != test.want {
+				t.Fatalf("parseBackendRequest(%q) = %q, %v; want %q", test.value, got, err, test.want)
+			}
+		})
+	}
+	if got, err := parseBackendRequest("apple"); err == nil || got != routing.BackendUnknown || !strings.Contains(err.Error(), "local_apple_container") {
+		t.Fatalf("unsupported alias = %q, %v", got, err)
+	}
+
+	var output strings.Builder
+	writeUsage(&output)
+	if !strings.Contains(output.String(), "native|external|local_opencodex|local_apple_container|relay") {
+		t.Fatalf("usage omits Apple Container backend: %q", output.String())
 	}
 }

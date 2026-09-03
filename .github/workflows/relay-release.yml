@@ -119,21 +119,57 @@ jobs:
           release_json="${RUNNER_TEMP}/relay-releases.json"
           app_assets="${RUNNER_TEMP}/relay-app-assets.tsv"
           builds="${RUNNER_TEMP}/relay-app-builds.txt"
-          gh api "repos/${RELEASE_REPOSITORY}/releases?per_page=100&page=1" > "$release_json"
-          release_count="$(jq 'length' "$release_json")"
-          [[ "$release_count" -lt 100 ]] || {
-            printf 'ERROR: previous public release scan exceeded its one-page bound\n' >&2
+          release_pages="${RUNNER_TEMP}/relay-release-pages"
+          mkdir -m 0700 "$release_pages"
+          scan_complete=false
+          for page in 1 2 3 4 5; do
+            page_json="${release_pages}/page-${page}.json"
+            gh api "repos/${RELEASE_REPOSITORY}/releases?per_page=100&page=${page}" > "$page_json"
+            page_count="$(jq 'length' "$page_json")"
+            [[ "$page_count" -le 100 ]] || {
+              printf 'ERROR: GitHub returned an oversized release page\n' >&2
+              exit 1
+            }
+            if [[ "$page_count" -lt 100 ]]; then
+              scan_complete=true
+              break
+            fi
+          done
+          [[ "$scan_complete" == true ]] || {
+            printf 'ERROR: previous public release scan exceeded its five-page bound\n' >&2
             exit 1
           }
-          jq -r '
-            [.[] | select(.draft == false) | .assets[]
-               | select(.name == "OpenCodexRelay.app.zip" and .state == "uploaded")
-               | [.id, .size]]
-            | .[] | @tsv
-          ' "$release_json" > "$app_assets"
+          jq -s 'add' "$release_pages"/page-*.json > "$release_json"
+          python3 - "$release_json" > "$app_assets" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          semver = re.compile(
+              r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+          )
+          releases = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(releases, list):
+              raise SystemExit("release list is invalid")
+          for release in releases:
+              if not isinstance(release, dict) or release.get("draft") is not False:
+                  continue
+              tag = release.get("tag_name")
+              match = semver.fullmatch(tag) if isinstance(tag, str) else None
+              if match is None:
+                  continue
+              for asset in release.get("assets", []):
+                  if (
+                      isinstance(asset, dict)
+                      and asset.get("name") == "OpenCodexRelay.app.zip"
+                      and asset.get("state") == "uploaded"
+                  ):
+                      print(f"{asset.get('id')}\t{asset.get('size')}")
+          PY
           asset_count="$(wc -l < "$app_assets" | tr -d ' ')"
-          [[ "$asset_count" -ge 1 && "$asset_count" -lt 100 ]] || {
-            printf 'ERROR: expected 1 through 99 previous public macOS app assets, found %s\n' "$asset_count" >&2
+          [[ "$asset_count" -ge 1 && "$asset_count" -lt 500 ]] || {
+            printf 'ERROR: expected 1 through 499 previous public macOS app assets, found %s\n' "$asset_count" >&2
             exit 1
           }
           : > "$builds"

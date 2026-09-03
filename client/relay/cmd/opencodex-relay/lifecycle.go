@@ -61,21 +61,25 @@ func runCatalogLifecycle(
 	lifecycle.run(ctx)
 }
 
-// runLocalOpenCodexCatalogLifecycle owns the distinct relay-written Local
-// catalog. It never receives a credential loader and LocalOpenCodexFetcher
-// constructs a no-proxy/no-header client, so a local profile cannot reuse the
-// External gateway admission boundary by accident.
+// runLocalOpenCodexCatalogLifecycle owns one of the distinct relay-written
+// local catalogs. LocalOpenCodexFetcher always constructs a no-proxy client;
+// the fixed Apple profile additionally loads only its API token and injects it
+// on /v1/models. The native profile remains credentialless.
 func runLocalOpenCodexCatalogLifecycle(
 	ctx context.Context,
 	cfg config.Config,
+	load func() (credentials.Values, error),
 	tracker *proxy.Tracker,
 	logger *slog.Logger,
 	watcher *routing.Watcher,
 	observation *proxy.ConnectionObservation,
 ) {
 	refresher := catalog.LocalOpenCodexFetcher{
-		BaseURL:     cfg.UpstreamBaseURL,
-		CatalogPath: cfg.Catalog.Path,
+		BaseURL:               cfg.UpstreamBaseURL,
+		CatalogPath:           cfg.Catalog.Path,
+		ExpectedServicePort:   10100,
+		AuthenticationProfile: cfg.Credentials.RemoteAuthenticationProfile(),
+		Credentials:           load,
 	}
 	lifecycle := catalogLifecycle{
 		cfg:         cfg,

@@ -17,8 +17,9 @@ import (
 const (
 	DefaultListenAddress = "127.0.0.1:18180"
 
-	UpstreamModeExternalGateway = "external_gateway"
-	UpstreamModeLocalOpenCodex  = "local_opencodex"
+	UpstreamModeExternalGateway     = "external_gateway"
+	UpstreamModeLocalOpenCodex      = "local_opencodex"
+	UpstreamModeLocalAppleContainer = "local_apple_container"
 
 	CredentialsSourceKeychain = "keychain"
 	CredentialsSourceFile     = "file"
@@ -27,6 +28,7 @@ const (
 	RemoteAuthenticationNone                          = "none"
 	RemoteAuthenticationGatewayAPIKey                 = "gateway_api_key"
 	RemoteAuthenticationCloudflareAccessAndGatewayKey = "cloudflare_access_and_gateway_api_key"
+	LocalAuthenticationOpenCodexAPIKey                = "local_opencodex_api_key"
 
 	ResponsesWebSocketModePassthrough           = "passthrough"
 	ResponsesWebSocketModeHTTPFallback          = "http_fallback"
@@ -50,6 +52,8 @@ const (
 	LocalDevelopmentInteractiveListen = "127.0.0.1:18192"
 	LocalDevelopmentExternalCatalog   = "opencodex-relay-dev-external-catalog.json"
 	LocalDevelopmentLocalCatalog      = "opencodex-relay-dev-local-catalog.json"
+	LocalDevelopmentAppleCatalog      = "opencodex-relay-dev-apple-container-catalog.json"
+	LocalAppleContainerCatalog        = "opencodex-relay-apple-container-catalog.json"
 
 	// CatalogRestartPendingSuffix and CatalogPreviousSuffix name every
 	// sidecar artifact a relay-owned catalog writer may create. Keeping these
@@ -59,8 +63,9 @@ const (
 	CatalogRestartPendingSuffix = ".restart-pending"
 	CatalogPreviousSuffix       = ".previous"
 
-	localOpenCodexIPv4URL = "http://127.0.0.1:10100/v1"
-	localOpenCodexIPv6URL = "http://[::1]:10100/v1"
+	localOpenCodexIPv4URL  = "http://127.0.0.1:10100/v1"
+	localOpenCodexIPv6URL  = "http://[::1]:10100/v1"
+	localAppleContainerURL = "http://127.0.0.1:10210/v1"
 
 	minResponsesPendingBytes = int64(32 << 20)
 	maxResponsesPendingBytes = int64(16 << 30)
@@ -86,11 +91,17 @@ type Config struct {
 	// local_opencodex + remote_manager installations retain their established
 	// single-topology contract.
 	LocalOpenCodex *LocalOpenCodexProfile `json:"local_opencodex,omitempty"`
+	// LocalAppleContainer is an optional macOS Apple Silicon profile. Its
+	// endpoint, credential source, authentication profile, and catalog
+	// namespace are compiled-in invariants; only the current-user Keychain
+	// account may be selected explicitly.
+	LocalAppleContainer *LocalAppleContainerProfile `json:"local_apple_container,omitempty"`
 
 	// localProfileRuntime marks an ephemeral Config returned by
 	// LocalOpenCodexRuntimeConfig. It is deliberately not serialized: a saved
 	// relay.json must never silently change its canonical external topology.
-	localProfileRuntime bool
+	localProfileRuntime        bool
+	localAppleContainerRuntime bool
 }
 
 // Scope returns a canonical bounded installation scope without allowing a
@@ -139,6 +150,8 @@ func RequiredCredentialKinds(profile string) ([]string, error) {
 		return []string{"gateway_api_key"}, nil
 	case RemoteAuthenticationCloudflareAccessAndGatewayKey:
 		return []string{"cloudflare_access_client_id", "cloudflare_access_client_secret", "gateway_api_key"}, nil
+	case LocalAuthenticationOpenCodexAPIKey:
+		return []string{"local_opencodex_api_key"}, nil
 	default:
 		return nil, errors.New("authentication_profile is invalid")
 	}
@@ -208,6 +221,15 @@ type LocalOpenCodexProfile struct {
 	CatalogPath     string `json:"catalog_path"`
 }
 
+// LocalAppleContainerProfile stores only non-secret enrollment metadata. The
+// endpoint and catalog basename are fixed so relay.json cannot repurpose this
+// profile as arbitrary local egress or a competing catalog writer.
+type LocalAppleContainerProfile struct {
+	UpstreamBaseURL   string `json:"upstream_base_url"`
+	CatalogPath       string `json:"catalog_path"`
+	CredentialAccount string `json:"credential_account,omitempty"`
+}
+
 // ConnectionProbeConfig permits the macOS MenuBar installer to opt in to a
 // deliberately low-frequency gateway reachability observation. It contains no
 // endpoint, credentials, or timing knobs: the resident relay fixes those
@@ -252,6 +274,17 @@ func DefaultLocalOpenCodexCatalogPath() (string, error) {
 	return filepath.Join(home, ".codex", "opencodex-relay-local-catalog.json"), nil
 }
 
+// DefaultLocalAppleContainerCatalogPath returns the production catalog
+// namespace reserved for the Apple Container runtime. It is intentionally
+// distinct from both the external gateway and host-native OpenCodex paths.
+func DefaultLocalAppleContainerCatalogPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".codex", LocalAppleContainerCatalog), nil
+}
+
 // NewLocalOpenCodexProfile creates the safe default enrollment shape. It
 // does not contact OpenCodex or alter relay.json; callers still need to write
 // the returned profile through their explicit enrollment transaction.
@@ -289,10 +322,48 @@ func NewLocalOpenCodexProfileForCodexConfigWithCatalogName(codexConfigPath, cata
 	}, nil
 }
 
+// NewLocalAppleContainerProfile creates the compiled-in production profile.
+// It contains no credential value and does not mutate relay.json.
+func NewLocalAppleContainerProfile() (*LocalAppleContainerProfile, error) {
+	catalogPath, err := DefaultLocalAppleContainerCatalogPath()
+	if err != nil {
+		return nil, err
+	}
+	return &LocalAppleContainerProfile{
+		UpstreamBaseURL: localAppleContainerURL,
+		CatalogPath:     catalogPath,
+	}, nil
+}
+
+// NewLocalAppleContainerProfileForCodexConfig binds the fixed Apple catalog
+// basename to the explicitly selected Codex home.
+func NewLocalAppleContainerProfileForCodexConfig(codexConfigPath string) (*LocalAppleContainerProfile, error) {
+	return NewLocalAppleContainerProfileForCodexConfigWithCatalogName(codexConfigPath, LocalAppleContainerCatalog)
+}
+
+// NewLocalAppleContainerProfileForCodexConfigWithCatalogName keeps production
+// and local-development catalog namespaces disjoint.
+func NewLocalAppleContainerProfileForCodexConfigWithCatalogName(codexConfigPath, catalogName string) (*LocalAppleContainerProfile, error) {
+	if codexConfigPath == "" || !filepath.IsAbs(codexConfigPath) || filepath.Clean(codexConfigPath) != codexConfigPath {
+		return nil, errors.New("Codex config path must be a clean absolute path")
+	}
+	if catalogName != LocalAppleContainerCatalog && catalogName != LocalDevelopmentAppleCatalog {
+		return nil, errors.New("local Apple Container catalog filename is unsupported")
+	}
+	return &LocalAppleContainerProfile{
+		UpstreamBaseURL: localAppleContainerURL,
+		CatalogPath:     filepath.Join(filepath.Dir(codexConfigPath), catalogName),
+	}, nil
+}
+
 // HasLocalOpenCodexProfile reports only durable enrollment, not listener
 // reachability. Readiness is intentionally established by the bounded local
 // preflight rather than config inspection or a TCP connect.
 func (c Config) HasLocalOpenCodexProfile() bool { return c.LocalOpenCodex != nil }
+
+// HasLocalAppleContainerProfile reports durable enrollment only. Runtime
+// health is established independently by the authenticated local preflight.
+func (c Config) HasLocalAppleContainerProfile() bool { return c.LocalAppleContainer != nil }
 
 // LocalOpenCodexRuntimeConfig derives the immutable runtime settings for the
 // optional relay-owned local profile. It preserves the persisted external
@@ -314,7 +385,44 @@ func (c Config) LocalOpenCodexRuntimeConfig() (Config, error) {
 	result.Catalog.Owner = CatalogOwnerRelay
 	result.Catalog.Path = c.LocalOpenCodex.CatalogPath
 	result.ConnectionProbe.Enabled = false
+	// The canonical config may enroll both local backends. An immutable
+	// runtime clone carries only the selected profile so validation cannot
+	// reinterpret the other profile as a second active topology.
+	result.LocalAppleContainer = nil
 	result.localProfileRuntime = true
+	if err := result.Validate(); err != nil {
+		return Config{}, err
+	}
+	return result, nil
+}
+
+// LocalAppleContainerRuntimeConfig derives the immutable runtime settings for
+// the Apple Container profile. The API token remains in Keychain and is
+// selected through a dedicated authentication profile; the management token
+// is intentionally outside this generic relay configuration and loader.
+func (c Config) LocalAppleContainerRuntimeConfig() (Config, error) {
+	if c.LocalAppleContainer == nil {
+		return Config{}, errors.New("local_apple_container profile is not enrolled")
+	}
+	if c.UpstreamMode != UpstreamModeExternalGateway {
+		return Config{}, errors.New("local_apple_container profile requires external_gateway as the canonical relay topology")
+	}
+	if err := c.Validate(); err != nil {
+		return Config{}, err
+	}
+	result := c
+	result.UpstreamMode = UpstreamModeLocalAppleContainer
+	result.UpstreamBaseURL = c.LocalAppleContainer.UpstreamBaseURL
+	result.Credentials = CredentialsConfig{
+		Source:                CredentialsSourceKeychain,
+		Account:               c.LocalAppleContainer.CredentialAccount,
+		AuthenticationProfile: LocalAuthenticationOpenCodexAPIKey,
+	}
+	result.Catalog.Owner = CatalogOwnerRelay
+	result.Catalog.Path = c.LocalAppleContainer.CatalogPath
+	result.ConnectionProbe.Enabled = false
+	result.LocalOpenCodex = nil
+	result.localAppleContainerRuntime = true
 	if err := result.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -327,6 +435,13 @@ func (c Config) LocalOpenCodexRuntimeConfig() (Config, error) {
 // local profile into an arbitrary egress target.
 func IsLocalOpenCodexBaseURL(value string) bool {
 	return value == localOpenCodexIPv4URL || value == localOpenCodexIPv6URL
+}
+
+// IsLocalAppleContainerBaseURL accepts only the fixed numeric host-side
+// published endpoint. The guest identity port is validated separately by the
+// typed local preflight and is deliberately not inferred from this URL.
+func IsLocalAppleContainerBaseURL(value string) bool {
+	return value == localAppleContainerURL
 }
 
 func DefaultCredentialFile() (string, error) {
@@ -527,6 +642,9 @@ func (c Config) Validate() error {
 		if _, err := RequiredCredentialKinds(profile); err != nil {
 			return err
 		}
+		if profile == LocalAuthenticationOpenCodexAPIKey {
+			return errors.New("local_opencodex_api_key is reserved for local_apple_container")
+		}
 		if profile == RemoteAuthenticationNone {
 			if c.Credentials.Source != CredentialsSourceNone && c.Credentials.Source != CredentialsSourceKeychain && c.Credentials.Source != CredentialsSourceFile {
 				return errors.New("credentials.source is invalid")
@@ -554,8 +672,21 @@ func (c Config) Validate() error {
 		if c.Credentials.RemoteAuthenticationProfile() != RemoteAuthenticationNone || c.Credentials.AllowInsecurePrivateIP {
 			return errors.New("local_opencodex must not configure remote authentication")
 		}
+	case UpstreamModeLocalAppleContainer:
+		if !c.localAppleContainerRuntime || c.LocalAppleContainer == nil {
+			return errors.New("local_apple_container is a derived runtime profile")
+		}
+		if !IsLocalAppleContainerBaseURL(c.UpstreamBaseURL) {
+			return fmt.Errorf("upstream_base_url must be %s for local_apple_container", localAppleContainerURL)
+		}
+		if c.Credentials.Source != CredentialsSourceKeychain || c.Credentials.File != "" {
+			return errors.New("credentials.source must be keychain for local_apple_container")
+		}
+		if c.Credentials.RemoteAuthenticationProfile() != LocalAuthenticationOpenCodexAPIKey || c.Credentials.AllowInsecurePrivateIP {
+			return errors.New("local_apple_container requires the fixed local API authentication profile")
+		}
 	default:
-		return errors.New("upstream_mode must be external_gateway or local_opencodex")
+		return errors.New("upstream_mode must be external_gateway, local_opencodex, or a derived local_apple_container profile")
 	}
 	if c.Credentials.Source == CredentialsSourceFile && c.Credentials.File == "" {
 		return errors.New("credentials.file is required for file credentials")
@@ -641,6 +772,9 @@ func (c Config) Validate() error {
 	if upstreamMode == UpstreamModeLocalOpenCodex && catalogOwner != CatalogOwnerRemoteManager && !(c.localProfileRuntime && catalogOwner == CatalogOwnerRelay) {
 		return errors.New("catalog.owner must be remote_manager for legacy local_opencodex")
 	}
+	if upstreamMode == UpstreamModeLocalAppleContainer && catalogOwner != CatalogOwnerRelay {
+		return errors.New("catalog.owner must be relay for local_apple_container")
+	}
 	if upstreamMode == UpstreamModeExternalGateway && catalogOwner != CatalogOwnerRelay {
 		return errors.New("catalog.owner must be relay for external_gateway")
 	}
@@ -657,12 +791,17 @@ func (c Config) Validate() error {
 		expectedCatalogName := LocalDevelopmentExternalCatalog
 		if c.localProfileRuntime {
 			expectedCatalogName = LocalDevelopmentLocalCatalog
+		} else if c.localAppleContainerRuntime {
+			expectedCatalogName = LocalDevelopmentAppleCatalog
 		}
 		if filepath.Base(c.Catalog.Path) != expectedCatalogName {
 			return fmt.Errorf("local_development catalog.path must end in %s", expectedCatalogName)
 		}
 		if !c.localProfileRuntime && c.LocalOpenCodex != nil && filepath.Base(c.LocalOpenCodex.CatalogPath) != LocalDevelopmentLocalCatalog {
 			return fmt.Errorf("local_development local_opencodex.catalog_path must end in %s", LocalDevelopmentLocalCatalog)
+		}
+		if !c.localAppleContainerRuntime && c.LocalAppleContainer != nil && filepath.Base(c.LocalAppleContainer.CatalogPath) != LocalDevelopmentAppleCatalog {
+			return fmt.Errorf("local_development local_apple_container.catalog_path must end in %s", LocalDevelopmentAppleCatalog)
 		}
 	}
 	if c.Catalog.AppServerHome != "" {
@@ -675,6 +814,21 @@ func (c Config) Validate() error {
 	}
 	if err := c.validateLocalOpenCodexProfile(upstreamMode); err != nil {
 		return err
+	}
+	if err := c.validateLocalAppleContainerProfile(upstreamMode); err != nil {
+		return err
+	}
+	if !c.localProfileRuntime && !c.localAppleContainerRuntime {
+		paths := []string{c.Catalog.Path}
+		if c.LocalOpenCodex != nil {
+			paths = append(paths, c.LocalOpenCodex.CatalogPath)
+		}
+		if c.LocalAppleContainer != nil {
+			paths = append(paths, c.LocalAppleContainer.CatalogPath)
+		}
+		if err := validateCatalogArtifactSeparation(paths...); err != nil {
+			return err
+		}
 	}
 	_, err = c.RefreshEvery()
 	return err
@@ -706,8 +860,38 @@ func (c Config) validateLocalOpenCodexProfile(upstreamMode string) error {
 	if c.Catalog.Path == "" || !filepath.IsAbs(c.Catalog.Path) || filepath.Clean(c.Catalog.Path) != c.Catalog.Path {
 		return errors.New("catalog.path must be a clean absolute path when local_opencodex is configured")
 	}
-	if err := validateCatalogArtifactSeparation(c.Catalog.Path, path); err != nil {
-		return err
+	return nil
+}
+
+func (c Config) validateLocalAppleContainerProfile(upstreamMode string) error {
+	if c.localAppleContainerRuntime {
+		if c.LocalAppleContainer == nil || upstreamMode != UpstreamModeLocalAppleContainer || c.Catalog.Owner != CatalogOwnerRelay {
+			return errors.New("invalid local_apple_container runtime profile")
+		}
+		return nil
+	}
+	if c.LocalAppleContainer == nil {
+		return nil
+	}
+	if upstreamMode != UpstreamModeExternalGateway {
+		return errors.New("local_apple_container profile requires external_gateway as the canonical relay topology")
+	}
+	if !IsLocalAppleContainerBaseURL(c.LocalAppleContainer.UpstreamBaseURL) {
+		return fmt.Errorf("local_apple_container.upstream_base_url must be %s", localAppleContainerURL)
+	}
+	path := c.LocalAppleContainer.CatalogPath
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("local_apple_container.catalog_path must be a clean absolute path")
+	}
+	expectedName := LocalAppleContainerCatalog
+	if c.Scope() == InstallationScopeLocalDevelopment {
+		expectedName = LocalDevelopmentAppleCatalog
+	}
+	if filepath.Base(path) != expectedName {
+		return fmt.Errorf("local_apple_container.catalog_path must end in %s", expectedName)
+	}
+	if strings.TrimSpace(c.LocalAppleContainer.CredentialAccount) != c.LocalAppleContainer.CredentialAccount {
+		return errors.New("local_apple_container.credential_account must not contain surrounding whitespace")
 	}
 	return nil
 }
@@ -721,26 +905,30 @@ func (c Config) validateLocalOpenCodexProfile(upstreamMode string) error {
 // probe or mutate the filesystem to discover its case behavior, so EqualFold
 // prevents an unsafe dual profile on the common case-insensitive volume while
 // merely rejecting an otherwise unusual case-sensitive spelling.
-func validateCatalogArtifactSeparation(externalPath, localPath string) error {
-	externalArtifacts := catalogArtifactPaths(externalPath)
-	localArtifacts := catalogArtifactPaths(localPath)
-	for _, externalArtifact := range externalArtifacts {
-		canonicalExternal, err := canonicalCatalogArtifactPath(externalArtifact)
-		if err != nil {
-			return errors.New("external catalog artifact path cannot be resolved safely")
-		}
-		for _, localArtifact := range localArtifacts {
-			canonicalLocal, err := canonicalCatalogArtifactPath(localArtifact)
-			if err != nil {
-				return errors.New("local_opencodex catalog artifact path cannot be resolved safely")
-			}
-			if strings.EqualFold(canonicalExternal, canonicalLocal) {
-				return errors.New("local_opencodex catalog artifacts must differ from external catalog artifacts")
-			}
-			if same, err := sameExistingFile(externalArtifact, localArtifact); err != nil {
-				return errors.New("catalog artifact path cannot be inspected safely")
-			} else if same {
-				return errors.New("local_opencodex catalog artifacts must differ from external catalog artifacts")
+func validateCatalogArtifactSeparation(paths ...string) error {
+	for firstIndex, firstPath := range paths {
+		firstArtifacts := catalogArtifactPaths(firstPath)
+		for secondIndex := firstIndex + 1; secondIndex < len(paths); secondIndex++ {
+			secondArtifacts := catalogArtifactPaths(paths[secondIndex])
+			for _, firstArtifact := range firstArtifacts {
+				canonicalFirst, err := canonicalCatalogArtifactPath(firstArtifact)
+				if err != nil {
+					return errors.New("catalog artifact path cannot be resolved safely")
+				}
+				for _, secondArtifact := range secondArtifacts {
+					canonicalSecond, err := canonicalCatalogArtifactPath(secondArtifact)
+					if err != nil {
+						return errors.New("catalog artifact path cannot be resolved safely")
+					}
+					if strings.EqualFold(canonicalFirst, canonicalSecond) {
+						return errors.New("external, local_opencodex, and local_apple_container catalog artifacts must be distinct")
+					}
+					if same, err := sameExistingFile(firstArtifact, secondArtifact); err != nil {
+						return errors.New("catalog artifact path cannot be inspected safely")
+					} else if same {
+						return errors.New("external, local_opencodex, and local_apple_container catalog artifacts must be distinct")
+					}
+				}
 			}
 		}
 	}

@@ -219,6 +219,11 @@ canonical_install_path() {
   printf '%s/%s\n' "$resolved_parent" "$base"
 }
 
+safe_absolute_catalog_path() {
+  [[ "$1" == /* && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'//'* && \
+     "$1" != *'/./'* && "$1" != */. && "$1" != *'/../'* && "$1" != */.. && "$1" != ./* ]]
+}
+
 preflight_menu_bar_binding() {
   local path="$1"
   if [[ ! -e "$path" && ! -L "$path" ]]; then
@@ -399,34 +404,56 @@ active_local_runtime_is_acknowledged() {
   local codex_path="$3"
   local status
 
-  # A canonical external relay may retain an explicitly enrolled Local profile.
-  # Accept its derived runtime only after the resident relayctl status proves
-  # that this exact bound state is live, acknowledged, and still fail-closed to
-  # the fixed 10100 identity/catalog contract. A missing helper or any
-  # unacknowledged state deliberately falls back to the canonical comparison,
-  # which rejects a surprise Local listener rather than inferring a fallback.
+  # A canonical external relay may retain explicitly enrolled host-native and
+  # Apple Container profiles. Accept a derived runtime only after the resident
+  # relayctl status proves that the exact bound state is live and acknowledged.
+  # Return the bounded profile label so the independent health read-back below
+  # can verify its endpoint/catalog contract without reading either Keychain
+  # token. A missing helper or any unacknowledged state deliberately falls back
+  # to the canonical comparison, which rejects a surprise Local listener.
   [[ -n "$relayctl" && -x "$relayctl" && -n "$codex_path" ]] || return 1
   status="$("$relayctl" mode status --config "$config" --codex-config "$codex_path" --json 2>/dev/null)" || return 1
-  jq -e --slurpfile cfg "$config" '
+  jq -er --slurpfile cfg "$config" '
     ($cfg[0]) as $c
     | ($c.local_opencodex // null) as $local
-    | (($c.upstream_mode // "external_gateway") == "external_gateway")
-    and (($c.catalog.owner // "relay") == "relay")
-    and ($local | type == "object")
-    and ($local.upstream_base_url == "http://127.0.0.1:10100/v1" or $local.upstream_base_url == "http://[::1]:10100/v1")
-    and ($local.catalog_path | type == "string" and startswith("/") and . != $c.catalog.path)
-    and .schema_version == 2
-    and .desired_backend == "local_opencodex"
-    and .applied_backend == "local_opencodex"
-    and .phase == "relay_active"
-    and .relay_admission == "allow"
-    and .catalog_refresh == "run"
-    and .relay_running == true
-    and .connection.local_relay == "healthy"
-    and .connection.routing_sync == "acknowledged"
-    and .connection.local_opencodex == "ready"
-    and .connection.catalog == "running"
-  ' <<< "$status" >/dev/null
+    | ($c.local_apple_container // null) as $apple
+    | select(
+        (($c.installation_scope // "production") == "production")
+        and (($c.upstream_mode // "external_gateway") == "external_gateway")
+        and (($c.catalog.owner // "relay") == "relay")
+        and .schema_version == 4
+        and .phase == "relay_active"
+        and .relay_admission == "allow"
+        and .catalog_refresh == "run"
+        and .relay_running == true
+        and .connection.local_relay == "healthy"
+        and .connection.routing_sync == "acknowledged"
+        and .connection.local_opencodex == "ready"
+        and .connection.catalog == "running"
+      )
+    | if (
+        .desired_backend == "local_opencodex"
+        and .applied_backend == "local_opencodex"
+        and ($local | type == "object")
+        and ($local.upstream_base_url == "http://127.0.0.1:10100/v1" or $local.upstream_base_url == "http://[::1]:10100/v1")
+        and ($local.catalog_path | type == "string" and startswith("/") and . != $c.catalog.path)
+        and (($apple == null) or $local.catalog_path != $apple.catalog_path)
+      ) then
+        "local_opencodex"
+      elif (
+        .desired_backend == "local_apple_container"
+        and .applied_backend == "local_apple_container"
+        and ($apple | type == "object")
+        and $apple.upstream_base_url == "http://127.0.0.1:10210/v1"
+        and ($apple.catalog_path | type == "string" and startswith("/") and endswith("/opencodex-relay-apple-container-catalog.json") and . != $c.catalog.path)
+        and (($local == null) or $apple.catalog_path != $local.catalog_path)
+        and (($apple.credential_account // "") | type == "string")
+      ) then
+        "local_apple_container"
+      else
+        empty
+      end
+  ' <<< "$status"
 }
 
 health_matches_listener_lane() {
@@ -449,6 +476,7 @@ health_matches_listener_lane() {
         if . == null or . == "" then $fallback else . end;
       ($cfg[0]) as $c
       | ($c.local_opencodex // null) as $local
+      | ($c.local_apple_container // null) as $apple
       | ($c.responses.scheduler // {}) as $s
       | .ok == true
       and .listener_lane == $lane
@@ -458,6 +486,10 @@ health_matches_listener_lane() {
         if $runtime_profile == "local_opencodex" then
           .upstream_mode == "local_opencodex"
           and .upstream_base_url == $local.upstream_base_url
+          and .catalog_owner == "relay"
+        elif $runtime_profile == "local_apple_container" then
+          .upstream_mode == "local_apple_container"
+          and .upstream_base_url == $apple.upstream_base_url
           and .catalog_owner == "relay"
         elif $runtime_profile == "canonical" then
           .upstream_mode == ($c.upstream_mode | go_empty_default("external_gateway"))
@@ -499,6 +531,7 @@ verify_dual_listener_health_once() {
   local interactive_listener
   local general_health
   local interactive_health
+  local runtime_profile
   listeners="$(relay_listeners "$config")" || return 1
   IFS=$'\t' read -r general_listener interactive_listener <<< "$listeners"
   general_health="$(curl --fail --silent --show-error --noproxy '*' --max-time 3 \
@@ -514,9 +547,13 @@ verify_dual_listener_health_once() {
   # legacy-static profiles, while a Local health shape is accepted only after
   # the independent relayctl acknowledgement above proves it is the selected
   # derived runtime.
-  active_local_runtime_is_acknowledged "$config" "$relayctl" "$codex_path" || return 1
-  health_matches_listener_lane "$general_health" "$config" general "$general_listener" "$interactive_listener" local_opencodex && \
-    health_matches_listener_lane "$interactive_health" "$config" interactive "$general_listener" "$interactive_listener" local_opencodex
+  runtime_profile="$(active_local_runtime_is_acknowledged "$config" "$relayctl" "$codex_path")" || return 1
+  case "$runtime_profile" in
+    local_opencodex|local_apple_container) ;;
+    *) return 1 ;;
+  esac
+  health_matches_listener_lane "$general_health" "$config" general "$general_listener" "$interactive_listener" "$runtime_profile" && \
+    health_matches_listener_lane "$interactive_health" "$config" interactive "$general_listener" "$interactive_listener" "$runtime_profile"
 }
 
 wait_for_dual_listener_health() {
@@ -574,7 +611,7 @@ seed_deferred_routing_state() {
   local applied
   status="$("$relayctl" mode status --config "$relay_config" --codex-config "$codex_path" --json)" || \
     die 'unable to inspect routing before deferred service activation'
-  applied="$(jq -er '.applied_backend | select(. == "external" or . == "local_opencodex" or . == "none")' <<<"$status")" || \
+  applied="$(jq -er '.applied_backend | select(. == "external" or . == "local_opencodex" or . == "local_apple_container" or . == "none")' <<<"$status")" || \
     die 'deferred routing is ambiguous; resolve it with relayctl mode recover before installing the service'
   # A same-mode request persists the exact canonical binding without changing
   # any Codex TOML/profile artifact. This prevents a new native installation
@@ -594,7 +631,7 @@ request_install_routing_state() {
   local applied
   status="$("$relayctl" mode status --config "$relay_config" --codex-config "$codex_path" --json)" || \
     die 'unable to inspect routing before service activation'
-  applied="$(jq -er '.applied_backend | select(. == "external" or . == "local_opencodex" or . == "none")' <<<"$status")" || \
+  applied="$(jq -er '.applied_backend | select(. == "external" or . == "local_opencodex" or . == "local_apple_container" or . == "none")' <<<"$status")" || \
     die 'routing is ambiguous; resolve it with relayctl mode recover before installing the service'
   # A fresh native install intentionally defaults to the configured relay
   # topology.  Canonical macOS/external installs therefore choose External,
@@ -749,6 +786,10 @@ verify_and_extract_macos_bundle() {
   [[ "$trusted_codex_bundle_id" == "$TRUSTED_CODEX_BUNDLE_ID" && \
      "$trusted_codex_team_id" == "$TRUSTED_CODEX_TEAM_ID" ]] || \
     die 'macOS bundle Codex Desktop trust identity is not reviewed'
+  runtime_public_key="${app}/Contents/Resources/RuntimeTrust/opencodex-runtime-release-ed25519.pub"
+  [[ -f "$runtime_public_key" && ! -L "$runtime_public_key" ]] || \
+    die 'macOS bundle runtime release trust key is unavailable or unsafe'
+  require_ed25519_public_key "$runtime_public_key"
 
   [[ -x "${app}/Contents/Library/Helpers/opencodex-relay" && \
      ! -L "${app}/Contents/Library/Helpers/opencodex-relay" && \
@@ -921,6 +962,39 @@ snapshot_owner_only_control_file() {
   snapshot_regular_file "$path" "$snapshot_prefix"
 }
 
+require_runtime_maintenance_absent() {
+  local path="$1"
+  [[ ! -e "$path" && ! -L "$path" ]] || \
+    die 'runtime maintenance must be recovered before changing the Relay installation'
+}
+
+snapshot_runtime_maintenance_absence() {
+  local path="$1"
+  local snapshot_prefix="$2"
+  # A live maintenance journal belongs to the paired routing/runtime recovery
+  # protocols. Never copy it into an installer transaction as ordinary state.
+  require_runtime_maintenance_absent "$path"
+  [[ ! -e "${snapshot_prefix}.state" && ! -L "${snapshot_prefix}.state" && \
+     ! -e "${snapshot_prefix}.file" && ! -L "${snapshot_prefix}.file" ]] || \
+    die 'runtime maintenance rollback snapshot destination is unsafe'
+  printf 'present=false\n' > "${snapshot_prefix}.state"
+  chmod 0600 "${snapshot_prefix}.state"
+}
+
+verify_runtime_maintenance_absence_snapshot() {
+  local path="$1"
+  local snapshot_prefix="$2"
+  local state
+  [[ -f "${snapshot_prefix}.state" && ! -L "${snapshot_prefix}.state" && \
+     ! -e "${snapshot_prefix}.file" && ! -L "${snapshot_prefix}.file" ]] || return 1
+  state="$(sed -nE 's/^present=(true|false)$/\1/p' "${snapshot_prefix}.state")"
+  [[ "$state" == false ]] || return 1
+  # The lifecycle reservation excludes legitimate writers. If a journal
+  # nevertheless appeared, retain it and fail closed instead of deleting or
+  # replacing a possibly live recovery witness.
+  [[ ! -e "$path" && ! -L "$path" ]]
+}
+
 restore_regular_file_snapshot() {
   local path="$1"
   local snapshot_prefix="$2"
@@ -970,11 +1044,17 @@ rollback_install_transaction() {
   local local_catalog_snapshot="${18}"
   local local_catalog_pending="${19}"
   local local_catalog_pending_snapshot="${20}"
-  local service_snapshot="${21}"
-  local menu_bar_link="${22:-}"
-  local menu_bar_link_snapshot="${23:-}"
-  local menu_bar_binding="${24:-}"
-  local menu_bar_binding_snapshot="${25:-}"
+  local apple_catalog="${21}"
+  local apple_catalog_snapshot="${22}"
+  local apple_catalog_pending="${23}"
+  local apple_catalog_pending_snapshot="${24}"
+  local service_snapshot="${25}"
+  local menu_bar_link="${26:-}"
+  local menu_bar_link_snapshot="${27:-}"
+  local menu_bar_binding="${28:-}"
+  local menu_bar_binding_snapshot="${29:-}"
+  local runtime_maintenance="${30}"
+  local runtime_maintenance_snapshot="${31}"
   local rollback_failed=false
 
 	# Stop the candidate before restoring an admitting state/configuration. If
@@ -1017,6 +1097,10 @@ rollback_install_transaction() {
     printf 'CRITICAL: unable to restore the previous routing transaction journal.\n' >&2
     rollback_failed=true
   fi
+  if ! verify_runtime_maintenance_absence_snapshot "$runtime_maintenance" "$runtime_maintenance_snapshot"; then
+    printf 'CRITICAL: runtime maintenance appeared during Relay install; it was retained for recovery.\n' >&2
+    rollback_failed=true
+  fi
   if ! restore_regular_file_snapshot "$local_enrollment" "$local_enrollment_snapshot"; then
     printf 'CRITICAL: unable to restore the previous Local OpenCodex enrollment receipt.\n' >&2
     rollback_failed=true
@@ -1027,6 +1111,14 @@ rollback_install_transaction() {
   fi
   if ! restore_regular_file_snapshot "$local_catalog_pending" "$local_catalog_pending_snapshot"; then
     printf 'CRITICAL: unable to restore the previous Local OpenCodex catalog marker.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_regular_file_snapshot "$apple_catalog" "$apple_catalog_snapshot"; then
+    printf 'CRITICAL: unable to restore the previous Apple Container catalog.\n' >&2
+    rollback_failed=true
+  fi
+  if ! restore_regular_file_snapshot "$apple_catalog_pending" "$apple_catalog_pending_snapshot"; then
+    printf 'CRITICAL: unable to restore the previous Apple Container catalog marker.\n' >&2
     rollback_failed=true
   fi
   if [[ -n "$menu_bar_link" ]] && ! restore_managed_menu_link "$menu_bar_link" "$menu_bar_link_snapshot"; then
@@ -1148,9 +1240,12 @@ finish_install() {
       "$local_enrollment_path" "${transaction_dir}/local-enrollment" \
       "$local_catalog_path" "${transaction_dir}/local-catalog" \
       "$local_catalog_pending_path" "${transaction_dir}/local-catalog-pending" \
+      "$apple_catalog_path" "${transaction_dir}/apple-catalog" \
+      "$apple_catalog_pending_path" "${transaction_dir}/apple-catalog-pending" \
       "${transaction_dir}/service" \
       "${menu_bar_link:-}" "${transaction_dir}/menu-bar-link" \
-      "${menu_bar_binding:-}" "${transaction_dir}/menu-bar-binding"; then
+      "${menu_bar_binding:-}" "${transaction_dir}/menu-bar-binding" \
+      "$runtime_maintenance_path" "${transaction_dir}/runtime-maintenance"; then
       status=70
 	  rollback_failed=true
 	  retain_recovery_evidence=true
@@ -1401,9 +1496,12 @@ macos_bundle_mode=false
 routing_state_path=""
 routing_initialized_path=""
 routing_journal_path=""
+runtime_maintenance_path=""
 local_enrollment_path=""
 local_catalog_path=""
 local_catalog_pending_path=""
+apple_catalog_path=""
+apple_catalog_pending_path=""
 source_install_reservation_active=false
 source_install_reservation_token=""
 source_install_reservation_root_created=false
@@ -1810,8 +1908,13 @@ case "$action" in
     routing_state_path="${config_path}.routing-state.json"
     routing_initialized_path="${config_path}.routing-initialized"
     routing_journal_path="${config_path}.routing-transaction.json"
+    runtime_maintenance_path="${config_path}.runtime-maintenance.json"
 	local_enrollment_path="${config_path}.local-opencodex-enrollment.json"
 	local_catalog_path="$(dirname -- "$codex_config")/opencodex-relay-local-catalog.json"
+	# An unenrolled Apple profile has no installer-owned catalog artifact. Keep
+	# its empty rollback slot inside the transaction rather than touching a
+	# same-named file in the selected Codex home merely because it exists.
+	apple_catalog_path="${transaction_dir}/unconfigured-apple-catalog"
 	if [[ -f "$config_path" && ! -L "$config_path" ]]; then
 	  configured_local_catalog="$(jq -er '.local_opencodex.catalog_path // empty' "$config_path" 2>/dev/null || true)"
 	  if [[ -n "$configured_local_catalog" ]]; then
@@ -1819,17 +1922,29 @@ case "$action" in
 	      die 'existing Local OpenCodex catalog path is unsafe'
 	    local_catalog_path="$configured_local_catalog"
 	  fi
+	  configured_apple_catalog="$(jq -er '.local_apple_container.catalog_path // empty' "$config_path" 2>/dev/null || true)"
+	  if [[ -n "$configured_apple_catalog" ]]; then
+	    [[ "$(basename -- "$configured_apple_catalog")" == opencodex-relay-apple-container-catalog.json ]] && \
+	      safe_absolute_catalog_path "$configured_apple_catalog" || \
+	      die 'existing Apple Container catalog path is unsafe'
+	    apple_catalog_path="$configured_apple_catalog"
+	  fi
 	fi
 	local_catalog_pending_path="${local_catalog_path}.restart-pending"
+	apple_catalog_pending_path="${apple_catalog_path}.restart-pending"
+    require_runtime_maintenance_absent "$runtime_maintenance_path"
     snapshot_regular_file "$config_path" "${transaction_dir}/relay-config"
     snapshot_regular_file "$codex_config" "${transaction_dir}/codex-config"
     snapshot_regular_file "$interactive_profile" "${transaction_dir}/interactive-profile"
     snapshot_owner_only_control_file "$routing_state_path" "${transaction_dir}/routing-state"
     snapshot_owner_only_control_file "$routing_initialized_path" "${transaction_dir}/routing-initialized"
     snapshot_owner_only_control_file "$routing_journal_path" "${transaction_dir}/routing-journal"
+    snapshot_runtime_maintenance_absence "$runtime_maintenance_path" "${transaction_dir}/runtime-maintenance"
 	    snapshot_owner_only_control_file "$local_enrollment_path" "${transaction_dir}/local-enrollment"
 	    snapshot_regular_file "$local_catalog_path" "${transaction_dir}/local-catalog"
 	    snapshot_regular_file "$local_catalog_pending_path" "${transaction_dir}/local-catalog-pending"
+	    snapshot_regular_file "$apple_catalog_path" "${transaction_dir}/apple-catalog"
+	    snapshot_regular_file "$apple_catalog_pending_path" "${transaction_dir}/apple-catalog-pending"
     if [[ "$macos_bundle_mode" == true ]]; then
       menu_bar_link="$MACOS_MENU_BAR_LINK"
       menu_bar_binding="$MACOS_MENU_BAR_BINDING"

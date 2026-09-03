@@ -2,10 +2,13 @@ package legacymigration
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
 
 type fakeKeychain map[string][]byte
@@ -189,6 +192,37 @@ func TestInspectBlocksConflictingDestination(t *testing.T) {
 	}
 	if _, err := Run("apply", Options{Home: home, Keychain: fakeKeychain{}}); err == nil {
 		t.Fatal("apply accepted a conflicting destination")
+	}
+}
+
+func TestMigrationRejectsRuntimeMaintenanceAtEitherConfigName(t *testing.T) {
+	for _, fixture := range []struct {
+		name  string
+		write func(*testing.T, string)
+	}{
+		{name: "regular", write: func(t *testing.T, path string) { mustWrite(t, path, "{}\n") }},
+		{name: "dangling_symlink", write: func(t *testing.T, path string) {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		for _, stem := range []string{legacyStem(), newStem} {
+			t.Run(fixture.name+"/"+stem, func(t *testing.T) {
+				home := t.TempDir()
+				configPath := filepath.Join(home, ".config", stem, "relay.json")
+				fixture.write(t, routing.MaintenancePath(configPath))
+				options := Options{Home: home, Keychain: fakeKeychain{}}
+				for _, operation := range []string{"inspect", "apply", "rollback"} {
+					if _, err := Run(operation, options); !errors.Is(err, errRuntimeMaintenanceActive) {
+						t.Fatalf("%s with %s maintenance error = %v", operation, stem, err)
+					}
+				}
+			})
+		}
 	}
 }
 

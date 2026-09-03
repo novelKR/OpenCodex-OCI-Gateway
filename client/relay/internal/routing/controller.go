@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	statusSchemaVersion = 3
+	statusSchemaVersion = 4
 	maxJournalBytes     = 16 << 10
 
 	recoveryReasonNotRequired            = "recovery_not_required"
@@ -199,6 +199,14 @@ func withLocalOpenCodexPreflight(preflight func(context.Context, string) localop
 	return func(controller *Controller) { controller.localPreflight = preflight }
 }
 
+// withLocalTargetPreflight is the typed test seam used by the authenticated
+// Apple Container profile. Unlike the legacy native seam it carries the fixed
+// host endpoint, expected guest identity port, authentication profile, and
+// already-loaded API credential as one non-ambiguous target.
+func withLocalTargetPreflight(preflight func(context.Context, localopencodex.Target) localopencodex.Result) ControllerOption {
+	return func(controller *Controller) { controller.localTargetPreflight = preflight }
+}
+
 // withLocalCatalogMaterializer is a deterministic test seam for the
 // synchronous Local profile catalog barrier. Production callers always use
 // catalog.MaterializeLocalOpenCodexCatalog below.
@@ -258,6 +266,7 @@ type Controller struct {
 	loadCredentials         func(config.CredentialsConfig) (credentials.Values, error)
 	validateGateway         func(context.Context, config.Config, credentials.Values) (catalog.Result, error)
 	localPreflight          func(context.Context, string) localopencodex.Result
+	localTargetPreflight    func(context.Context, localopencodex.Target) localopencodex.Result
 	materializeLocalCatalog func(context.Context, config.Config) error
 	ackTimeout              time.Duration
 	pollInterval            time.Duration
@@ -280,19 +289,19 @@ func NewController(configPath, codexConfigPath string, options ...ControllerOpti
 		return nil, err
 	}
 	controller := &Controller{
-		store:                   store,
-		codexConfigPath:         boundCodex,
-		health:                  NewHTTPHealthReader(),
-		loadConfig:              config.Load,
-		loadCredentials:         credentials.Load,
-		validateGateway:         validateExternalGatewayCatalog,
-		localPreflight:          localopencodex.Preflight,
-		materializeLocalCatalog: materializeLocalOpenCodexCatalog,
-		ackTimeout:              30 * time.Second,
-		pollInterval:            100 * time.Millisecond,
-		journalPath:             store.TransactionPath(),
-		localProfileOK:          runtime.GOOS == "darwin" && runtime.GOARCH == "arm64",
-		codexOwner:              codexconfig.ProductionOwner,
+		store:                store,
+		codexConfigPath:      boundCodex,
+		health:               NewHTTPHealthReader(),
+		loadConfig:           config.Load,
+		loadCredentials:      credentials.Load,
+		validateGateway:      validateExternalGatewayCatalog,
+		localPreflight:       localopencodex.Preflight,
+		localTargetPreflight: localopencodex.PreflightTarget,
+		ackTimeout:           30 * time.Second,
+		pollInterval:         100 * time.Millisecond,
+		journalPath:          store.TransactionPath(),
+		localProfileOK:       runtime.GOOS == "darwin" && runtime.GOARCH == "arm64",
+		codexOwner:           codexconfig.ProductionOwner,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -305,8 +314,11 @@ func NewController(configPath, codexConfigPath string, options ...ControllerOpti
 	if controller.localPreflight == nil {
 		controller.localPreflight = localopencodex.Preflight
 	}
+	if controller.localTargetPreflight == nil {
+		controller.localTargetPreflight = localopencodex.PreflightTarget
+	}
 	if controller.materializeLocalCatalog == nil {
-		controller.materializeLocalCatalog = materializeLocalOpenCodexCatalog
+		controller.materializeLocalCatalog = controller.materializeLocalCatalogForBackend
 	}
 	canonicalOwner, err := codexconfig.OwnerForID(controller.codexOwner.ID)
 	if err != nil {
@@ -328,12 +340,29 @@ func (c *Controller) recoveryGateCanRelease() bool {
 	return c != nil && c.recoveryGateReleasable != nil && c.recoveryGateReleasable()
 }
 
+// maintenancePendingOrInvalid is the ordinary routing controller's
+// fail-closed interlock with lifecycle-owned container-runtime transactions.
+// Only the corresponding runtime coordinator may consume either witness;
+// routing, gateway, and repair operations must not race them or reinterpret
+// them as an ordinary routing journal.
+func (c *Controller) maintenancePendingOrInvalid() bool {
+	if c == nil || c.store == nil {
+		return true
+	}
+	_, found, err := c.store.loadMaintenance()
+	if err != nil || found {
+		return true
+	}
+	_, found, err = c.store.loadRuntimeRouting(c.codexConfigPath)
+	return err != nil || found
+}
+
 // CatalogAdmissionAllowed is the non-mutating guard for ad-hoc catalog
 // refresh commands. It intentionally fails closed before a caller loads
 // credentials or constructs an upstream request. A pending native request is
 // still admitted until Apply, matching the documented no-interruption phase.
 func (c *Controller) CatalogAdmissionAllowed() bool {
-	if c == nil || c.store == nil || c.recoveryGateActive() {
+	if c == nil || c.store == nil || c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return false
 	}
 	state, legacy, err := c.store.Read()
@@ -376,6 +405,9 @@ func (c *Controller) Status(ctx context.Context) Status {
 	// recovery capabilities, preventing a rename/remove race from advertising a
 	// rollback that Recover would immediately reject.
 	journal, journalFound, journalErr := c.loadJournal()
+	maintenance, maintenanceFound, maintenanceErr := c.store.loadMaintenance()
+	maintenanceSafeApplying := maintenanceErr == nil && maintenanceFound && !legacy && stateValid &&
+		state.Phase == PhaseApplying && maintenance.matchesState(state)
 	capabilities := c.recoveryCapabilities(state, stateValid, legacy, journal, journalFound, journalErr)
 	gateStableJournalReady := gateActive && c.recoveryGateCanRelease() && stateValid && !legacy &&
 		journalErr == nil && journalFound && stableNonLocalRecoveryCommit(state) &&
@@ -389,7 +421,8 @@ func (c *Controller) Status(ctx context.Context) Status {
 	gateParkedObservedReady := gateActive && c.recoveryGateCanRelease() && stateValid && !legacy &&
 		journalErr == nil && !journalFound && state.Phase == PhaseRecoveryRequired &&
 		nonLocalRecoveryTarget(state) && capabilities.CanComplete && !capabilities.CanRollback &&
-		capabilities.Target != BackendUnknown && capabilities.Target != BackendLocalOpenCodex
+		capabilities.Target != BackendUnknown && capabilities.Target != BackendLocalOpenCodex &&
+		capabilities.Target != BackendLocalAppleContainer
 	gateJournalGeneration := uint64(0)
 	if gateJournalReady {
 		gateJournalGeneration = state.Generation
@@ -404,6 +437,13 @@ func (c *Controller) Status(ctx context.Context) Status {
 		result.Connection.RoutingSync = RoutingSyncInvalid
 		state = recoveryStatusState(c.store.ConfigPath())
 		stateValid = false
+	}
+	if maintenanceErr != nil || (maintenanceFound && !maintenanceSafeApplying) || (maintenanceFound && journalFound) {
+		result = statusFromState(recoveryStatusState(c.store.ConfigPath()), false)
+		result.Connection.RoutingSync = RoutingSyncInvalid
+		state = recoveryStatusState(c.store.ConfigPath())
+		stateValid = false
+		capabilities = unavailableRecoveryCapabilities(recoveryReasonObservedUnavailable, recoveryReasonObservedUnavailable)
 	}
 	gatedGeneration := uint64(0)
 	gateStableCommitReady := gateActive && c.recoveryGateCanRelease() && stateValid && !legacy &&
@@ -466,7 +506,8 @@ func (c *Controller) Status(ctx context.Context) Status {
 		return result.withRecoveryCapabilities(capabilities)
 	}
 	health := c.health.Read(ctx, cfg)
-	dynamicLocalProfile := cfg.UpstreamMode == config.UpstreamModeExternalGateway && cfg.LocalOpenCodex != nil
+	dynamicLocalProfile := cfg.UpstreamMode == config.UpstreamModeExternalGateway &&
+		(cfg.LocalOpenCodex != nil || cfg.LocalAppleContainer != nil)
 	// The resident watcher can park on a journal/config drift before the
 	// durable state file itself changes. Never let the public status retain an
 	// old relay_active/allow projection in that case: callers must see the same
@@ -506,8 +547,10 @@ func nonLocalRecoveryTarget(state State) bool {
 	return state.Generation > 0 &&
 		state.DesiredBackend != BackendUnknown &&
 		state.DesiredBackend != BackendLocalOpenCodex &&
+		state.DesiredBackend != BackendLocalAppleContainer &&
 		state.AppliedBackend != BackendUnknown &&
-		state.AppliedBackend != BackendLocalOpenCodex
+		state.AppliedBackend != BackendLocalOpenCodex &&
+		state.AppliedBackend != BackendLocalAppleContainer
 }
 
 func recoveryStatusState(configPath string) State {
@@ -569,7 +612,7 @@ func (c *Controller) SeedNativeParked(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 	defer lock.Close()
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return Status{}, ErrRecoveryRequired
 	}
 	if _, found, err := c.loadJournal(); err != nil || found {
@@ -628,7 +671,7 @@ func (c *Controller) VerifyNative(ctx context.Context) (Status, error) {
 		return Status{}, ErrNativeVerification
 	}
 	defer lock.Close()
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return Status{}, ErrNativeVerification
 	}
 
@@ -682,7 +725,7 @@ func (c *Controller) RepairNative(ctx context.Context, expectedGeneration uint64
 
 	// The removal gate and routing journal are independent durable witnesses.
 	// Neither may be guessed away by this narrowly-scoped state repair.
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return Status{}, ErrNativeRepairUnavailable
 	}
 	if pending, transactionErr := c.store.HasPendingTransaction(); transactionErr != nil || pending {
@@ -795,7 +838,7 @@ func (c *Controller) requestBackendWithIntentAndWitness(
 		return Status{}, err
 	}
 	defer lock.Close()
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return Status{}, ErrRecoveryRequired
 	}
 	if _, found, err := c.loadJournal(); err != nil || found {
@@ -845,7 +888,7 @@ func (c *Controller) requestBackendWithIntentAndWitness(
 }
 
 func (c *Controller) preflightRequestedBackend(ctx context.Context, target Backend) error {
-	if target != BackendExternal && target != BackendLocalOpenCodex {
+	if target != BackendExternal && target != BackendLocalOpenCodex && target != BackendLocalAppleContainer {
 		return nil
 	}
 	cfg, err := c.loadConfig(c.store.ConfigPath())
@@ -870,6 +913,21 @@ func (c *Controller) preflightRequestedBackend(ctx context.Context, target Backe
 		if err != nil || !c.localPreflight(ctx, local.UpstreamBaseURL).Ready() {
 			return ErrLocalOpenCodexPreflight
 		}
+	case BackendLocalAppleContainer:
+		if !c.localProfileOK {
+			return ErrLocalOpenCodexPreflight
+		}
+		local, err := cfg.LocalAppleContainerRuntimeConfig()
+		if err != nil {
+			return ErrLocalOpenCodexPreflight
+		}
+		values, err := c.loadCredentials(local.Credentials)
+		if err != nil || values.ValidateForProfile(config.LocalAuthenticationOpenCodexAPIKey) != nil {
+			return ErrCredentialPreflight
+		}
+		if !c.localTargetPreflight(ctx, localopencodex.AppleContainerTarget(values)).Ready() {
+			return ErrLocalOpenCodexPreflight
+		}
 	}
 	return nil
 }
@@ -880,7 +938,7 @@ func (c *Controller) Cancel(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 	defer lock.Close()
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return Status{}, ErrRecoveryRequired
 	}
 	if _, found, err := c.loadJournal(); err != nil || found {
@@ -913,7 +971,7 @@ func (c *Controller) Apply(ctx context.Context, desktopExited bool) (Status, err
 		return Status{}, err
 	}
 	defer lock.Close()
-	if c.recoveryGateActive() {
+	if c.recoveryGateActive() || c.maintenancePendingOrInvalid() {
 		return Status{}, ErrRecoveryRequired
 	}
 	if _, found, err := c.loadJournal(); err != nil || found {
@@ -962,7 +1020,7 @@ func (c *Controller) Recover(ctx context.Context, action RecoveryAction, desktop
 		return Status{}, err
 	}
 	defer lock.Close()
-	if c.removalRecoveryWitness == nil && c.recoveryGateActive() {
+	if c.maintenancePendingOrInvalid() || (c.removalRecoveryWitness == nil && c.recoveryGateActive()) {
 		return Status{}, ErrRecoveryRequired
 	}
 
@@ -1130,7 +1188,7 @@ func (c *Controller) recoverObservedLocked(ctx context.Context, lock *Lock, curr
 
 func forcedRecoveryOrigin(target Backend) Backend {
 	switch target {
-	case BackendExternal, BackendLocalOpenCodex:
+	case BackendExternal, BackendLocalOpenCodex, BackendLocalAppleContainer:
 		return BackendNone
 	case BackendNone:
 		return BackendExternal
@@ -1223,7 +1281,7 @@ func (c *Controller) finishApplyingLockedWithOriginAuthority(ctx context.Context
 	// Codex config below can never select a missing or unchecked Local catalog.
 	// Legacy static local_opencodex keeps its Remote-manager ownership and is
 	// intentionally outside this macOS relay-owned profile barrier.
-	if target == BackendLocalOpenCodex && cfg.Catalog.Owner == config.CatalogOwnerRelay {
+	if (target == BackendLocalOpenCodex || target == BackendLocalAppleContainer) && cfg.Catalog.Owner == config.CatalogOwnerRelay {
 		if err := c.materializeLocalCatalog(ctx, cfg); err != nil {
 			return c.failApplyingLocked(lock, applying, ErrLocalOpenCodexPreflight)
 		}
@@ -1292,6 +1350,32 @@ func materializeLocalOpenCodexCatalog(ctx context.Context, cfg config.Config) er
 		return ErrLocalOpenCodexPreflight
 	}
 	return nil
+}
+
+func (c *Controller) materializeLocalCatalogForBackend(ctx context.Context, cfg config.Config) error {
+	if cfg.Catalog.Owner != config.CatalogOwnerRelay {
+		return ErrLocalOpenCodexPreflight
+	}
+	switch cfg.UpstreamMode {
+	case config.UpstreamModeLocalOpenCodex:
+		return materializeLocalOpenCodexCatalog(ctx, cfg)
+	case config.UpstreamModeLocalAppleContainer:
+		fetcher := catalog.LocalOpenCodexFetcher{
+			BaseURL:               cfg.UpstreamBaseURL,
+			CatalogPath:           cfg.Catalog.Path,
+			ExpectedServicePort:   10100,
+			AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
+			Credentials: func() (credentials.Values, error) {
+				return c.loadCredentials(cfg.Credentials)
+			},
+		}
+		if _, err := fetcher.Refresh(ctx); err != nil {
+			return ErrLocalOpenCodexPreflight
+		}
+		return nil
+	default:
+		return ErrLocalOpenCodexPreflight
+	}
 }
 
 func (c *Controller) failApplyingLocked(lock *Lock, state State, cause error) (Status, error) {
@@ -1365,6 +1449,26 @@ func (c *Controller) preflightBackendWithLegacyIntent(target Backend, knownLegac
 		}
 		result.Config = local
 		return result, nil
+	case BackendLocalAppleContainer:
+		if err := codexconfig.PreflightEnableWithInteractiveProfileForOwner(c.codexConfigPath, c.codexOwner); err != nil {
+			return backendPreflight{}, err
+		}
+		if !c.localProfileOK {
+			return backendPreflight{}, ErrLocalOpenCodexPreflight
+		}
+		local, err := cfg.LocalAppleContainerRuntimeConfig()
+		if err != nil {
+			return backendPreflight{}, err
+		}
+		values, err := c.loadCredentials(local.Credentials)
+		if err != nil || values.ValidateForProfile(config.LocalAuthenticationOpenCodexAPIKey) != nil {
+			return backendPreflight{}, ErrCredentialPreflight
+		}
+		if !c.localTargetPreflight(context.Background(), localopencodex.AppleContainerTarget(values)).Ready() {
+			return backendPreflight{}, ErrLocalOpenCodexPreflight
+		}
+		result.Config = local
+		return result, nil
 	default:
 		return backendPreflight{}, ErrRecoveryRequired
 	}
@@ -1400,7 +1504,7 @@ func (c *Controller) applyConfigWithLegacyIntent(target Backend, cfg config.Conf
 	switch target {
 	case BackendNone:
 		return codexconfig.DisableWithInteractiveProfileForOwner(c.codexConfigPath, c.codexOwner)
-	case BackendExternal, BackendLocalOpenCodex:
+	case BackendExternal, BackendLocalOpenCodex, BackendLocalAppleContainer:
 		if knownLegacyBackupAndMigrate {
 			if target != BackendExternal {
 				return ErrRecoveryRequired
@@ -1430,7 +1534,7 @@ func routingArtifactsMatch(codexConfigPath string, owner codexconfig.Owner, targ
 	switch target {
 	case BackendNone:
 		return codexconfig.ValidateNativeRoutingForOwner(codexConfigPath, owner) == nil
-	case BackendExternal, BackendLocalOpenCodex:
+	case BackendExternal, BackendLocalOpenCodex, BackendLocalAppleContainer:
 		return codexconfig.ValidateManagedRoutingForOwner(
 			codexConfigPath,
 			owner,
@@ -1487,7 +1591,8 @@ func (c *Controller) awaitFinalized(ctx context.Context, cfg config.Config, stat
 	defer cancel()
 	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
-	requireLocalCatalog := state.AppliedBackend == BackendLocalOpenCodex && cfg.Catalog.Owner == config.CatalogOwnerRelay
+	requireLocalCatalog := (state.AppliedBackend == BackendLocalOpenCodex || state.AppliedBackend == BackendLocalAppleContainer) &&
+		cfg.Catalog.Owner == config.CatalogOwnerRelay
 	for {
 		health := c.health.Read(deadline, cfg)
 		if finalHealthAcknowledges(health.General, state, requireLocalCatalog) &&
@@ -1604,17 +1709,26 @@ func managedBackendFromArtifacts(codexConfigPath string, owner codexconfig.Owner
 	case config.UpstreamModeExternalGateway:
 		externalMatches := validate(cfg) == nil
 		localMatches := false
+		appleMatches := false
 		if cfg.LocalOpenCodex != nil {
 			local, err := cfg.LocalOpenCodexRuntimeConfig()
 			if err == nil {
 				localMatches = validate(local) == nil
 			}
 		}
+		if cfg.LocalAppleContainer != nil {
+			apple, err := cfg.LocalAppleContainerRuntimeConfig()
+			if err == nil {
+				appleMatches = validate(apple) == nil
+			}
+		}
 		switch {
-		case externalMatches && !localMatches:
+		case externalMatches && !localMatches && !appleMatches:
 			return BackendExternal, nil
-		case localMatches && !externalMatches:
+		case localMatches && !externalMatches && !appleMatches:
 			return BackendLocalOpenCodex, nil
+		case appleMatches && !externalMatches && !localMatches:
+			return BackendLocalAppleContainer, nil
 		default:
 			// Both matches would make ownership ambiguous; neither match means a
 			// managed block drifted. In either case, do not guess a backend.
@@ -1958,7 +2072,9 @@ func (s Status) withHealth(health LocalRelay, state State, stateValid bool, dyna
 	// durable state continues to record the user's Local selection, while this
 	// status projection tells the MenuBar that the resident manager has parked
 	// admission and catalog work until an explicit External/Native apply.
-	if dynamicLocalProfile && state.AppliedBackend == BackendLocalOpenCodex && s.Connection.LocalOpenCodex != LocalOpenCodexReady {
+	if dynamicLocalProfile &&
+		(state.AppliedBackend == BackendLocalOpenCodex || state.AppliedBackend == BackendLocalAppleContainer) &&
+		s.Connection.LocalOpenCodex != LocalOpenCodexReady {
 		s.RelayAdmission = "deny"
 		s.CatalogRefresh = "pause"
 	}
@@ -2245,6 +2361,13 @@ func normalizeTransactionJournal(journal transactionJournal) transactionJournal 
 		journal.TargetBackend = backendForLegacyMode(journal.Target)
 		journal.OriginBackend = backendForLegacyMode(journal.Origin)
 		journal.OriginAuthoritative = true
+	} else if journal.Schema == explicitBackendSchemaVersion {
+		// A v2 journal could not name the Apple Container backend. Leave a
+		// future-labelled v2 document at its old schema so validate rejects it
+		// instead of silently granting it v3 meaning.
+		if validSchemaV2Backend(journal.TargetBackend) && validSchemaV2Backend(journal.OriginBackend) {
+			journal.Schema = SchemaVersion
+		}
 	}
 	return journal
 }

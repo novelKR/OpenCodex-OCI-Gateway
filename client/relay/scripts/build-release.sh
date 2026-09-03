@@ -10,6 +10,7 @@ readonly THIRD_PARTY_NOTICES_FILE="THIRD_PARTY_NOTICES.md"
 readonly THIRD_PARTY_NOTICES_SOURCE="${RELAY_ROOT}/${THIRD_PARTY_NOTICES_FILE}"
 readonly RELEASE_BUILD_NUMBER_SOURCE="${RELAY_ROOT}/RELEASE_BUILD_NUMBER"
 readonly RELEASE_PUBLIC_KEY_SOURCE="${RELAY_ROOT}/../../config/trust/opencodex-relay-release-ed25519.pub"
+readonly RUNTIME_PUBLIC_KEY_SOURCE="${RELAY_ROOT}/../../config/trust/opencodex-runtime-release-ed25519.pub"
 readonly MACOS_APP_ROOT="${RELAY_ROOT}/macos/OpenCodexRelay"
 readonly MACOS_INFO_TEMPLATE="${MACOS_APP_ROOT}/Resources/Info.plist"
 readonly MACOS_APP_ICON="${MACOS_APP_ROOT}/Resources/AppIcon.icns"
@@ -173,6 +174,10 @@ command -v shasum >/dev/null || command -v sha256sum >/dev/null || die 'sha256 t
   die 'tracked release public key must be a regular file'
 openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY_SOURCE" -text -noout 2>/dev/null | grep -Eq '^ED25519 Public-Key:' || \
   die 'tracked release public key must be an Ed25519 public PEM'
+[[ -f "$RUNTIME_PUBLIC_KEY_SOURCE" && ! -L "$RUNTIME_PUBLIC_KEY_SOURCE" ]] || \
+  die 'tracked runtime release public key must be a regular file'
+openssl pkey -pubin -in "$RUNTIME_PUBLIC_KEY_SOURCE" -text -noout 2>/dev/null | grep -Eq '^ED25519 Public-Key:' || \
+  die 'tracked runtime release public key must be an Ed25519 public PEM'
 [[ -f "$MACOS_INFO_TEMPLATE" && ! -L "$MACOS_INFO_TEMPLATE" ]] || \
   die 'macOS Info.plist template is unavailable'
 [[ -f "$MACOS_APP_ICON" && ! -L "$MACOS_APP_ICON" ]] || die 'macOS app icon is unavailable'
@@ -276,18 +281,29 @@ helpers_dir="${app_dir}/Contents/Library/Helpers"
 guard_helpers_dir="${app_dir}/Contents/Library/HelperTools"
 release_trust_dir="${app_dir}/Contents/Resources/ReleaseTrust"
 bundled_release_public_key="${release_trust_dir}/opencodex-relay-release-ed25519.pub"
+runtime_trust_dir="${app_dir}/Contents/Resources/RuntimeTrust"
+bundled_runtime_public_key="${runtime_trust_dir}/opencodex-runtime-release-ed25519.pub"
 mkdir -p "${app_dir}/Contents/MacOS" "$helpers_dir" "$guard_helpers_dir" \
-  "${app_dir}/Contents/Resources" "$release_trust_dir"
+  "${app_dir}/Contents/Resources" "$release_trust_dir" "$runtime_trust_dir"
 install -m 0644 "$MACOS_APP_ICON" "${app_dir}/Contents/Resources/AppIcon.icns"
 install -m 0644 "$RELEASE_PUBLIC_KEY_SOURCE" "$bundled_release_public_key"
+install -m 0644 "$RUNTIME_PUBLIC_KEY_SOURCE" "$bundled_runtime_public_key"
 cmp -s "$RELEASE_PUBLIC_KEY_SOURCE" "$bundled_release_public_key" || \
   die 'bundled release public key bytes differ from the tracked trust root'
+cmp -s "$RUNTIME_PUBLIC_KEY_SOURCE" "$bundled_runtime_public_key" || \
+  die 'bundled runtime public key bytes differ from the tracked trust root'
 trusted_public_der="${release_tmp}/tracked-release-public-key.der"
 bundled_public_der="${release_tmp}/bundled-release-public-key.der"
 openssl pkey -pubin -in "$RELEASE_PUBLIC_KEY_SOURCE" -outform DER > "$trusted_public_der"
 openssl pkey -pubin -in "$bundled_release_public_key" -outform DER > "$bundled_public_der"
 cmp -s "$trusted_public_der" "$bundled_public_der" || \
   die 'bundled release public key fingerprint differs from the tracked trust root'
+tracked_runtime_public_der="${release_tmp}/tracked-runtime-public-key.der"
+bundled_runtime_public_der="${release_tmp}/bundled-runtime-public-key.der"
+openssl pkey -pubin -in "$RUNTIME_PUBLIC_KEY_SOURCE" -outform DER > "$tracked_runtime_public_der"
+openssl pkey -pubin -in "$bundled_runtime_public_key" -outform DER > "$bundled_runtime_public_der"
+cmp -s "$tracked_runtime_public_der" "$bundled_runtime_public_der" || \
+  die 'bundled runtime public key fingerprint differs from the tracked trust root'
 release_trust_key_id="$(sha256 "$trusted_public_der")"
 build_go_binary darwin arm64 opencodex-relay "${helpers_dir}/opencodex-relay"
 build_go_binary darwin arm64 opencodex-relayctl "${helpers_dir}/opencodex-relayctl"

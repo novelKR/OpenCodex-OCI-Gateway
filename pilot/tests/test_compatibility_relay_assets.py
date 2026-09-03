@@ -68,6 +68,22 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_container_runtime_activation_uses_the_exact_desktop_exit_gate(self) -> None:
+        sources = RELAY / "macos" / "OpenCodexRelay" / "Sources" / "OpenCodexRelay"
+        view = (sources / "ContainerRuntimeView.swift").read_text(encoding="utf-8")
+        model = (sources / "MenuBarModel.swift").read_text(encoding="utf-8")
+        self.assertIn("model.activateContainerRuntime(controller)", view)
+        self.assertNotIn("activateConfirmed(desktopExited: true)", view)
+
+        start = model.index("func activateContainerRuntime(")
+        end = model.index("private func runDesktopExitCheckedCommand", start)
+        activation = model[start:end]
+        exit_check = activation.index("ensureVerifiedDesktopExited(at: desktopURL)")
+        mutation = activation.index("activateAfterVerifiedDesktopExit(expected: witness)")
+        self.assertLess(exit_check, mutation)
+        self.assertIn("let witness = controller.activationWitness", activation)
+        self.assertIn("defer { self.isBusy = false }", activation)
+
     def test_credential_loader_is_not_hidden_by_a_broad_secret_pattern(self) -> None:
         ignore_lines = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
         self.assertNotIn("credentials*", ignore_lines)
@@ -717,6 +733,21 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("snapshot_owner_only_control_file \"$routing_state_path\"", installer)
         self.assertIn("snapshot_owner_only_control_file \"$routing_initialized_path\"", installer)
         self.assertIn("snapshot_owner_only_control_file \"$routing_journal_path\"", installer)
+        self.assertIn("snapshot_runtime_maintenance_absence \"$runtime_maintenance_path\"", installer)
+        self.assertIn("require_runtime_maintenance_absent \"$runtime_maintenance_path\"", installer)
+        self.assertIn(
+            "verify_runtime_maintenance_absence_snapshot \"$runtime_maintenance\"",
+            installer,
+        )
+        self.assertIn("it was retained for recovery", installer)
+        self.assertNotIn(
+            "snapshot_owner_only_control_file \"$runtime_maintenance_path\"",
+            installer,
+        )
+        self.assertNotIn(
+            "restore_regular_file_snapshot \"$runtime_maintenance\"",
+            installer,
+        )
         self.assertIn("require_interactive_listener_available", installer)
         self.assertIn("wait_for_dual_listener_health", installer)
         self.assertIn("listener_lane", installer)
@@ -725,7 +756,11 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn('local_opencodex) applied=local_opencodex', installer)
         self.assertIn("active_local_runtime_is_acknowledged", installer)
         self.assertIn('.applied_backend == "local_opencodex"', installer)
-        self.assertIn('"$interactive_listener" local_opencodex', installer)
+        self.assertIn('.applied_backend == "local_apple_container"', installer)
+        self.assertIn('"$interactive_listener" "$runtime_profile"', installer)
+        self.assertIn('http://127.0.0.1:10210/v1', installer)
+        self.assertIn('mode request "$applied"', installer)
+        self.assertIn(".schema_version == 4", installer)
         self.assertLess(
             installer.index("reserve_source_install_lifecycle", installer.index('case "$action" in')),
             installer.index('install -d -m 0700 "$INSTALL_ROOT"'),
@@ -733,6 +768,498 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("release_source_install_lifecycle", installer)
         service = (RELAY / "scripts" / "install-service.sh").read_text(encoding="utf-8")
         self.assertIn('[[ -f "$config_path" && ! -L "$config_path" ]]', service)
+
+    def test_installers_preserve_only_a_healthy_acknowledged_apple_runtime(self) -> None:
+        production = (RELAY / "scripts" / "install-relay.sh").read_text(encoding="utf-8")
+        local_dev = (RELAY / "scripts" / "install-local-dev.sh").read_text(encoding="utf-8")
+
+        production_local_check = production[
+            production.index("active_local_runtime_is_acknowledged()") :
+            production.index("wait_for_dual_listener_health()")
+        ]
+        local_dev_check = local_dev[
+            local_dev.index("active_local_dev_runtime_is_acknowledged()") :
+            local_dev.index("prepare_existing_homebrew_guard_for_replacement()")
+        ]
+        for check in (production_local_check, local_dev_check):
+            self.assertIn('local_apple_container', check)
+            self.assertIn('http://127.0.0.1:10210/v1', check)
+            self.assertIn('.connection.routing_sync == "acknowledged"', check)
+            self.assertIn('.connection.local_opencodex == "ready"', check)
+            self.assertIn('.connection.catalog == "running"', check)
+            self.assertNotIn('find-generic-password', check)
+            self.assertNotIn('apple-container-admin-auth-token', check)
+            self.assertNotIn('apple-container-api-auth-token', check)
+
+        production_install = production[production.index('case "$action" in') :]
+        self.assertLess(
+            production_install.index('wait_for_dual_listener_health "$config_path"'),
+            production_install.index('install_transaction_active=false'),
+        )
+        local_dev_install = local_dev[local_dev.index("install_local_dev()") :]
+        self.assertIn(
+            'snapshot_regular_file "$apple_catalog_path" "${transaction_dir}/apple-catalog"',
+            production_install,
+        )
+        self.assertIn(
+            'restore_regular_file_snapshot "$apple_catalog" "$apple_catalog_snapshot"',
+            production,
+        )
+        self.assertLess(
+            production_install.index('snapshot_runtime_maintenance_absence "$runtime_maintenance_path"'),
+            production_install.index('snapshot_regular_file "$apple_catalog_path"'),
+        )
+        self.assertIn(
+            'snapshot_file "$apple_runtime_catalog_path" "${transaction_dir}/apple-runtime-catalog"',
+            local_dev_install,
+        )
+        self.assertIn(
+            'restore_file "$apple_runtime_catalog_path" "${transaction_dir}/apple-runtime-catalog"',
+            local_dev,
+        )
+        self.assertLess(
+            local_dev_install.index("snapshot_runtime_maintenance_absence"),
+            local_dev_install.index('snapshot_file "$apple_runtime_catalog_path"'),
+        )
+        self.assertLess(
+            local_dev_install.index("trap 'rollback_install $?' EXIT"),
+            local_dev_install.index("wait_for_active_local_dev_runtime_health"),
+        )
+        self.assertLess(
+            local_dev_install.index("wait_for_active_local_dev_runtime_health"),
+            local_dev_install.index("install_transaction_active=false"),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            fake_bin = root / "bin"
+            home.mkdir()
+            fake_bin.mkdir()
+            codex_config = home / ".codex" / "config.toml"
+            codex_config.parent.mkdir()
+            codex_config.write_text('model = "fixture"\n', encoding="utf-8")
+
+            production_config = root / "production.json"
+            production_catalog = home / ".codex" / "opencodex-relay-catalog.json"
+            production_local_catalog = home / ".codex" / "opencodex-relay-local-catalog.json"
+            production_apple_catalog = home / ".codex" / "opencodex-relay-apple-container-catalog.json"
+            production_config.write_text(
+                json.dumps(
+                    {
+                        "installation_scope": "production",
+                        "listen_address": "127.0.0.1:18180",
+                        "upstream_mode": "external_gateway",
+                        "upstream_base_url": "https://example.test/v1",
+                        "responses": {"scheduler": {"interactive_listen_address": "127.0.0.1:18182"}},
+                        "catalog": {"owner": "relay", "path": str(production_catalog)},
+                        "local_opencodex": {
+                            "upstream_base_url": "http://127.0.0.1:10100/v1",
+                            "catalog_path": str(production_local_catalog),
+                        },
+                        "local_apple_container": {
+                            "upstream_base_url": "http://127.0.0.1:10210/v1",
+                            "catalog_path": str(production_apple_catalog),
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            local_dev_config = root / "local-dev.json"
+            local_dev_catalog = home / ".codex" / "opencodex-relay-dev-external-catalog.json"
+            local_dev_local_catalog = home / ".codex" / "opencodex-relay-dev-local-catalog.json"
+            local_dev_apple_catalog = home / ".codex" / "opencodex-relay-dev-apple-container-catalog.json"
+            local_dev_config.write_text(
+                json.dumps(
+                    {
+                        "installation_scope": "local_development",
+                        "listen_address": "127.0.0.1:18190",
+                        "upstream_mode": "external_gateway",
+                        "upstream_base_url": "https://example.test/v1",
+                        "responses": {"scheduler": {"interactive_listen_address": "127.0.0.1:18192"}},
+                        "catalog": {"owner": "relay", "path": str(local_dev_catalog)},
+                        "local_opencodex": {
+                            "upstream_base_url": "http://127.0.0.1:10100/v1",
+                            "catalog_path": str(local_dev_local_catalog),
+                        },
+                        "local_apple_container": {
+                            "upstream_base_url": "http://127.0.0.1:10210/v1",
+                            "catalog_path": str(local_dev_apple_catalog),
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            valid_status = root / "status.json"
+            valid_status.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 4,
+                        "desired_backend": "local_apple_container",
+                        "applied_backend": "local_apple_container",
+                        "phase": "relay_active",
+                        "relay_admission": "allow",
+                        "catalog_refresh": "run",
+                        "relay_running": True,
+                        "connection": {
+                            "local_relay": "healthy",
+                            "routing_sync": "acknowledged",
+                            "local_opencodex": "ready",
+                            "catalog": "running",
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            recovery_status = root / "recovery-status.json"
+            recovery_payload = json.loads(valid_status.read_text(encoding="utf-8"))
+            recovery_payload["phase"] = "recovery_required"
+            recovery_payload["relay_admission"] = "deny"
+            recovery_status.write_text(json.dumps(recovery_payload) + "\n", encoding="utf-8")
+            native_status = root / "native-status.json"
+            native_payload = json.loads(valid_status.read_text(encoding="utf-8"))
+            native_payload["desired_backend"] = "local_opencodex"
+            native_payload["applied_backend"] = "local_opencodex"
+            native_status.write_text(json.dumps(native_payload) + "\n", encoding="utf-8")
+
+            production_general = root / "production-general.json"
+            production_interactive = root / "production-interactive.json"
+            local_dev_general = root / "local-dev-general.json"
+            local_dev_interactive = root / "local-dev-interactive.json"
+            for path, lane, general, interactive in (
+                (production_general, "general", "127.0.0.1:18180", "127.0.0.1:18182"),
+                (production_interactive, "interactive", "127.0.0.1:18180", "127.0.0.1:18182"),
+                (local_dev_general, "general", "127.0.0.1:18190", "127.0.0.1:18192"),
+                (local_dev_interactive, "interactive", "127.0.0.1:18190", "127.0.0.1:18192"),
+            ):
+                health = relay_scheduler_health(lane, interactive)
+                health["general_listener"] = general
+                health["upstream_mode"] = "local_apple_container"
+                health["upstream_base_url"] = "http://127.0.0.1:10210/v1"
+                path.write_text(json.dumps(health) + "\n", encoding="utf-8")
+            production_native_general = root / "production-native-general.json"
+            production_native_interactive = root / "production-native-interactive.json"
+            local_dev_native_general = root / "local-dev-native-general.json"
+            local_dev_native_interactive = root / "local-dev-native-interactive.json"
+            for path, lane, general, interactive in (
+                (production_native_general, "general", "127.0.0.1:18180", "127.0.0.1:18182"),
+                (production_native_interactive, "interactive", "127.0.0.1:18180", "127.0.0.1:18182"),
+                (local_dev_native_general, "general", "127.0.0.1:18190", "127.0.0.1:18192"),
+                (local_dev_native_interactive, "interactive", "127.0.0.1:18190", "127.0.0.1:18192"),
+            ):
+                health = relay_scheduler_health(lane, interactive)
+                health["general_listener"] = general
+                health["upstream_mode"] = "local_opencodex"
+                health["upstream_base_url"] = "http://127.0.0.1:10100/v1"
+                path.write_text(json.dumps(health) + "\n", encoding="utf-8")
+
+            relayctl_log = root / "relayctl.log"
+            relayctl = fake_bin / "relayctl"
+            relayctl.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_RELAYCTL_LOG\"\n"
+                "[[ \"${1:-}\" == mode && \"${2:-}\" == status ]] || exit 64\n"
+                "cat \"$FAKE_STATUS\"\n",
+                encoding="utf-8",
+            )
+            relayctl.chmod(0o700)
+            (fake_bin / "curl").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "url=\n"
+                "for arg in \"$@\"; do [[ \"$arg\" != http://* ]] || url=\"$arg\"; done\n"
+                "case \"$url\" in\n"
+                "  http://127.0.0.1:18180/__relay/healthz) cat \"$FAKE_PRODUCTION_GENERAL\" ;;\n"
+                "  http://127.0.0.1:18182/__relay/healthz) cat \"$FAKE_PRODUCTION_INTERACTIVE\" ;;\n"
+                "  http://127.0.0.1:18190/__relay/healthz) cat \"$FAKE_LOCAL_DEV_GENERAL\" ;;\n"
+                "  http://127.0.0.1:18192/__relay/healthz) cat \"$FAKE_LOCAL_DEV_INTERACTIVE\" ;;\n"
+                "  *) exit 65 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "curl").chmod(0o700)
+
+            production_prelude = root / "production-prelude.sh"
+            production_prelude.write_text(
+                production[: production.index('\naction="${1:-}"')], encoding="utf-8"
+            )
+            local_dev_prelude = root / "local-dev-prelude.sh"
+            local_dev_prelude.write_text(
+                local_dev[: local_dev.index('\naction="${1:-}"')], encoding="utf-8"
+            )
+            environment = os.environ | {
+                "HOME": str(home),
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "FAKE_RELAYCTL_LOG": str(relayctl_log),
+                "FAKE_STATUS": str(valid_status),
+                "FAKE_PRODUCTION_GENERAL": str(production_general),
+                "FAKE_PRODUCTION_INTERACTIVE": str(production_interactive),
+                "FAKE_LOCAL_DEV_GENERAL": str(local_dev_general),
+                "FAKE_LOCAL_DEV_INTERACTIVE": str(local_dev_interactive),
+            }
+            production_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; [[ "$(active_local_runtime_is_acknowledged "$2" "$3" "$4")" == local_apple_container ]]; verify_dual_listener_health_once "$2" "$3" "$4"',
+                    "installer-test",
+                    str(production_prelude),
+                    str(production_config),
+                    str(relayctl),
+                    str(codex_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(production_result.returncode, 0, production_result.stderr)
+            local_dev_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; [[ "$(active_local_dev_runtime_is_acknowledged "$2" "$3" "$4")" == local_apple_container ]]; verify_active_local_dev_runtime_health_once "$2" "$3" "$4" local_apple_container',
+                    "installer-test",
+                    str(local_dev_prelude),
+                    str(local_dev_config),
+                    str(relayctl),
+                    str(codex_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(local_dev_result.returncode, 0, local_dev_result.stderr)
+
+            native_environment = environment | {
+                "FAKE_STATUS": str(native_status),
+                "FAKE_PRODUCTION_GENERAL": str(production_native_general),
+                "FAKE_PRODUCTION_INTERACTIVE": str(production_native_interactive),
+                "FAKE_LOCAL_DEV_GENERAL": str(local_dev_native_general),
+                "FAKE_LOCAL_DEV_INTERACTIVE": str(local_dev_native_interactive),
+            }
+            production_native_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; [[ "$(active_local_runtime_is_acknowledged "$2" "$3" "$4")" == local_opencodex ]]; verify_dual_listener_health_once "$2" "$3" "$4"',
+                    "installer-test",
+                    str(production_prelude),
+                    str(production_config),
+                    str(relayctl),
+                    str(codex_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=native_environment,
+            )
+            self.assertEqual(production_native_result.returncode, 0, production_native_result.stderr)
+            local_dev_native_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; [[ "$(active_local_dev_runtime_is_acknowledged "$2" "$3" "$4")" == local_opencodex ]]; verify_active_local_dev_runtime_health_once "$2" "$3" "$4" local_opencodex',
+                    "installer-test",
+                    str(local_dev_prelude),
+                    str(local_dev_config),
+                    str(relayctl),
+                    str(codex_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=native_environment,
+            )
+            self.assertEqual(local_dev_native_result.returncode, 0, local_dev_native_result.stderr)
+            calls = relayctl_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(
+                    call,
+                    f"mode status --config {production_config if str(production_config) in call else local_dev_config} --codex-config {codex_config} --json",
+                )
+                self.assertNotIn("token", call.lower())
+
+            recovered = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; active_local_runtime_is_acknowledged "$2" "$3" "$4"',
+                    "installer-test",
+                    str(production_prelude),
+                    str(production_config),
+                    str(relayctl),
+                    str(codex_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment | {"FAKE_STATUS": str(recovery_status)},
+            )
+            self.assertNotEqual(recovered.returncode, 0)
+
+            mismatched_health = root / "mismatched-apple-health.json"
+            mismatched_payload = json.loads(production_general.read_text(encoding="utf-8"))
+            mismatched_payload["upstream_base_url"] = "http://127.0.0.1:10100/v1"
+            mismatched_health.write_text(json.dumps(mismatched_payload) + "\n", encoding="utf-8")
+            mismatched = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; verify_dual_listener_health_once "$2" "$3" "$4"',
+                    "installer-test",
+                    str(production_prelude),
+                    str(production_config),
+                    str(relayctl),
+                    str(codex_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment | {"FAKE_PRODUCTION_GENERAL": str(mismatched_health)},
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+
+            maintenance = Path(f"{production_config}.runtime-maintenance.json")
+            maintenance.write_text("malformed\n", encoding="utf-8")
+            maintenance_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; require_runtime_maintenance_absent "$2"',
+                    "installer-test",
+                    str(production_prelude),
+                    str(maintenance),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(maintenance_result.returncode, 0)
+            self.assertTrue(maintenance.is_file())
+
+            local_dev_maintenance = Path(f"{local_dev_config}.runtime-maintenance.json")
+            local_dev_maintenance.write_text("{}\n", encoding="utf-8")
+            local_dev_maintenance_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; require_local_dev_config_leaves_or_absent "$2"',
+                    "installer-test",
+                    str(local_dev_prelude),
+                    str(local_dev_config),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(local_dev_maintenance_result.returncode, 0)
+            self.assertTrue(local_dev_maintenance.is_file())
+
+            # Exercise the same EXIT rollback used after a candidate service
+            # or health failure. Both Local catalog generations and their
+            # restart markers must return to the captured bytes before the old
+            # service could be reactivated.
+            rollback_transaction = root / "rollback-transaction"
+            rollback_transaction.mkdir()
+            rollback_config = root / "rollback-config.json"
+            rollback_config.write_text('{"fixture":true}\n', encoding="utf-8")
+            rollback_local_catalog = root / "opencodex-relay-dev-local-catalog.json"
+            rollback_local_pending = Path(f"{rollback_local_catalog}.restart-pending")
+            rollback_apple_catalog = root / "opencodex-relay-dev-apple-container-catalog.json"
+            rollback_apple_pending = Path(f"{rollback_apple_catalog}.restart-pending")
+            for path, content in (
+                (rollback_local_catalog, "old local catalog\n"),
+                (rollback_local_pending, "old local pending\n"),
+                (rollback_apple_catalog, "old apple catalog\n"),
+                (rollback_apple_pending, "old apple pending\n"),
+            ):
+                path.write_text(content, encoding="utf-8")
+
+            def snapshot_fixture(path: Path, name: str) -> None:
+                prefix = rollback_transaction / name
+                if path.is_file():
+                    Path(f"{prefix}.data").write_bytes(path.read_bytes())
+                    Path(f"{prefix}.state").write_text("present=true\n", encoding="utf-8")
+                else:
+                    Path(f"{prefix}.state").write_text("present=false\n", encoding="utf-8")
+
+            snapshot_fixture(rollback_config, "config")
+            for absent_path, name in (
+                (Path(f"{rollback_config}.routing-state.json"), "routing-state"),
+                (Path(f"{rollback_config}.routing-initialized"), "routing-initialized"),
+                (Path(f"{rollback_config}.routing-transaction.json"), "routing-journal"),
+                (home / "Library" / "Application Support" / "OpenCodexRelayDev" / "routing-binding.json", "binding"),
+                (home / "Library" / "LaunchAgents" / "io.github.novelkr.opencodex-relay.dev.plist", "service"),
+            ):
+                snapshot_fixture(absent_path, name)
+            Path(f"{rollback_transaction / 'runtime-maintenance'}.state").write_text(
+                "present=false\n", encoding="utf-8"
+            )
+            snapshot_fixture(rollback_local_catalog, "local-runtime-catalog")
+            snapshot_fixture(rollback_local_pending, "local-runtime-catalog-pending")
+            snapshot_fixture(rollback_apple_catalog, "apple-runtime-catalog")
+            snapshot_fixture(rollback_apple_pending, "apple-runtime-catalog-pending")
+            Path(f"{rollback_transaction / 'app-link'}.state").write_text(
+                "present=false\n", encoding="utf-8"
+            )
+            Path(f"{rollback_transaction / 'current'}.state").write_text(
+                "present=false\n", encoding="utf-8"
+            )
+            rollback_local_catalog.write_text("candidate local catalog\n", encoding="utf-8")
+            rollback_local_pending.write_text("candidate local pending\n", encoding="utf-8")
+            rollback_apple_catalog.write_text("candidate apple catalog\n", encoding="utf-8")
+            rollback_apple_pending.write_text("candidate apple pending\n", encoding="utf-8")
+            fake_local_dev_service = root / "install-local-dev-service.sh"
+            fake_local_dev_service.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_local_dev_service.chmod(0o700)
+            rollback_workspace = root / "rollback-workspace"
+            rollback_staging = root / "rollback-staging"
+            rollback_workspace.mkdir()
+            rollback_staging.mkdir()
+            rollback_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; config_path="$2"; transaction_dir="$3"; '
+                    'local_runtime_catalog_path="$4"; local_runtime_catalog_pending_path="$5"; '
+                    'apple_runtime_catalog_path="$6"; apple_runtime_catalog_pending_path="$7"; '
+                    'tmp="$8"; staging_dir="$9"; install_transaction_active=true; '
+                    'source_install_reservation_active=false; install_dir_created=false; '
+                    'guard_restore_helper=""; rollback_install 86',
+                    "installer-test",
+                    str(local_dev_prelude),
+                    str(rollback_config),
+                    str(rollback_transaction),
+                    str(rollback_local_catalog),
+                    str(rollback_local_pending),
+                    str(rollback_apple_catalog),
+                    str(rollback_apple_pending),
+                    str(rollback_workspace),
+                    str(rollback_staging),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(rollback_result.returncode, 86, rollback_result.stderr)
+            self.assertEqual(rollback_local_catalog.read_text(encoding="utf-8"), "old local catalog\n")
+            self.assertEqual(rollback_local_pending.read_text(encoding="utf-8"), "old local pending\n")
+            self.assertEqual(rollback_apple_catalog.read_text(encoding="utf-8"), "old apple catalog\n")
+            self.assertEqual(rollback_apple_pending.read_text(encoding="utf-8"), "old apple pending\n")
+            self.assertFalse(rollback_transaction.exists())
 
     def test_public_github_release_path_is_explicit_and_fail_closed(self) -> None:
         installer_path = RELAY / "scripts" / "install-relay.sh"
@@ -762,6 +1289,13 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn("Contents/Resources/ReleaseTrust", builder)
         self.assertIn("bundled release public key bytes differ", builder)
         self.assertIn("bundled release public key fingerprint differs", builder)
+        self.assertIn("Contents/Resources/RuntimeTrust", builder)
+        self.assertIn("bundled runtime public key bytes differ", builder)
+        self.assertIn("bundled runtime public key fingerprint differs", builder)
+        self.assertIn(
+            "opencodex-runtime-release-ed25519.pub",
+            installer,
+        )
         self.assertIn("--signing-key-keychain-service SERVICE", builder)
         self.assertIn('swift "$KEYCHAIN_HELPER" read', builder)
         keychain_helper = RELAY / "scripts" / "keychain-signing-key.swift"
@@ -2601,6 +3135,21 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
         self.assertIn('"$SERVICE_HELPER" stop', installer)
         self.assertIn('relay_dev_service_active=true manager=launchd', installer)
         self.assertIn("prior service could not be restored", installer)
+        self.assertIn("${config}.runtime-maintenance.json", installer)
+        self.assertIn("${config_path}.runtime-maintenance.json", installer)
+        self.assertIn("runtime maintenance must be recovered", installer)
+        self.assertIn("snapshot_runtime_maintenance_absence", installer)
+        self.assertIn("verify_runtime_maintenance_absence_snapshot", installer)
+        self.assertIn("it was retained for recovery", installer)
+        self.assertNotIn(
+            'snapshot_file "${config_path}.runtime-maintenance.json"',
+            installer,
+        )
+        self.assertNotIn(
+            "runtime-maintenance.json|${transaction_dir}/runtime-maintenance|runtime maintenance journal",
+            installer,
+        )
+        self.assertIn('select(.schema_version == 4 and .phase == "recovery_required"', installer)
 
     def test_macos_menu_bar_localization_resources_are_staged_before_signing(self) -> None:
         app_root = RELAY / "macos" / "OpenCodexRelay"
@@ -3127,6 +3676,12 @@ class CompatibilityRelayAssetTests(unittest.TestCase):
             resources = app / "Contents" / "Resources"
             resources.mkdir()
             (resources / "AppIcon.icns").write_bytes(b"icnsfixture")
+            runtime_trust = resources / "RuntimeTrust"
+            runtime_trust.mkdir()
+            shutil.copyfile(
+                REPO_ROOT / "config" / "trust" / "opencodex-runtime-release-ed25519.pub",
+                runtime_trust / "opencodex-runtime-release-ed25519.pub",
+            )
             (app / "Contents" / "Info.plist").write_text(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                 "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "

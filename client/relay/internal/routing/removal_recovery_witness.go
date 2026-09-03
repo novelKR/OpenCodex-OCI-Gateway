@@ -328,8 +328,10 @@ func removalRecoveryStableJournalRelation(state State, journal transactionJourna
 		state.AppliedBackend == journal.TargetBackend &&
 		journal.TargetBackend != BackendUnknown &&
 		journal.TargetBackend != BackendLocalOpenCodex &&
+		journal.TargetBackend != BackendLocalAppleContainer &&
 		journal.OriginBackend != BackendUnknown &&
 		journal.OriginBackend != BackendLocalOpenCodex &&
+		journal.OriginBackend != BackendLocalAppleContainer &&
 		journal.TargetBackend != journal.OriginBackend
 }
 
@@ -344,7 +346,9 @@ func removalRecoveryParkedJournalRelation(state State, journal transactionJourna
 		state.AppliedBackend == journal.OriginBackend &&
 		journal.TargetBackend != BackendUnknown &&
 		journal.TargetBackend != BackendLocalOpenCodex &&
+		journal.TargetBackend != BackendLocalAppleContainer &&
 		journal.OriginBackend != BackendUnknown &&
 		journal.OriginBackend != BackendLocalOpenCodex &&
+		journal.OriginBackend != BackendLocalAppleContainer &&
 		journal.TargetBackend != journal.OriginBackend
 }

@@ -221,6 +221,20 @@ struct MainAppLoginRegistration: LoginRegistrationManaging {
 
 @MainActor
 final class MenuBarModel: ObservableObject {
+    private enum ContainerRuntimeDesktopMutation {
+        case activate
+        case stop
+        case recover
+
+        var activityName: String {
+            switch self {
+            case .activate: "activation"
+            case .stop: "stop"
+            case .recover: "recovery"
+            }
+        }
+    }
+
     private enum InteractiveSurface: Hashable {
         case menuBarPopover
         case controlCenter
@@ -2153,6 +2167,127 @@ final class MenuBarModel: ObservableObject {
 			}
 		}
 	}
+
+    /// Container activation changes the same Codex config and routing state as
+    /// the ordinary mode transactions. Keep the exact selected Desktop exit
+    /// check and the mutation under one UI lease so another routing action
+    /// cannot enter between the final restart check and relayctl's CAS gate.
+    func activateContainerRuntime(_ controller: ContainerRuntimeController) {
+        guard let witness = controller.activationWitness else { return }
+        runContainerRuntimeDesktopMutation(
+            .activate,
+            controller: controller,
+            witness: witness
+        )
+    }
+
+    func stopContainerRuntime(_ controller: ContainerRuntimeController) {
+        guard let witness = controller.stopWitness else { return }
+        runContainerRuntimeDesktopMutation(
+            .stop,
+            controller: controller,
+            witness: witness
+        )
+    }
+
+    func recoverContainerRuntime(_ controller: ContainerRuntimeController) {
+        guard let witness = controller.recoveryWitness else { return }
+        runContainerRuntimeDesktopMutation(
+            .recover,
+            controller: controller,
+            witness: witness
+        )
+    }
+
+    private func runContainerRuntimeDesktopMutation(
+        _ operation: ContainerRuntimeDesktopMutation,
+        controller: ContainerRuntimeController,
+        witness: ContainerRuntimeMutationWitness
+    ) {
+        guard let desktopURL = resolveSelectedDesktopTarget(), !isBusy else { return }
+
+        isBusy = true
+        message = SafeStatusMessage(
+            code: "desktop_quit_requested",
+            key: .messageDesktopQuitRequested,
+            arguments: [.literal(desktopURL.deletingPathExtension().lastPathComponent)]
+        )
+        activityLog.record(
+            category: .operation,
+            code: "container_runtime_\(operation.activityName)_started"
+        )
+        Task { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            defer { self.isBusy = false }
+            guard await self.ensureVerifiedDesktopExited(at: desktopURL) != nil else {
+                self.activityLog.record(
+                    .warning,
+                    category: .operation,
+                    code: "container_runtime_\(operation.activityName)_finished",
+                    fields: ["result_code": self.message?.code ?? "desktop_exit_unverified"]
+                )
+                return
+            }
+
+            let succeeded: Bool
+            switch operation {
+            case .activate:
+                succeeded = await controller.activateAfterVerifiedDesktopExit(expected: witness)
+            case .stop:
+                succeeded = await controller.stopAfterVerifiedDesktopExit(expected: witness)
+            case .recover:
+                succeeded = await controller.recoverAfterVerifiedDesktopExit(expected: witness)
+            }
+            guard succeeded else {
+                let code = controller.lastErrorCode ?? "container_runtime_failed"
+                self.message = SafeStatusMessage(
+                    code: code,
+                    key: .messageRoutingOperationFailed
+                )
+                self.activityLog.record(
+                    .error,
+                    category: .operation,
+                    code: "container_runtime_\(operation.activityName)_finished",
+                    fields: ["failure_code": code, "result_code": code]
+                )
+                return
+            }
+
+            guard let relaunchURL = self.revalidateDesktopURL(desktopURL) else { return }
+            do {
+                try await self.desktopApplication.relaunch(at: relaunchURL)
+                self.refreshDesktopTargetState()
+            } catch {
+                self.refreshDesktopTargetState()
+                self.message = SafeStatusMessage(
+                    code: "desktop_relaunch_failed",
+                    key: .messageDesktopRelaunchFailed
+                )
+                return
+            }
+
+            if let client = self.configuredRelayctlClient() {
+                do {
+                    try await self.refreshAfterModeAction(using: client)
+                    self.message = SafeStatusMessage(
+                        code: "routing_applied",
+                        key: .messageRoutingApplied
+                    )
+                } catch {
+                    self.statusError = self.safeMessage(for: error)
+                    self.message = SafeStatusMessage(
+                        code: "routing_applied_refresh_pending",
+                        key: .messageRoutingAppliedRefreshPending
+                    )
+                }
+            }
+            self.activityLog.record(
+                category: .operation,
+                code: "container_runtime_\(operation.activityName)_finished",
+                fields: ["result_code": "routing_applied"]
+            )
+        }
+    }
 
     private func runDesktopExitCheckedCommand(
         command: RelayctlCommand,

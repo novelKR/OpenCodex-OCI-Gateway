@@ -64,8 +64,15 @@ public enum RoutingBindingReader {
     /// This exact location is intentionally not configurable at runtime. The
     /// installer owns its atomic creation, backup, and rollback transaction.
     public static func defaultURL(fileManager: FileManager = .default) -> URL {
+        defaultURL(distributionFlavor: .current, fileManager: fileManager)
+    }
+
+    public static func defaultURL(
+        distributionFlavor: DistributionFlavor,
+        fileManager: FileManager = .default
+    ) -> URL {
         fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent(DistributionFlavor.current.routingBindingRelativePath, isDirectory: false)
+            .appendingPathComponent(distributionFlavor.routingBindingRelativePath, isDirectory: false)
     }
 
     public static func load(at url: URL = defaultURL()) throws -> RoutingBinding {

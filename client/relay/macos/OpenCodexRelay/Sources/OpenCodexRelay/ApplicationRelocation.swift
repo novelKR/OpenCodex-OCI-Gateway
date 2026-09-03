@@ -220,6 +220,9 @@ struct SecurityApplicationBundleValidator: ApplicationBundleValidating {
         "Contents/Library/Helpers/OpenCodexRelayHelperInstaller",
         "Contents/Library/HelperTools/OpenCodexRelayPrivilegedHelper",
     ]
+    private static let requiredResourceRelativePaths = [
+        "Contents/Resources/RuntimeTrust/opencodex-runtime-release-ed25519.pub",
+    ]
 
     func inspect(bundleAt url: URL) throws -> ApplicationBundleInspection {
         guard url.isFileURL,
@@ -240,6 +243,12 @@ struct SecurityApplicationBundleValidator: ApplicationBundleValidating {
                 throw ApplicationRelocationFailure.artifactInvalid
             }
             codeHashes.append(try Self.validatedCodeHash(at: nested))
+        }
+        for relativePath in Self.requiredResourceRelativePaths {
+            let resource = url.appendingPathComponent(relativePath, isDirectory: false)
+            guard Self.regularFile(at: resource) else {
+                throw ApplicationRelocationFailure.artifactInvalid
+            }
         }
 
         let identityMaterial = ([
@@ -263,6 +272,12 @@ struct SecurityApplicationBundleValidator: ApplicationBundleValidating {
         return Darwin.lstat(url.path, &info) == 0 &&
             (info.st_mode & S_IFMT) == S_IFREG &&
             (info.st_mode & mode_t(0o111)) != 0
+    }
+
+    private static func regularFile(at url: URL) -> Bool {
+        var info = stat()
+        return Darwin.lstat(url.path, &info) == 0 &&
+            (info.st_mode & S_IFMT) == S_IFREG
     }
 
     private static func validatedCodeHash(at url: URL) throws -> String {

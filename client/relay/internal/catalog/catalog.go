@@ -246,12 +246,20 @@ func catalogRequest(ctx context.Context, upstreamBaseURL, clientVersion, profile
 }
 
 func applyCredentialHeaders(header http.Header, profile string, values credentials.Values) {
+	header.Del("CF-Access-Client-Id")
+	header.Del("CF-Access-Client-Secret")
+	header.Del("Cf-Access-Jwt-Assertion")
+	header.Del("X-OpenCodex-API-Key")
+	header.Del("X-OpenCodex-Relay")
 	if profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		header.Set("CF-Access-Client-Id", values.CFClientID)
 		header.Set("CF-Access-Client-Secret", values.CFClientSecret)
 	}
 	if profile == config.RemoteAuthenticationGatewayAPIKey || profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		header.Set("X-OpenCodex-API-Key", values.GatewayKey)
+	}
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		header.Set("X-OpenCodex-API-Key", values.LocalOpenCodexAPIKey)
 	}
 }
 

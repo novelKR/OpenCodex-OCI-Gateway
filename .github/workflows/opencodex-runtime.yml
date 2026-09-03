@@ -1,0 +1,753 @@
+name: Build and qualify OpenCodex runtime candidate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/opencodex-runtime.yml"
+      - "client/relay/**"
+      - "containers/opencodex/**"
+      - "tools/opencodex_runtime_apple_canary.py"
+      - "tools/opencodex_runtime_hosted_qualification.py"
+      - "tools/opencodex_runtime_image_test.py"
+      - "tools/opencodex_runtime_lifecycle_canary.py"
+      - "tools/opencodex_runtime_manifest.py"
+      - "tools/opencodex_upstream.py"
+      - "pilot/tests/test_opencodex_runtime_*.py"
+      - "pilot/tests/test_opencodex_upstream.py"
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Existing successful candidate workflow run ID to verify anonymously
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: opencodex-runtime-pipeline
+  cancel-in-progress: false
+
+env:
+  RUNTIME_IMAGE: ghcr.io/novelkr/opencodex-runtime
+  BUILDX_DOWNLOAD_URL: https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-amd64
+  BUILDX_SHA256: c37114fcd034025ec68e224657c8a5a850df472ded3ddcbca75ad3a7ebb9710d
+  BUILDX_VERSION_OUTPUT: github.com/docker/buildx v0.30.1 9e66234aa13328a5e75b75aa5574e1ca6d6d9c01
+  BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.26.1@sha256:8290a3b1183f45fb0c7ccd2faa7aa88eeb9af0ea85ff54458cbd8cbdb576e721
+
+jobs:
+  candidate:
+    if: github.event_name == 'push' && github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: runtime-candidate
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/opencodex-runtime-docker-config
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    outputs:
+      artifact_version: ${{ steps.identity.outputs.artifact_version }}
+      release_sequence: ${{ steps.identity.outputs.release_sequence }}
+      candidate_tag: ${{ steps.identity.outputs.candidate_tag }}
+      index_digest: ${{ steps.build.outputs.digest }}
+      amd64_digest: ${{ steps.descriptor.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.descriptor.outputs.arm64_digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Install the reviewed Buildx CLI before first execution
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]
+          umask 077
+          plugin_dir="${DOCKER_CONFIG}/cli-plugins"
+          download="${RUNNER_TEMP}/docker-buildx-v0.30.1.download"
+          plugin="${plugin_dir}/docker-buildx"
+          install -d -m 0700 "$DOCKER_CONFIG" "$plugin_dir"
+          [[ ! -e "$download" && ! -L "$download" && ! -e "$plugin" && ! -L "$plugin" ]]
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$download" "$BUILDX_DOWNLOAD_URL"
+          [[ "$(sha256sum "$download" | awk '{print $1}')" == "$BUILDX_SHA256" ]]
+          install -m 0555 "$download" "$plugin"
+          rm -f -- "$download"
+          [[ "$(sha256sum "$plugin" | awk '{print $1}')" == "$BUILDX_SHA256" ]]
+          [[ "$(docker buildx version)" == "$BUILDX_VERSION_OUTPUT" ]]
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          cache-image: false
+          image: ${{ env.BINFMT_IMAGE }}
+          platforms: arm64
+      - id: buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
+      - name: Verify the reviewed Buildx binary and BuildKit builder image
+        env:
+          BUILDX_NODES: ${{ steps.buildx.outputs.nodes }}
+        run: |
+          set -euo pipefail
+          plugin="${DOCKER_CONFIG}/cli-plugins/docker-buildx"
+          [[ -f "$plugin" && ! -L "$plugin" ]]
+          [[ "$(sha256sum "$plugin" | awk '{print $1}')" == "$BUILDX_SHA256" ]]
+          [[ "$(docker buildx version)" == "$BUILDX_VERSION_OUTPUT" ]]
+          node_name="$(python3 -c 'import json,os,re; value=json.loads(os.environ["BUILDX_NODES"]); assert isinstance(value,list) and len(value)==1; name=value[0].get("name"); assert isinstance(name,str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",name); print(name)')"
+          builder_container="buildx_buildkit_${node_name}"
+          configured_image="$(docker inspect --format '{{.Config.Image}}' "$builder_container")"
+          [[ "$configured_image" == *@sha256:8290a3b1183f45fb0c7ccd2faa7aa88eeb9af0ea85ff54458cbd8cbdb576e721 ]]
+          container_image_id="$(docker inspect --format '{{.Image}}' "$builder_container")"
+          expected_image_id="$(docker image inspect --format '{{.Id}}' "$BUILDKIT_IMAGE")"
+          [[ "$container_image_id" == "$expected_image_id" ]]
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Bind candidate identity to the reviewed lock and public main commit
+        id: identity
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_RUN_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          version="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["version"])')"
+          revision="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["revision"])')"
+          image_revision="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["image_revision"])')"
+          artifact_version="${version}-r${image_revision}"
+          candidate_tag="candidate-${artifact_version}-${GITHUB_SHA}"
+          {
+            printf 'version=%s\n' "$version"
+            printf 'upstream_revision=%s\n' "$revision"
+            printf 'image_revision=%s\n' "$image_revision"
+            printf 'artifact_version=%s\n' "$artifact_version"
+            printf 'release_sequence=%s\n' "$GITHUB_RUN_NUMBER"
+            printf 'candidate_tag=%s\n' "$candidate_tag"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push the two-platform candidate exactly once
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: containers/opencodex
+          file: containers/opencodex/Dockerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ env.RUNTIME_IMAGE }}:${{ steps.identity.outputs.candidate_tag }}
+          build-args: |
+            IMAGE_VERSION=${{ steps.identity.outputs.artifact_version }}
+            OPENCODEX_VERSION=${{ steps.identity.outputs.version }}
+            OPENCODEX_REVISION=${{ steps.identity.outputs.upstream_revision }}
+            PUBLIC_CORE_REVISION=${{ github.sha }}
+      - name: Attest the exact candidate index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.RUNTIME_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Read back index, platforms, attestations, and candidate descriptor
+        id: descriptor
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/opencodex-runtime-candidate"
+          mkdir -m 0700 "$output"
+          exact="${RUNTIME_IMAGE}@${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect --raw "$exact" > "$output/index.json"
+          docker buildx imagetools inspect "$exact" \
+            --format '{{ json (index .SBOM "linux/amd64").SPDX }}' > "$output/sbom-amd64.json"
+          docker buildx imagetools inspect "$exact" \
+            --format '{{ json (index .Provenance "linux/amd64").SLSA }}' > "$output/provenance-amd64.json"
+          docker buildx imagetools inspect "$exact" \
+            --format '{{ json (index .SBOM "linux/arm64").SPDX }}' > "$output/sbom-arm64.json"
+          docker buildx imagetools inspect "$exact" \
+            --format '{{ json (index .Provenance "linux/arm64").SLSA }}' > "$output/provenance-arm64.json"
+          [[ "sha256:$(sha256sum "$output/index.json" | awk '{print $1}')" == '${{ steps.build.outputs.digest }}' ]] || {
+            printf 'ERROR: registry index bytes do not match the build digest\n' >&2
+            exit 1
+          }
+          inspection="$(python3 tools/opencodex_runtime_manifest.py inspect-index \
+            --index "$output/index.json" --expected-digest '${{ steps.build.outputs.digest }}')"
+          amd64_digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["amd64_digest"])' <<<"$inspection")"
+          arm64_digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["arm64_digest"])' <<<"$inspection")"
+          python3 tools/opencodex_runtime_manifest.py create-candidate \
+            --lock containers/opencodex/upstream.lock.json \
+            --index "$output/index.json" \
+            --index-digest '${{ steps.build.outputs.digest }}' \
+            --artifact-version '${{ steps.identity.outputs.artifact_version }}' \
+            --release-sequence '${{ steps.identity.outputs.release_sequence }}' \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --sbom-amd64 "$output/sbom-amd64.json" \
+            --provenance-amd64 "$output/provenance-amd64.json" \
+            --sbom-arm64 "$output/sbom-arm64.json" \
+            --provenance-arm64 "$output/provenance-arm64.json" \
+            --output "$output/candidate.json"
+          python3 tools/opencodex_runtime_manifest.py verify-candidate \
+            --candidate "$output/candidate.json" \
+            --artifact-version '${{ steps.identity.outputs.artifact_version }}' \
+            --release-sequence '${{ steps.identity.outputs.release_sequence }}' \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest '${{ steps.build.outputs.digest }}'
+          {
+            printf 'amd64_digest=%s\n' "$amd64_digest"
+            printf 'arm64_digest=%s\n' "$arm64_digest"
+          } >> "$GITHUB_OUTPUT"
+      - name: Preserve the exact candidate witness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opencodex-runtime-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-candidate
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  linux_arm64_canary:
+    needs: candidate
+    if: github.event_name == 'push' && needs.candidate.result == 'success'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/opencodex-runtime-arm64-docker-config
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: opencodex-runtime-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-candidate
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Pull and exercise only the candidate exact index digest on native ARM64
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == ARM64 ]]
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          recorded_index="${RUNNER_TEMP}/opencodex-runtime-candidate/index.json"
+          registry_index="${RUNNER_TEMP}/opencodex-runtime-index-readback.json"
+          receipt="${RUNNER_TEMP}/opencodex-runtime-linux-arm64-canary.json"
+          protocol="${RUNNER_TEMP}/opencodex-runtime-linux-arm64-protocol.json"
+          index_digest='${{ needs.candidate.outputs.index_digest }}'
+          arm64_digest='${{ needs.candidate.outputs.arm64_digest }}'
+          exact="${RUNTIME_IMAGE}@${index_digest}"
+
+          python3 tools/opencodex_runtime_manifest.py verify-candidate \
+            --candidate "$candidate" \
+            --artifact-version '${{ needs.candidate.outputs.artifact_version }}' \
+            --release-sequence '${{ needs.candidate.outputs.release_sequence }}' \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest "$index_digest"
+          [[ "sha256:$(sha256sum "$recorded_index" | awk '{print $1}')" == "$index_digest" ]]
+          inspection="$(python3 tools/opencodex_runtime_manifest.py inspect-index \
+            --index "$recorded_index" --expected-digest "$index_digest")"
+          [[ "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["arm64_digest"])' <<<"$inspection")" == "$arm64_digest" ]]
+          [[ "$(sha256sum containers/opencodex/upstream.lock.json | awk '{print $1}')" == \
+             "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream_lock_sha256"])' "$candidate")" ]]
+
+          docker buildx imagetools inspect --raw "$exact" > "$registry_index"
+          [[ "sha256:$(sha256sum "$registry_index" | awk '{print $1}')" == "$index_digest" ]]
+          cmp -s "$recorded_index" "$registry_index"
+          docker buildx imagetools inspect --raw "${RUNTIME_IMAGE}@${arm64_digest}" \
+            > "${RUNNER_TEMP}/opencodex-runtime-arm64-manifest.json"
+          [[ "sha256:$(sha256sum "${RUNNER_TEMP}/opencodex-runtime-arm64-manifest.json" | awk '{print $1}')" == "$arm64_digest" ]]
+          docker pull --platform linux/arm64 "$exact"
+          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$exact")" == linux/arm64 ]]
+          docker image inspect "$exact" > "${RUNNER_TEMP}/opencodex-runtime-local-image.json"
+          python3 - "$exact" "${RUNNER_TEMP}/opencodex-runtime-local-image.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          exact = sys.argv[1]
+          values = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          if not isinstance(values, list) or len(values) != 1:
+              raise SystemExit("local exact-digest image inspection is invalid")
+          digests = values[0].get("RepoDigests")
+          if not isinstance(digests, list) or exact not in digests:
+              raise SystemExit("local ARM64 image is not bound to the candidate index digest")
+          PY
+
+          version="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["version"])')"
+          upstream_revision="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["revision"])')"
+          python3 tools/opencodex_runtime_image_test.py \
+            --image "$exact" \
+            --expected-version "$version" \
+            --expected-artifact-version '${{ needs.candidate.outputs.artifact_version }}' \
+            --expected-upstream-revision "$upstream_revision" \
+            --expected-source-revision "$GITHUB_SHA" > "$protocol"
+          python3 - "$protocol" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if value != {"schema": 1, "status": "passed"}:
+              raise SystemExit("Linux ARM64 protocol result is invalid")
+          PY
+          python3 tools/opencodex_runtime_hosted_qualification.py create-linux \
+            --candidate "$candidate" \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest "$index_digest" \
+            --arm64-digest "$arm64_digest" \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --runner-os "$RUNNER_OS" \
+            --runner-arch "$RUNNER_ARCH" \
+            --output "$receipt"
+          python3 tools/opencodex_runtime_hosted_qualification.py verify-linux \
+            --candidate "$candidate" \
+            --receipt "$receipt" \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest "$index_digest" \
+            --arm64-digest "$arm64_digest"
+      - name: Preserve the GitHub-hosted Linux ARM64 witness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opencodex-runtime-linux-arm64-canary-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-linux-arm64-canary.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  macos_contract:
+    needs: candidate
+    if: github.event_name == 'push' && needs.candidate.result == 'success'
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: client/relay/go.sum
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: opencodex-runtime-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-candidate
+      - name: Revalidate the candidate without claiming Apple Container execution
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$RUNNER_OS" == macOS && "$RUNNER_ARCH" == ARM64 ]]
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          python3 tools/opencodex_runtime_manifest.py verify-candidate \
+            --candidate "$candidate" \
+            --artifact-version '${{ needs.candidate.outputs.artifact_version }}' \
+            --release-sequence '${{ needs.candidate.outputs.release_sequence }}' \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest '${{ needs.candidate.outputs.index_digest }}'
+          [[ "$(shasum -a 256 containers/opencodex/upstream.lock.json | awk '{print $1}')" == \
+             "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream_lock_sha256"])' "$candidate")" ]]
+      - name: Test Go routing, lifecycle, manifest, and relayctl contracts
+        working-directory: client/relay
+        run: |
+          set -euo pipefail
+          test_tmp="${RUNNER_TEMP}/opencodex-runtime-macos-go"
+          install -d -m 0700 "$test_tmp"
+          TMPDIR="$test_tmp" go test ./...
+          TMPDIR="$test_tmp" go test -race ./...
+          TMPDIR="$test_tmp" go vet ./...
+      - name: Test and release-build the Swift client contracts
+        working-directory: client/relay/macos/OpenCodexRelay
+        run: |
+          swift test
+          swift build -c release -Xswiftc -warnings-as-errors
+      - name: Test isolated Keychain and fake Apple lifecycle adapters
+        run: |
+          set -euo pipefail
+          test_tmp="${RUNNER_TEMP}/opencodex-runtime-macos-contract"
+          install -d -m 0700 "$test_tmp"
+          client/relay/scripts/test-keychain-acl-integration.sh
+          TMPDIR="$test_tmp" python3 -m unittest \
+            pilot.tests.test_opencodex_runtime_manifest \
+            pilot.tests.test_opencodex_runtime_apple_canary \
+            pilot.tests.test_opencodex_runtime_lifecycle_canary \
+            pilot.tests.test_opencodex_runtime_hosted_qualification
+      - name: Create the macOS contract-only receipt
+        run: |
+          set -euo pipefail
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          receipt="${RUNNER_TEMP}/opencodex-runtime-macos-contract.json"
+          python3 tools/opencodex_runtime_hosted_qualification.py create-macos \
+            --candidate "$candidate" \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest '${{ needs.candidate.outputs.index_digest }}' \
+            --arm64-digest '${{ needs.candidate.outputs.arm64_digest }}' \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --runner-os "$RUNNER_OS" \
+            --runner-arch "$RUNNER_ARCH" \
+            --output "$receipt"
+          python3 tools/opencodex_runtime_hosted_qualification.py verify-macos \
+            --candidate "$candidate" \
+            --receipt "$receipt" \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest '${{ needs.candidate.outputs.index_digest }}' \
+            --arm64-digest '${{ needs.candidate.outputs.arm64_digest }}'
+          printf 'apple_container_live=false\nstable_promotion_eligible=false\n'
+      - name: Preserve the GitHub-hosted macOS contract witness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opencodex-runtime-macos-contract-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-macos-contract.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  hosted_qualification:
+    needs: [candidate, linux_arm64_canary, macos_contract]
+    if: github.event_name == 'push' && needs.candidate.result == 'success' && needs.linux_arm64_canary.result == 'success' && needs.macos_contract.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/opencodex-runtime-qualification-docker-config
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: opencodex-runtime-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-candidate
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: opencodex-runtime-linux-arm64-canary-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-linux-arm64-canary
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: opencodex-runtime-macos-contract-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-macos-contract
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Revalidate exact candidate provenance on a GitHub-hosted runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          index_digest='${{ needs.candidate.outputs.index_digest }}'
+          python3 tools/opencodex_runtime_manifest.py verify-candidate \
+            --candidate "$candidate" \
+            --artifact-version '${{ needs.candidate.outputs.artifact_version }}' \
+            --release-sequence '${{ needs.candidate.outputs.release_sequence }}' \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest "$index_digest"
+          gh attestation verify "oci://${RUNTIME_IMAGE}@${index_digest}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/opencodex-runtime.yml" \
+            --source-ref refs/heads/main \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners >/dev/null
+      - name: Create the strict hosted-candidate qualification receipt
+        run: |
+          set -euo pipefail
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          linux="${RUNNER_TEMP}/opencodex-runtime-linux-arm64-canary/opencodex-runtime-linux-arm64-canary.json"
+          macos="${RUNNER_TEMP}/opencodex-runtime-macos-contract/opencodex-runtime-macos-contract.json"
+          receipt="${RUNNER_TEMP}/opencodex-runtime-hosted-qualification.json"
+          python3 tools/opencodex_runtime_hosted_qualification.py create-hosted \
+            --candidate "$candidate" \
+            --linux-receipt "$linux" \
+            --macos-receipt "$macos" \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest '${{ needs.candidate.outputs.index_digest }}' \
+            --arm64-digest '${{ needs.candidate.outputs.arm64_digest }}' \
+            --output "$receipt"
+          python3 tools/opencodex_runtime_hosted_qualification.py verify-hosted \
+            --candidate "$candidate" \
+            --receipt "$receipt" \
+            --linux-receipt "$linux" \
+            --macos-receipt "$macos" \
+            --source-revision "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --index-digest '${{ needs.candidate.outputs.index_digest }}' \
+            --arm64-digest '${{ needs.candidate.outputs.arm64_digest }}'
+          {
+            printf '## OpenCodex Runtime hosted qualification\n\n'
+            printf -- '- qualification_level: `hosted-candidate`\n'
+            printf -- '- apple_container_live: `false`\n'
+            printf -- '- stable_promotion_eligible: `false`\n'
+            printf -- '- exact image: `%s@%s`\n' "$RUNTIME_IMAGE" '${{ needs.candidate.outputs.index_digest }}'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve the hosted-candidate qualification witness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opencodex-runtime-hosted-qualification-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-hosted-qualification.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  verify_public_candidate:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/opencodex-runtime-anonymous-docker-config
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Resolve one successful candidate run and its exact artifacts
+        id: candidate_run
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          run_file="${RUNNER_TEMP}/opencodex-runtime-candidate-run.json"
+          artifact_file="${RUNNER_TEMP}/opencodex-runtime-candidate-artifacts.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" > "$run_file"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/artifacts?per_page=100" > "$artifact_file"
+          python3 - "$run_file" "$artifact_file" "$CANDIDATE_RUN_ID" "$GITHUB_REPOSITORY" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          run = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          artifacts = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          run_id = int(sys.argv[3])
+          repository = sys.argv[4]
+          output = pathlib.Path(sys.argv[5])
+          if (
+              not isinstance(run, dict)
+              or run.get("id") != run_id
+              or run.get("event") != "push"
+              or run.get("head_branch") != "main"
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or run.get("path") != ".github/workflows/opencodex-runtime.yml"
+              or not isinstance(run.get("head_repository"), dict)
+              or run["head_repository"].get("full_name") != repository
+          ):
+              raise SystemExit("candidate run is not a successful public-main runtime workflow")
+          source = run.get("head_sha")
+          attempt = run.get("run_attempt")
+          run_number = run.get("run_number")
+          if not isinstance(source, str) or re.fullmatch(r"[0-9a-f]{40}", source) is None:
+              raise SystemExit("candidate run source revision is invalid")
+          if type(attempt) is not int or attempt < 1:
+              raise SystemExit("candidate run attempt is invalid")
+          if type(run_number) is not int or run_number < 1:
+              raise SystemExit("candidate run number is invalid")
+          if not isinstance(artifacts, dict) or set(artifacts) != {"total_count", "artifacts"}:
+              raise SystemExit("candidate artifact listing schema is invalid")
+          rows = artifacts["artifacts"]
+          if not isinstance(rows, list) or artifacts["total_count"] != len(rows):
+              raise SystemExit("candidate artifact listing is incomplete")
+          expected = {
+              f"opencodex-runtime-candidate-{run_id}": "candidate_name",
+              f"opencodex-runtime-hosted-qualification-{run_id}": "hosted_name",
+          }
+          selected = {}
+          for name, output_name in expected.items():
+              matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name]
+              if len(matches) != 1:
+                  raise SystemExit(f"candidate run does not contain one exact {name} artifact")
+              artifact = matches[0]
+              workflow_run = artifact.get("workflow_run")
+              if (
+                  artifact.get("expired") is not False
+                  or type(artifact.get("id")) is not int
+                  or artifact["id"] < 1
+                  or type(artifact.get("size_in_bytes")) is not int
+                  or artifact["size_in_bytes"] < 1
+                  or not isinstance(workflow_run, dict)
+                  or workflow_run.get("id") != run_id
+                  or workflow_run.get("head_sha") != source
+              ):
+                  raise SystemExit(f"candidate artifact {name} identity is invalid")
+              selected[output_name] = name
+          lines = {
+              "run_id": str(run_id),
+              "run_attempt": str(attempt),
+              "run_number": str(run_number),
+              "source_revision": source,
+              **selected,
+          }
+          with output.open("a", encoding="utf-8") as stream:
+              for key in sorted(lines):
+                  stream.write(f"{key}={lines[key]}\n")
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.candidate_run.outputs.source_revision }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.candidate_run.outputs.candidate_name }}
+          path: ${{ runner.temp }}/opencodex-runtime-candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate_run.outputs.run_id }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.candidate_run.outputs.hosted_name }}
+          path: ${{ runner.temp }}/opencodex-runtime-hosted-qualification
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate_run.outputs.run_id }}
+      - name: Verify the candidate and hosted qualification before registry access
+        id: witness
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == ARM64 ]]
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          hosted="${RUNNER_TEMP}/opencodex-runtime-hosted-qualification/opencodex-runtime-hosted-qualification.json"
+          index="${RUNNER_TEMP}/opencodex-runtime-candidate/index.json"
+          source='${{ steps.candidate_run.outputs.source_revision }}'
+          run_id='${{ steps.candidate_run.outputs.run_id }}'
+          attempt='${{ steps.candidate_run.outputs.run_attempt }}'
+          python3 tools/opencodex_runtime_manifest.py verify-candidate \
+            --candidate "$candidate" \
+            --release-sequence '${{ steps.candidate_run.outputs.run_number }}' \
+            --source-revision "$source" \
+            --workflow-run-id "$run_id" \
+            --workflow-run-attempt "$attempt"
+          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          [[ "$(sha256sum containers/opencodex/upstream.lock.json | awk '{print $1}')" == \
+             "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream_lock_sha256"])' "$candidate")" ]]
+          index_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["index_digest"])' "$candidate")"
+          arm64_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["platforms"][1]["digest"])' "$candidate")"
+          [[ "sha256:$(sha256sum "$index" | awk '{print $1}')" == "$index_digest" ]]
+          inspection="$(python3 tools/opencodex_runtime_manifest.py inspect-index \
+            --index "$index" --expected-digest "$index_digest")"
+          [[ "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["arm64_digest"])' <<<"$inspection")" == "$arm64_digest" ]]
+          python3 tools/opencodex_runtime_hosted_qualification.py verify-hosted \
+            --candidate "$candidate" \
+            --receipt "$hosted" \
+            --source-revision "$source" \
+            --workflow-run-id "$run_id" \
+            --workflow-run-attempt "$attempt" \
+            --index-digest "$index_digest" \
+            --arm64-digest "$arm64_digest"
+          {
+            printf 'index_digest=%s\n' "$index_digest"
+            printf 'arm64_digest=%s\n' "$arm64_digest"
+          } >> "$GITHUB_OUTPUT"
+      - name: Prove anonymous exact-digest pull without registry credentials
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 0700 "$DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$DOCKER_CONFIG/config.json"
+          exact="${RUNTIME_IMAGE}@${{ steps.witness.outputs.index_digest }}"
+          docker pull --platform linux/arm64 "$exact"
+          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$exact")" == linux/arm64 ]]
+          docker image inspect "$exact" > "${RUNNER_TEMP}/opencodex-runtime-public-image.json"
+          python3 - "$exact" "$DOCKER_CONFIG/config.json" "${RUNNER_TEMP}/opencodex-runtime-public-image.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          exact = sys.argv[1]
+          config = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          images = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+          if config != {"auths": {}}:
+              raise SystemExit("anonymous Docker configuration acquired credentials")
+          if not isinstance(images, list) or len(images) != 1:
+              raise SystemExit("anonymous exact-digest image inspection is invalid")
+          digests = images[0].get("RepoDigests")
+          if not isinstance(digests, list) or exact not in digests:
+              raise SystemExit("anonymous pull is not bound to the candidate index digest")
+          PY
+      - name: Create a public-ready receipt that remains ineligible for stable promotion
+        run: |
+          set -euo pipefail
+          candidate="${RUNNER_TEMP}/opencodex-runtime-candidate/candidate.json"
+          hosted="${RUNNER_TEMP}/opencodex-runtime-hosted-qualification/opencodex-runtime-hosted-qualification.json"
+          receipt="${RUNNER_TEMP}/opencodex-runtime-public-candidate-verification.json"
+          python3 tools/opencodex_runtime_hosted_qualification.py create-public \
+            --candidate "$candidate" \
+            --hosted-receipt "$hosted" \
+            --source-revision '${{ steps.candidate_run.outputs.source_revision }}' \
+            --workflow-run-id '${{ steps.candidate_run.outputs.run_id }}' \
+            --workflow-run-attempt '${{ steps.candidate_run.outputs.run_attempt }}' \
+            --index-digest '${{ steps.witness.outputs.index_digest }}' \
+            --arm64-digest '${{ steps.witness.outputs.arm64_digest }}' \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --runner-os "$RUNNER_OS" \
+            --runner-arch "$RUNNER_ARCH" \
+            --verification-workflow-run-id "$GITHUB_RUN_ID" \
+            --verification-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$receipt"
+          python3 tools/opencodex_runtime_hosted_qualification.py verify-public \
+            --candidate "$candidate" \
+            --hosted-receipt "$hosted" \
+            --receipt "$receipt" \
+            --source-revision '${{ steps.candidate_run.outputs.source_revision }}' \
+            --workflow-run-id '${{ steps.candidate_run.outputs.run_id }}' \
+            --workflow-run-attempt '${{ steps.candidate_run.outputs.run_attempt }}' \
+            --index-digest '${{ steps.witness.outputs.index_digest }}' \
+            --arm64-digest '${{ steps.witness.outputs.arm64_digest }}' \
+            --verification-workflow-run-id "$GITHUB_RUN_ID" \
+            --verification-workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+          {
+            printf '## OpenCodex Runtime public candidate verification\n\n'
+            printf -- '- public_ready: `true`\n'
+            printf -- '- anonymous_exact_digest_pull: `true`\n'
+            printf -- '- apple_container_live: `false`\n'
+            printf -- '- stable_promotion_eligible: `false`\n'
+            printf -- '- candidate workflow run: `%s` attempt `%s`\n' \
+              '${{ steps.candidate_run.outputs.run_id }}' '${{ steps.candidate_run.outputs.run_attempt }}'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve the anonymous public-candidate witness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opencodex-runtime-public-candidate-${{ steps.candidate_run.outputs.run_id }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/opencodex-runtime-public-candidate-verification.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30

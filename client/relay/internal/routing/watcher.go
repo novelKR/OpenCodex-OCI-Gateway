@@ -79,6 +79,30 @@ func (w *Watcher) Refresh() {
 		if transactionErr != nil || (pending && (legacy || state.Phase != PhaseApplying)) {
 			err = fmt.Errorf("routing transaction requires recovery")
 		}
+		maintenance, maintenanceFound, maintenanceErr := w.store.loadMaintenance()
+		if maintenanceErr != nil || (maintenanceFound && (legacy || state.Phase != PhaseApplying || !maintenance.matchesState(state))) {
+			err = fmt.Errorf("runtime maintenance requires recovery")
+		}
+		if pending && maintenanceFound {
+			// The two transaction owners are mutually exclusive. Even if both
+			// journals are individually well formed, their coexistence cannot
+			// prove which runtime/config mutation is authoritative.
+			err = fmt.Errorf("routing transaction owners conflict")
+		}
+		// An ordinary container-runtime route keeps its separate witness until
+		// the lifecycle manager durably commits. A strict matching witness is
+		// compatible with the finite routing states below; malformed, foreign,
+		// or multiply-owned evidence parks admission.
+		runtimeRouting, runtimeRoutingFound, runtimeRoutingErr := w.store.loadRuntimeRouting(state.BoundCodexConfigPath)
+		if runtimeRoutingErr != nil {
+			err = fmt.Errorf("container runtime routing witness requires recovery")
+		} else if runtimeRoutingFound {
+			controller := &Controller{store: w.store, journalPath: w.store.TransactionPath()}
+			transaction, transactionFound, loadErr := controller.loadJournal()
+			if loadErr != nil || maintenanceFound || !runtimeRouting.matchesState(state, transaction, transactionFound) {
+				err = fmt.Errorf("container runtime routing witness conflicts with routing state")
+			}
+		}
 		if err == nil && !legacy && w.driftCheck != nil && state.Phase != PhaseApplying && state.Phase != PhaseRecoveryRequired {
 			if driftErr := w.driftCheck(state); driftErr != nil {
 				err = fmt.Errorf("relay-managed Codex routing drift requires recovery")

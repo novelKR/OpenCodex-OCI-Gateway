@@ -469,6 +469,42 @@ public enum AppStringKey: String, CaseIterable, Sendable {
     case runtimeUpgradeConfirmationAction = "runtime_upgrade.confirmation.action"
     case runtimeUpgradeRecoveryConfirmationTitle = "runtime_upgrade.recovery_confirmation.title"
     case runtimeUpgradeRecoveryConfirmationDetail = "runtime_upgrade.recovery_confirmation.detail"
+
+    case containerRuntimeTitle = "container_runtime.title"
+    case containerRuntimeOptIn = "container_runtime.opt_in"
+    case containerRuntimeOptInDetail = "container_runtime.opt_in.detail"
+    case containerRuntimeCapability = "container_runtime.capability"
+    case containerRuntimeAppleVersion = "container_runtime.apple_version"
+    case containerRuntimeStagedVersion = "container_runtime.staged_version"
+    case containerRuntimeActiveVersion = "container_runtime.active_version"
+    case containerRuntimeIndexDigest = "container_runtime.index_digest"
+    case containerRuntimeArm64Digest = "container_runtime.arm64_digest"
+    case containerRuntimeCheck = "container_runtime.check"
+    case containerRuntimeStage = "container_runtime.stage"
+    case containerRuntimeActivate = "container_runtime.activate"
+    case containerRuntimeStop = "container_runtime.stop"
+    case containerRuntimeRecover = "container_runtime.recover"
+    case containerRuntimeStateUnavailable = "container_runtime.state.unavailable"
+    case containerRuntimeStateStopped = "container_runtime.state.stopped"
+    case containerRuntimeStateStaging = "container_runtime.state.staging"
+    case containerRuntimeStateHealthy = "container_runtime.state.healthy"
+    case containerRuntimeStateUpdating = "container_runtime.state.updating"
+    case containerRuntimeStateRecovery = "container_runtime.state.recovery_required"
+    case containerRuntimeFailedDetail = "container_runtime.failed.detail"
+    case containerRuntimeActivateTitle = "container_runtime.activate.title"
+    case containerRuntimeActivateDetail = "container_runtime.activate.detail"
+    case containerRuntimeActivateConfirm = "container_runtime.activate.confirm"
+    case containerRuntimeStopTitle = "container_runtime.stop.title"
+    case containerRuntimeStopDetail = "container_runtime.stop.detail"
+    case containerRuntimeOAuthTitle = "container_runtime.oauth.title"
+    case containerRuntimeOAuthLoad = "container_runtime.oauth.load"
+    case containerRuntimeOAuthStart = "container_runtime.oauth.start"
+    case containerRuntimeOAuthOpen = "container_runtime.oauth.open"
+    case containerRuntimeOAuthInput = "container_runtime.oauth.input"
+    case containerRuntimeOAuthSubmit = "container_runtime.oauth.submit"
+    case containerRuntimeOAuthStatus = "container_runtime.oauth.status"
+    case containerRuntimeOAuthCancel = "container_runtime.oauth.cancel"
+    case containerRuntimeOAuthDetail = "container_runtime.oauth.detail"
     case activityLogAbout = "activity_log.about"
     case activityLogCurrentSession = "activity_log.current_session"
     case activityLogPrivacy = "activity_log.privacy"
@@ -1301,7 +1337,7 @@ public extension AppLocalizer {
         switch value {
         case .unknown: text(.backendUnknown)
         case .external: text(.backendExternal)
-        case .localOpenCodex: text(.backendLocal)
+        case .localOpenCodex, .localAppleContainer: text(.backendLocal)
         case .none: text(.backendNative)
         }
     }

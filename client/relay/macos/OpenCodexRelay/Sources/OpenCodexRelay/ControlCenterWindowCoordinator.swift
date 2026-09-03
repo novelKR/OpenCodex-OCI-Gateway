@@ -27,6 +27,7 @@ final class ControlCenterWindowCoordinator: NSObject, ObservableObject, NSWindow
         relocation: ApplicationRelocationController,
         updates: ReleaseUpdateController,
         runtimeUpgrade: RuntimeUpgradeController,
+        containerRuntime: ContainerRuntimeController,
         section: RelayControlCenterSection? = nil
     ) {
         logger.info("Control Center presentation requested")
@@ -37,7 +38,8 @@ final class ControlCenterWindowCoordinator: NSObject, ObservableObject, NSWindow
             localization: localization,
             relocation: relocation,
             updates: updates,
-            runtimeUpgrade: runtimeUpgrade
+            runtimeUpgrade: runtimeUpgrade,
+            containerRuntime: containerRuntime
         )
         window.title = model.localizer.text(.viewControlCenter)
         configure(window)
@@ -57,14 +59,16 @@ final class ControlCenterWindowCoordinator: NSObject, ObservableObject, NSWindow
         localization: LocalizationStore,
         relocation: ApplicationRelocationController,
         updates: ReleaseUpdateController,
-        runtimeUpgrade: RuntimeUpgradeController
+        runtimeUpgrade: RuntimeUpgradeController,
+        containerRuntime: ContainerRuntimeController
     ) -> NSWindow {
         let root = RelayControlCenterView(
             model: model,
             windowCoordinator: self,
             relocation: relocation,
             updates: updates,
-            runtimeUpgrade: runtimeUpgrade
+            runtimeUpgrade: runtimeUpgrade,
+            containerRuntime: containerRuntime
         )
         .environmentObject(localization)
         .environment(\.locale, localization.locale)

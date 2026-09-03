@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -9,10 +10,12 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	gort "runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/localopencodex"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/proxy"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
@@ -39,6 +42,14 @@ func TestInitialRuntimeBackendUsesAppliedBackendOrParks(t *testing.T) {
 				Phase:          routing.PhaseRelayActive,
 			}},
 			want: routing.BackendLocalOpenCodex,
+		},
+		{
+			name: "Apple Container active",
+			snapshot: routing.Snapshot{State: routing.State{
+				AppliedBackend: routing.BackendLocalAppleContainer,
+				Phase:          routing.PhaseRelayActive,
+			}},
+			want: routing.BackendLocalAppleContainer,
 		},
 		{
 			name: "native pending retains applied local",
@@ -71,6 +82,44 @@ func TestInitialRuntimeBackendUsesAppliedBackendOrParks(t *testing.T) {
 				t.Fatalf("initial runtime backend = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRelayRuntimeStartsActiveAppleProfileWithTypedAuthenticatedPreflight(t *testing.T) {
+	if gort.GOOS != "darwin" || gort.GOARCH != "arm64" {
+		t.Skip("the Apple Container runtime profile is macOS Apple Silicon only")
+	}
+	runtime, fixture, _, probes := newAppleRuntimeFixture(t, false)
+	defer fixture.close(t, runtime)
+	snapshot := runtime.Handler().Snapshot()
+	if snapshot.Profile != proxy.RuntimeProfileLocalAppleContainer || snapshot.Admission != "active" || snapshot.LocalAvailability != proxy.LocalAvailabilityReady {
+		t.Fatalf("initial Apple runtime = %#v", snapshot)
+	}
+	if *probes != 1 {
+		t.Fatalf("initial Apple preflight calls = %d", *probes)
+	}
+}
+
+func TestRelayRuntimeReconstructsPendingAppleMaintenanceParkedAndRecovers(t *testing.T) {
+	if gort.GOOS != "darwin" || gort.GOARCH != "arm64" {
+		t.Skip("the Apple Container runtime profile is macOS Apple Silicon only")
+	}
+	runtime, fixture, witness, probes := newAppleRuntimeFixture(t, true)
+	defer fixture.close(t, runtime)
+	snapshot := runtime.Handler().Snapshot()
+	if snapshot.Profile != proxy.RuntimeProfileLocalAppleContainer || snapshot.Admission != "paused" || snapshot.CatalogRunning || *probes != 0 {
+		t.Fatalf("reconstructed pending Apple runtime = %#v probes=%d", snapshot, *probes)
+	}
+	coordinator, err := routing.NewMaintenanceCoordinator(fixture.store.ConfigPath(), fixture.watcher, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Commit(context.Background(), witness); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = runtime.Handler().Snapshot()
+	if snapshot.Profile != proxy.RuntimeProfileLocalAppleContainer || snapshot.Admission != "active" || snapshot.LocalAvailability != proxy.LocalAvailabilityReady || *probes != 1 {
+		t.Fatalf("recovered Apple runtime = %#v probes=%d", snapshot, *probes)
 	}
 }
 
@@ -198,6 +247,110 @@ type runtimeFixture struct {
 	state   routing.State
 }
 
+type noopMaintenanceRuntime struct{}
+
+func (noopMaintenanceRuntime) Prepare(context.Context) error                          { return nil }
+func (noopMaintenanceRuntime) Verify(context.Context, routing.ControlOperation) error { return nil }
+func (noopMaintenanceRuntime) Resume()                                                {}
+
+func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool) (*relayRuntime, *runtimeFixture, routing.MaintenanceWitness, *int) {
+	t.Helper()
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "relay.json")
+	codexPath := filepath.Join(directory, "config.toml")
+	cfg, err := config.NewDefault("https://gateway.example.test/v1", config.CredentialsSourceNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Catalog.Path = filepath.Join(directory, "external-catalog.json")
+	cfg.LocalAppleContainer, err = config.NewLocalAppleContainerProfileForCodexConfig(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Write(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	store, err := routing.Open(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := routing.NewRelayState(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = routing.BindCodexConfig(state, codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.DesiredBackend = routing.BackendLocalAppleContainer
+	state.AppliedBackend = routing.BackendLocalAppleContainer
+	state.DesiredMode = routing.ModeRelay
+	state.AppliedMode = routing.ModeRelay
+	state.Phase = routing.PhaseRelayActive
+	lock, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(state); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	watcher := routing.NewWatcher(store, 0)
+	witness := routing.MaintenanceWitness{}
+	if pendingMaintenance {
+		coordinator, err := routing.NewMaintenanceCoordinator(configPath, watcher, noopMaintenanceRuntime{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldHash := strings.Repeat("a", 64)
+		newHash := strings.Repeat("b", 64)
+		witness, err = coordinator.Prepare(context.Background(), state.Generation, routing.MaintenanceIntent{
+			OperationID:        "operation-0000001",
+			InstallationID:     "installation-0001",
+			OldManifestSHA256:  oldHash,
+			NewManifestSHA256:  newHash,
+			OldImageDigest:     "sha256:" + oldHash,
+			NewImageDigest:     "sha256:" + newHash,
+			OldStateGeneration: 1,
+			NewStateGeneration: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture := &runtimeFixture{cancel: cancel, store: store, watcher: watcher, state: state}
+	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	probes := 0
+	runtime, err := newRelayRuntimeWithDependencies(
+		ctx,
+		configPath,
+		cfg,
+		watcher,
+		proxy.NewTracker(),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_ context.Context, target localopencodex.Target) localopencodex.Result {
+			probes++
+			if target.BaseURL != "http://127.0.0.1:10210/v1" || target.ExpectedServicePort != 10100 ||
+				target.AuthenticationProfile != config.LocalAuthenticationOpenCodexAPIKey || target.Credentials.LocalOpenCodexAPIKey != apiToken {
+				t.Fatalf("Apple runtime preflight target = %#v", target)
+			}
+			return localopencodex.Result{Availability: localopencodex.AvailabilityReady, ModelCount: 1}
+		},
+		func(config.CredentialsConfig) (credentials.Values, error) {
+			return credentials.Values{LocalOpenCodexAPIKey: apiToken}, nil
+		},
+	)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	return runtime, fixture, witness, &probes
+}
+
 func newRuntimeFixture(t *testing.T, state routing.State, preflight localOpenCodexPreflight) (*relayRuntime, *runtimeFixture) {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "relay.json")
@@ -286,7 +439,7 @@ func runtimeState(t *testing.T, desired, applied routing.Backend, phase routing.
 
 func runtimeModeForBackend(backend routing.Backend) routing.Mode {
 	switch backend {
-	case routing.BackendExternal, routing.BackendLocalOpenCodex:
+	case routing.BackendExternal, routing.BackendLocalOpenCodex, routing.BackendLocalAppleContainer:
 		return routing.ModeRelay
 	case routing.BackendNone:
 		return routing.ModeNative
