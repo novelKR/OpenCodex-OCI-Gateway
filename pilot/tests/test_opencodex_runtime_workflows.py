@@ -261,6 +261,192 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, workflow)
         self.assertNotIn(":latest", workflow)
 
+    def test_candidate_attestation_uses_canonical_owner_only_registry_credentials(self):
+        workflow = self.text(".github/workflows/opencodex-runtime.yml")
+        candidate = workflow.split("  candidate:\n", 1)[1].split(
+            "\n  linux_arm64_canary:\n", 1
+        )[0]
+        linux = workflow.split("\n  linux_arm64_canary:\n", 1)[1].split(
+            "\n  macos_contract:\n", 1
+        )[0]
+        qualification = workflow.split("\n  hosted_qualification:\n", 1)[1].split(
+            "\n  verify_public_candidate:\n", 1
+        )[0]
+        installer = candidate.split(
+            "Install the reviewed Buildx CLI before first execution", 1
+        )[1].split("- uses: docker/setup-qemu-action@", 1)[0]
+        credential_check = candidate.split(
+            "Verify the attestation registry credential binding", 1
+        )[1].split("- name: Attest the exact candidate index", 1)[0]
+        attest = candidate.split("- name: Attest the exact candidate index", 1)[
+            1
+        ].split("- name: Read back index, platforms, attestations", 1)[0]
+
+        candidate_permissions = candidate.split("    permissions:\n", 1)[1].split(
+            "    outputs:\n", 1
+        )[0]
+        self.assertEqual(
+            [line.strip() for line in candidate_permissions.splitlines() if line.strip()],
+            [
+                "attestations: write",
+                "contents: read",
+                "id-token: write",
+                "packages: write",
+            ],
+        )
+
+        for expected in (
+            '[[ "$RUNNER_ENVIRONMENT" == github-hosted ]]',
+            '[[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]',
+            '[[ "$(id -un)" == runner ]]',
+            'expected_home="/home/runner"',
+            'pwd.getpwuid(os.getuid()).pw_dir',
+            'node -p \'require("os").homedir()\'',
+            '[[ "$HOME" == "$expected_home" ]]',
+            '[[ "$passwd_home" == "$expected_home" ]]',
+            '[[ "$node_home" == "$expected_home" ]]',
+            '[[ -d "$expected_home" && ! -L "$expected_home" ]]',
+            '[[ "$(stat -c \'%u\' "$expected_home")" == "$(id -u)" ]]',
+            '[[ "$DOCKER_CONFIG" == "${expected_home}/.docker" ]]',
+            'config="${DOCKER_CONFIG}/config.json"',
+            'if [[ -e "$DOCKER_CONFIG" || -L "$DOCKER_CONFIG" ]]',
+            '[[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]',
+            'find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 ! -name config.json',
+            'if [[ -e "$config" || -L "$config" ]]',
+            '[[ -f "$config" && ! -L "$config" ]]',
+            '$(id -u):600:1',
+            '"$size" -le 16384',
+            "DOCKER_HUB_ALIASES = {",
+            '"https://index.docker.io/v1/"',
+            'len(auths) > 1',
+            'set(auths).issubset(DOCKER_HUB_ALIASES)',
+            'install -d -m 0700 "$DOCKER_CONFIG" "$plugin_dir"',
+            '$(id -u):700',
+        ):
+            self.assertIn(expected, installer)
+        candidate_header = candidate.split("    permissions:\n", 1)[0]
+        self.assertIn("    env:\n      DOCKER_CONFIG: /home/runner/.docker", candidate_header)
+        self.assertEqual(workflow.count("DOCKER_CONFIG: /home/runner/.docker"), 1)
+        self.assertNotIn(
+            '${RUNNER_TEMP}/opencodex-runtime-docker-config', candidate
+        )
+        self.assertNotIn("DOCKER_CONFIG=%s", installer)
+        self.assertNotRegex(candidate, r"(?m)^\s*(?:export\s+)?HOME=")
+        self.assertNotRegex(candidate, r"(?m)^\s+HOME:")
+
+        login = candidate.split("- name: Log into ghcr.io", 1)[1].split(
+            "- name: Bind candidate identity", 1
+        )[0]
+        self.assertEqual(candidate.count("- name: Log into ghcr.io"), 1)
+        self.assertEqual(candidate.count("docker/login-action@"), 1)
+        self.assertIn("uses: docker/login-action@", login)
+        self.assertIn("registry: ghcr.io", login)
+        self.assertIn("username: ${{ github.actor }}", login)
+        self.assertIn("password: ${{ github.token }}", login)
+        self.assertIn("logout: true", login)
+
+        for expected in (
+            '[[ "$DOCKER_CONFIG" == "${canonical_home}/.docker" ]]',
+            '[[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]',
+            'config="${DOCKER_CONFIG}/config.json"',
+            '[[ -f "$config" && ! -L "$config" ]]',
+            "stat -c '%u'",
+            "stat -c '%h'",
+            "stat -c '%s'",
+            '"$size" -ge 1',
+            '"$size" -le 16384',
+            'chmod 0600 "$config"',
+            "stat -c '%a'",
+            "object_pairs_hook=strict_object",
+            "duplicate Docker credential configuration field",
+            'set(document) != {"auths"}',
+            '"ghcr.io" not in auths',
+            'set(auths) - {"ghcr.io"}',
+            "len(other_registries) > 1",
+            "other_registries.issubset(docker_hub_aliases)",
+            'set(entry) != {"auth"}',
+            "not 1 <= len(auth) <= 4096",
+        ):
+            self.assertIn(expected, credential_check)
+        self.assertNotIn("print(auth", credential_check)
+        self.assertNotRegex(credential_check, r"\b(?:cp|ln)\s+")
+        for forbidden in (
+            "base64",
+            "hashlib",
+            "sys.stdout",
+            "GITHUB_OUTPUT",
+            "GITHUB_STEP_SUMMARY",
+            "upload-artifact",
+            "docker login",
+        ):
+            self.assertNotIn(forbidden, credential_check)
+
+        expected_docker_hub_aliases = {
+            "docker.io",
+            "index.docker.io",
+            "registry-1.docker.io",
+            "https://index.docker.io/v1/",
+        }
+        for source, marker in (
+            (installer, "DOCKER_HUB_ALIASES = {"),
+            (credential_check, "docker_hub_aliases = {"),
+        ):
+            alias_block = source.split(marker, 1)[1].split("}", 1)[0]
+            aliases = re.findall(r'^\s*"([^"]+)",\s*$', alias_block, re.MULTILINE)
+            self.assertEqual(len(aliases), len(expected_docker_hub_aliases))
+            self.assertEqual(set(aliases), expected_docker_hub_aliases)
+        self.assertNotIn("credsStore", candidate)
+        self.assertNotIn("credHelpers", candidate)
+        self.assertNotRegex(
+            candidate,
+            r'(?m)^\s*(?:cp|ln)\b[^\n]*(?:DOCKER_CONFIG|/home/runner/\.docker)',
+        )
+
+        self.assertEqual(candidate.count("actions/attest-build-provenance@"), 1)
+        self.assertIn("subject-name: ${{ env.RUNTIME_IMAGE }}", attest)
+        self.assertIn("subject-digest: ${{ steps.build.outputs.digest }}", attest)
+        self.assertIn("push-to-registry: true", attest)
+
+        self.assertLess(
+            candidate.index("docker/login-action@"),
+            candidate.index("Build and push the two-platform candidate exactly once"),
+        )
+        self.assertLess(
+            candidate.index("Build and push the two-platform candidate exactly once"),
+            candidate.index("Verify the attestation registry credential binding"),
+        )
+        self.assertLess(
+            candidate.index("Verify the attestation registry credential binding"),
+            candidate.index("Attest the exact candidate index"),
+        )
+        self.assertLess(
+            candidate.index("Attest the exact candidate index"),
+            candidate.index("Read back index, platforms, attestations"),
+        )
+        self.assertLess(
+            candidate.index("Read back index, platforms, attestations"),
+            candidate.index("Preserve the exact candidate witness"),
+        )
+
+        self.assertIn(
+            '${RUNNER_TEMP}/opencodex-runtime-arm64-docker-config', linux
+        )
+        self.assertIn(
+            '${RUNNER_TEMP}/opencodex-runtime-qualification-docker-config',
+            qualification,
+        )
+        candidate_artifact = candidate.split(
+            "Preserve the exact candidate witness", 1
+        )[1]
+        self.assertIn(
+            "path: ${{ runner.temp }}/opencodex-runtime-candidate",
+            candidate_artifact,
+        )
+        self.assertNotIn("$DOCKER_CONFIG", candidate_artifact)
+        self.assertNotIn("/home/runner/.docker", candidate_artifact)
+        self.assertNotIn("${HOME}", candidate_artifact)
+        self.assertNotIn("$HOME", candidate_artifact)
+
     def test_npm_provenance_is_pinned_and_rechecked_at_build_boundaries(self):
         helper = self.text("tools/opencodex_npm_provenance.py")
         identity_helper = self.text("tools/verify_npm_slsa_identity.cjs")
