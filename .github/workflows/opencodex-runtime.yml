@@ -67,34 +67,46 @@ jobs:
       - name: Install the reviewed Buildx CLI before first execution
         run: |
           set -euo pipefail
-          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
-          [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]
-          [[ "$(id -un)" == runner ]]
+          fail() {
+            printf 'ERROR: candidate Docker preflight rejected %s\n' "$1" >&2
+            exit 1
+          }
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]] || fail runner-environment
+          [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]] || fail runner-platform
+          [[ "$(id -un)" == runner ]] || fail runner-user
           expected_home="/home/runner"
           passwd_home="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
           node_home="$(node -p 'require("os").homedir()')"
-          [[ "$HOME" == "$expected_home" ]]
-          [[ "$passwd_home" == "$expected_home" ]]
-          [[ "$node_home" == "$expected_home" ]]
-          [[ -d "$expected_home" && ! -L "$expected_home" ]]
-          [[ "$(stat -c '%u' "$expected_home")" == "$(id -u)" ]]
-          [[ "$DOCKER_CONFIG" == "${expected_home}/.docker" ]]
+          [[ "$HOME" == "$expected_home" ]] || fail environment-home
+          [[ "$passwd_home" == "$expected_home" ]] || fail passwd-home
+          [[ "$node_home" == "$expected_home" ]] || fail node-home
+          [[ -d "$expected_home" && ! -L "$expected_home" ]] || fail runner-home-type
+          [[ "$(stat -c '%u' "$expected_home")" == "$(id -u)" ]] || fail runner-home-owner
+          [[ "$DOCKER_CONFIG" == "${expected_home}/.docker" ]] || fail docker-config-path
           umask 077
           plugin_dir="${DOCKER_CONFIG}/cli-plugins"
           download="${RUNNER_TEMP}/docker-buildx-v0.30.1.download"
           plugin="${plugin_dir}/docker-buildx"
           config="${DOCKER_CONFIG}/config.json"
           if [[ -e "$DOCKER_CONFIG" || -L "$DOCKER_CONFIG" ]]; then
-            [[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
-            [[ "$(stat -c '%u:%a' "$DOCKER_CONFIG")" == "$(id -u):700" ]]
+            [[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]] || fail docker-home-type
+            [[ "$(stat -c '%u' "$DOCKER_CONFIG")" == "$(id -u)" ]] || fail docker-home-owner
+            directory_mode="$(stat -c '%a' "$DOCKER_CONFIG")"
+            [[ "$directory_mode" == 700 || "$directory_mode" == 755 ]] || fail docker-home-mode
             unexpected="$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 ! -name config.json -print -quit)"
-            [[ -z "$unexpected" ]]
+            [[ -z "$unexpected" ]] || fail docker-home-children
+            chmod 0700 "$DOCKER_CONFIG"
+            [[ "$(stat -c '%u:%a' "$DOCKER_CONFIG")" == "$(id -u):700" ]] || fail docker-home-normalization
           fi
           if [[ -e "$config" || -L "$config" ]]; then
-            [[ -f "$config" && ! -L "$config" ]]
-            [[ "$(stat -c '%u:%a:%h' "$config")" == "$(id -u):600:1" ]]
+            [[ -f "$config" && ! -L "$config" ]] || fail docker-config-type
+            [[ "$(stat -c '%u:%h' "$config")" == "$(id -u):1" ]] || fail docker-config-owner-link
+            config_mode="$(stat -c '%a' "$config")"
+            [[ "$config_mode" == 600 || "$config_mode" == 644 ]] || fail docker-config-mode
             size="$(stat -c '%s' "$config")"
-            [[ "$size" =~ ^[0-9]+$ && "$size" -ge 1 && "$size" -le 16384 ]]
+            [[ "$size" =~ ^[0-9]+$ && "$size" -ge 1 && "$size" -le 16384 ]] || fail docker-config-size
+            chmod 0600 "$config"
+            [[ "$(stat -c '%u:%a:%h' "$config")" == "$(id -u):600:1" ]] || fail docker-config-normalization
             python3 - "$config" <<'PY'
           import json
           import pathlib
@@ -137,18 +149,18 @@ jobs:
           PY
           fi
           install -d -m 0700 "$DOCKER_CONFIG" "$plugin_dir"
-          [[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
-          [[ -d "$plugin_dir" && ! -L "$plugin_dir" ]]
-          [[ "$(stat -c '%u:%a' "$DOCKER_CONFIG")" == "$(id -u):700" ]]
-          [[ "$(stat -c '%u:%a' "$plugin_dir")" == "$(id -u):700" ]]
-          [[ ! -e "$download" && ! -L "$download" && ! -e "$plugin" && ! -L "$plugin" ]]
+          [[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]] || fail docker-home-create
+          [[ -d "$plugin_dir" && ! -L "$plugin_dir" ]] || fail buildx-plugin-directory
+          [[ "$(stat -c '%u:%a' "$DOCKER_CONFIG")" == "$(id -u):700" ]] || fail docker-home-final-mode
+          [[ "$(stat -c '%u:%a' "$plugin_dir")" == "$(id -u):700" ]] || fail buildx-plugin-directory-mode
+          [[ ! -e "$download" && ! -L "$download" && ! -e "$plugin" && ! -L "$plugin" ]] || fail buildx-download-state
           curl --fail --location --proto '=https' --tlsv1.2 \
             --output "$download" "$BUILDX_DOWNLOAD_URL"
-          [[ "$(sha256sum "$download" | awk '{print $1}')" == "$BUILDX_SHA256" ]]
+          [[ "$(sha256sum "$download" | awk '{print $1}')" == "$BUILDX_SHA256" ]] || fail buildx-download-digest
           install -m 0555 "$download" "$plugin"
           rm -f -- "$download"
-          [[ "$(sha256sum "$plugin" | awk '{print $1}')" == "$BUILDX_SHA256" ]]
-          [[ "$(docker buildx version)" == "$BUILDX_VERSION_OUTPUT" ]]
+          [[ "$(sha256sum "$plugin" | awk '{print $1}')" == "$BUILDX_SHA256" ]] || fail buildx-install-digest
+          [[ "$(docker buildx version)" == "$BUILDX_VERSION_OUTPUT" ]] || fail buildx-version
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
           cache-image: false

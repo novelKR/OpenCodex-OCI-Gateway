@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 
+import json
+import os
 import pathlib
+import pwd
 import re
+import stat
+import subprocess
 import unittest
 
 
@@ -11,6 +16,113 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 class RuntimeWorkflowContractTests(unittest.TestCase):
     def text(self, relative: str) -> str:
         return (ROOT / relative).read_text(encoding="utf-8")
+
+    def test_github_hosted_candidate_docker_baseline_matches_input_policy(self):
+        if os.environ.get("GITHUB_ACTIONS") != "true":
+            self.skipTest("GitHub-hosted candidate input policy")
+
+        def require(condition: bool, phase: str) -> None:
+            if not condition:
+                raise self.failureException(
+                    f"candidate Docker baseline rejected: {phase}"
+                )
+
+        require(os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted", "environment")
+        require(os.environ.get("RUNNER_OS") == "Linux", "operating-system")
+        require(os.environ.get("RUNNER_ARCH") == "X64", "architecture")
+        require(pwd.getpwuid(os.getuid()).pw_name == "runner", "user")
+
+        expected_home = "/home/runner"
+        require(os.environ.get("HOME") == expected_home, "environment-home")
+        require(pwd.getpwuid(os.getuid()).pw_dir == expected_home, "passwd-home")
+        node_home = subprocess.run(
+            ["node", "-p", 'require("os").homedir()'],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        require(node_home == expected_home, "node-home")
+
+        home = pathlib.Path(expected_home)
+        home_stat = home.lstat()
+        require(stat.S_ISDIR(home_stat.st_mode), "runner-home-type")
+        require(not stat.S_ISLNK(home_stat.st_mode), "runner-home-symlink")
+        require(home_stat.st_uid == os.getuid(), "runner-home-owner")
+
+        docker_config = home / ".docker"
+        if not os.path.lexists(docker_config):
+            return
+        docker_stat = docker_config.lstat()
+        require(stat.S_ISDIR(docker_stat.st_mode), "docker-home-type")
+        require(not stat.S_ISLNK(docker_stat.st_mode), "docker-home-symlink")
+        require(docker_stat.st_uid == os.getuid(), "docker-home-owner")
+        require(
+            stat.S_IMODE(docker_stat.st_mode) in {0o700, 0o755},
+            "docker-home-mode",
+        )
+
+        children = list(docker_config.iterdir())
+        require(
+            all(path.name == "config.json" for path in children),
+            "docker-home-children",
+        )
+        config = docker_config / "config.json"
+        if not os.path.lexists(config):
+            return
+        config_stat = config.lstat()
+        require(stat.S_ISREG(config_stat.st_mode), "docker-config-type")
+        require(not stat.S_ISLNK(config_stat.st_mode), "docker-config-symlink")
+        require(config_stat.st_uid == os.getuid(), "docker-config-owner")
+        require(config_stat.st_nlink == 1, "docker-config-link-count")
+        require(
+            stat.S_IMODE(config_stat.st_mode) in {0o600, 0o644},
+            "docker-config-mode",
+        )
+        require(1 <= config_stat.st_size <= 16384, "docker-config-size")
+
+        def strict_object(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate field")
+                value[key] = item
+            return value
+
+        try:
+            document = json.loads(
+                config.read_text(encoding="utf-8"), object_pairs_hook=strict_object
+            )
+        except (OSError, UnicodeError, ValueError):
+            raise self.failureException(
+                "candidate Docker baseline rejected: docker-config-json"
+            ) from None
+        require(
+            isinstance(document, dict) and set(document) == {"auths"},
+            "docker-config-fields",
+        )
+        auths = document["auths"]
+        docker_hub_aliases = {
+            "docker.io",
+            "index.docker.io",
+            "registry-1.docker.io",
+            "https://index.docker.io/v1/",
+        }
+        require(
+            isinstance(auths, dict)
+            and len(auths) <= 1
+            and set(auths).issubset(docker_hub_aliases),
+            "docker-config-registry",
+        )
+        for entry in auths.values():
+            require(
+                isinstance(entry, dict) and set(entry) == {"auth"},
+                "docker-config-entry-fields",
+            )
+            auth = entry["auth"]
+            require(
+                isinstance(auth, str) and 1 <= len(auth) <= 4096,
+                "docker-config-entry",
+            )
 
     def test_upstream_watch_separates_read_only_detection_from_app_writer(self):
         workflow = self.text(".github/workflows/opencodex-upstream-watch.yml")
@@ -296,6 +408,8 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         )
 
         for expected in (
+            "fail() {",
+            "ERROR: candidate Docker preflight rejected %s",
             '[[ "$RUNNER_ENVIRONMENT" == github-hosted ]]',
             '[[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]',
             '[[ "$(id -un)" == runner ]]',
@@ -311,9 +425,17 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
             'config="${DOCKER_CONFIG}/config.json"',
             'if [[ -e "$DOCKER_CONFIG" || -L "$DOCKER_CONFIG" ]]',
             '[[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]',
+            'directory_mode="$(stat -c \'%a\' "$DOCKER_CONFIG")"',
+            '[[ "$directory_mode" == 700 || "$directory_mode" == 755 ]]',
             'find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 ! -name config.json',
+            'chmod 0700 "$DOCKER_CONFIG"',
+            "docker-home-normalization",
             'if [[ -e "$config" || -L "$config" ]]',
             '[[ -f "$config" && ! -L "$config" ]]',
+            'config_mode="$(stat -c \'%a\' "$config")"',
+            '[[ "$config_mode" == 600 || "$config_mode" == 644 ]]',
+            'chmod 0600 "$config"',
+            "docker-config-normalization",
             '$(id -u):600:1',
             '"$size" -le 16384',
             "DOCKER_HUB_ALIASES = {",
@@ -333,6 +455,53 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("DOCKER_CONFIG=%s", installer)
         self.assertNotRegex(candidate, r"(?m)^\s*(?:export\s+)?HOME=")
         self.assertNotRegex(candidate, r"(?m)^\s+HOME:")
+
+        docker_home_input = installer.split(
+            'if [[ -e "$DOCKER_CONFIG" || -L "$DOCKER_CONFIG" ]]', 1
+        )[1].split('chmod 0700 "$DOCKER_CONFIG"', 1)[0]
+        docker_config_input = installer.split(
+            'if [[ -e "$config" || -L "$config" ]]', 1
+        )[1].split('chmod 0600 "$config"', 1)[0]
+        self.assertNotIn("$(id -u):700", docker_home_input)
+        self.assertNotIn("$(id -u):600:1", docker_config_input)
+        self.assertLess(
+            installer.index('directory_mode="$(stat -c \'%a\' "$DOCKER_CONFIG")"'),
+            installer.index('chmod 0700 "$DOCKER_CONFIG"'),
+        )
+        self.assertLess(
+            installer.index('config_mode="$(stat -c \'%a\' "$config")"'),
+            installer.index('chmod 0600 "$config"'),
+        )
+
+        hosted_policy = self.text(
+            "pilot/tests/test_opencodex_runtime_workflows.py"
+        ).split(
+            "def test_github_hosted_candidate_docker_baseline_matches_input_policy",
+            1,
+        )[1].split("def test_upstream_watch_separates_read_only_detection", 1)[0]
+        for expected in (
+            'os.environ.get("GITHUB_ACTIONS") != "true"',
+            'os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"',
+            'os.environ.get("RUNNER_OS") == "Linux"',
+            'os.environ.get("RUNNER_ARCH") == "X64"',
+            'pwd.getpwuid(os.getuid()).pw_name == "runner"',
+            'expected_home = "/home/runner"',
+            "stat.S_IMODE(docker_stat.st_mode) in {0o700, 0o755}",
+            "config_stat.st_nlink == 1",
+            "stat.S_IMODE(config_stat.st_mode) in {0o600, 0o644}",
+            'set(document) == {"auths"}',
+            "set(auths).issubset(docker_hub_aliases)",
+        ):
+            self.assertIn(expected, hosted_policy)
+        for forbidden in (
+            "print(",
+            "hashlib",
+            "base64",
+            "GITHUB_OUTPUT",
+            "GITHUB_STEP_SUMMARY",
+            "upload-artifact",
+        ):
+            self.assertNotIn(forbidden, hosted_policy)
 
         login = candidate.split("- name: Log into ghcr.io", 1)[1].split(
             "- name: Bind candidate identity", 1
