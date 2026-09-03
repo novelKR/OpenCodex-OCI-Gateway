@@ -380,6 +380,39 @@ def assert_no_secret(data: str, markers: list[str], description: str) -> None:
         fail(f"{description} contains a secret marker")
 
 
+def emit_runtime_diagnostics(container: str, markers: list[str]) -> None:
+    state = docker(
+        "inspect", "--format", "{{json .State}}", container, check=False, timeout=15
+    )
+    logs = docker("logs", "--tail", "200", container, check=False, timeout=15)
+    diagnostic = "".join(
+        (
+            "runtime container state:\n",
+            state.stdout,
+            state.stderr,
+            "runtime container logs:\n",
+            logs.stdout,
+            logs.stderr,
+        )
+    )
+    assert_no_secret(diagnostic, markers, "runtime failure diagnostic")
+    encoded = diagnostic.encode("utf-8", errors="replace")
+    if len(encoded) > 64 * 1024:
+        encoded = encoded[: 64 * 1024]
+        diagnostic = encoded.decode("utf-8", errors="ignore") + "\n[diagnostic truncated]\n"
+    print(diagnostic, file=sys.stderr, end="" if diagnostic.endswith("\n") else "\n")
+
+
+def wait_health_with_diagnostics(
+    base_url: str, container: str, markers: list[str]
+) -> dict[str, Any]:
+    try:
+        return wait_health(base_url)
+    except ContractError:
+        emit_runtime_diagnostics(container, markers)
+        raise
+
+
 def main_contract(arguments: argparse.Namespace) -> None:
     if arguments.api_token or arguments.admin_token:
         fail("tokens may not be supplied through command-line options")
@@ -459,7 +492,7 @@ def main_contract(arguments: argparse.Namespace) -> None:
             owned.append(runtime)
             server.wait()
 
-            health = wait_health(base_url)
+            health = wait_health_with_diagnostics(base_url, runtime, markers)
             if health.get("service") != "opencodex" or health.get("status") != "ok" or health.get("port") != 10100:
                 fail("health identity does not report guest service port 10100")
             request_json(base_url + "/v1/models", expected=401)
@@ -481,7 +514,7 @@ def main_contract(arguments: argparse.Namespace) -> None:
                     "exec", fixture, "bun", "-e", CANCELLATION_STATUS_SCRIPT
                 ).stdout
             )
-            wait_health(base_url)
+            wait_health_with_diagnostics(base_url, runtime, markers)
             websocket_response(base_url, model, api_token)
 
             for description, captured in (
@@ -529,7 +562,7 @@ def main_contract(arguments: argparse.Namespace) -> None:
             ).stdout.strip()
             owned.append(runtime)
             second_server.wait()
-            wait_health(base_url)
+            wait_health_with_diagnostics(base_url, runtime, second_markers)
             request_json(base_url + "/v1/models", {TOKEN_HEADER: second_api})
             request_json(base_url + "/v1/models", {TOKEN_HEADER: second_admin}, expected=401)
             request_json(base_url + "/api/config", {TOKEN_HEADER: second_api}, expected=401)

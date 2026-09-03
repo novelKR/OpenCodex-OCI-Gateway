@@ -30,14 +30,22 @@ jobs:
         run: |
           test_tmp="/opencodex-ci-tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "$test_tmp"
-          trap 'sudo rmdir -- "$test_tmp"' EXIT
+          cleanup() {
+            sudo find "$test_tmp" -depth -mindepth 1 -delete
+            sudo rmdir -- "$test_tmp"
+          }
+          trap cleanup EXIT
           TMPDIR="$test_tmp" python3 -m unittest discover -s pilot/tests -p 'test_*.py'
       - name: Go test, race, and vet
         working-directory: client/relay
         run: |
           test_tmp="/opencodex-go-ci-tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "$test_tmp"
-          trap 'sudo rmdir -- "$test_tmp"' EXIT
+          cleanup() {
+            sudo find "$test_tmp" -depth -mindepth 1 -delete
+            sudo rmdir -- "$test_tmp"
+          }
+          trap cleanup EXIT
           TMPDIR="$test_tmp" go test ./...
           TMPDIR="$test_tmp" go test -race ./...
           TMPDIR="$test_tmp" go vet ./...

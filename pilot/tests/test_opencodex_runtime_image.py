@@ -8,6 +8,7 @@ import socket
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -108,6 +109,21 @@ class RuntimeImageContractTests(unittest.TestCase):
                 runtime_image.receive_exact(client, 4)
             with self.assertRaisesRegex(runtime_image.ContractError, "exchange failed"):
                 server.wait()
+
+    def test_failure_diagnostics_are_bounded_and_secret_scanned(self):
+        clean = runtime_image.subprocess.CompletedProcess([], 0, '{"Running":false}\n', "")
+        logs = runtime_image.subprocess.CompletedProcess([], 0, "bounded failure\n", "")
+        with mock.patch.object(runtime_image, "docker", side_effect=(clean, logs)), mock.patch(
+            "sys.stderr"
+        ) as stderr:
+            runtime_image.emit_runtime_diagnostics("container-id", ["secret-marker"])
+        rendered = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertIn("bounded failure", rendered)
+
+        leaked = runtime_image.subprocess.CompletedProcess([], 0, "secret-marker\n", "")
+        with mock.patch.object(runtime_image, "docker", side_effect=(clean, leaked)):
+            with self.assertRaisesRegex(runtime_image.ContractError, "contains a secret marker"):
+                runtime_image.emit_runtime_diagnostics("container-id", ["secret-marker"])
 
 
 if __name__ == "__main__":
