@@ -674,6 +674,63 @@ func TestAppleCLIStopAndDeleteRequireCompleteStartWitness(t *testing.T) {
 	}
 }
 
+func TestAppleCLIContainerStateRequiresExactRunningOwnedInspect(t *testing.T) {
+	directory := shortSocketTestDirectory(t)
+	spec := readbackStartSpec(t, directory)
+	object := inspectedContainer(spec)
+	body, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedCommandRunner{run: func(_ string, arguments []string, _ []byte) (commandOutput, error) {
+		if !reflect.DeepEqual(arguments, []string{"inspect", ContainerName}) {
+			t.Fatalf("container state arguments = %#v", arguments)
+		}
+		return commandOutput{stdout: append([]byte(nil), body...)}, nil
+	}}
+	cli := newAppleCLIWithRunner(runner)
+	cli.socketDirectory = directory
+
+	for _, test := range []struct {
+		name  string
+		state any
+		want  FixedContainerState
+	}{
+		{name: "running", state: "running", want: FixedContainerRunningOwned},
+		{name: "stopped", state: "stopped", want: FixedContainerStoppedOwned},
+		{name: "stopping", state: "stopping", want: FixedContainerUnknown},
+		{name: "exited", state: "exited", want: FixedContainerUnknown},
+		{name: "unknown spelling", state: "ready", want: FixedContainerUnknown},
+		{name: "missing", state: nil, want: FixedContainerUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := map[string]any{}
+			if test.state != nil {
+				status["state"] = test.state
+			}
+			object["status"] = status
+			body, _ = json.Marshal(object)
+			got, err := cli.ContainerState(context.Background(), ContainerName, spec)
+			if err != nil || got != test.want {
+				t.Fatalf("ContainerState = %q, %v; want %q", got, err, test.want)
+			}
+		})
+	}
+
+	object["status"] = map[string]any{"state": "running"}
+	configuration := object["configuration"].(map[string]any)
+	configuration["labels"].(map[string]string)[labelOperation] = strings.Repeat("9", 64)
+	body, _ = json.Marshal(object)
+	if got, err := cli.ContainerState(context.Background(), ContainerName, spec); err != nil || got != FixedContainerForeign {
+		t.Fatalf("foreign ContainerState = %q, %v", got, err)
+	}
+
+	body = []byte("[]")
+	if got, err := cli.ContainerState(context.Background(), ContainerName, spec); err != nil || got != FixedContainerAbsent {
+		t.Fatalf("absent ContainerState = %q, %v", got, err)
+	}
+}
+
 func TestAppleCLIRefusesForeignFixedContainerAndOccupiedPort(t *testing.T) {
 	foreignList := []byte(`[{"id":"opencodex-relay-runtime","configuration":{"id":"opencodex-relay-runtime","labels":{"io.github.novelkr.opencodex.runtime.owner":"other","io.github.novelkr.opencodex.runtime.installation":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}}]`)
 	runner := &scriptedCommandRunner{run: func(_ string, _ []string, _ []byte) (commandOutput, error) {

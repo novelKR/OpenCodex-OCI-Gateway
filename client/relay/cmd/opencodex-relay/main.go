@@ -9,18 +9,24 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/containerruntime"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/handoff"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/lifecyclelock"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/proxy"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/runtimemanifest"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/scheduler"
 )
 
 var version = "dev"
+
+const runtimeTrustKeyName = "opencodex-runtime-release-ed25519.pub"
 
 func main() {
 	configPath, err := config.DefaultConfigPath()
@@ -56,11 +62,21 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	home, homeErr := os.UserHomeDir()
+	runtimeRoot, runtimeRootErr := containerruntime.DefaultRoot(filepath.Clean(home))
+	runtimePublicKey, runtimePublicKeyErr := readBundledRuntimeTrustKey()
+	appleCLI := containerruntime.NewAppleCLI()
 	routingWatcher := routing.NewWatcher(
 		routingStore,
 		250*time.Millisecond,
 		routing.WithDriftCheck(routing.AppliedRoutingDriftCheck(configPath)),
 		routing.WithWatcherRecoveryGate(func() error { return handoff.RemovalRoutingGate(configPath) }),
+		routing.WithWatcherStateRecoveryGate(func(state routing.State) error {
+			if homeErr != nil || runtimeRootErr != nil || runtimePublicKeyErr != nil {
+				return containerruntime.ErrRecoveryRequired
+			}
+			return containerruntime.ValidateActiveRoutingAuthority(runtimeRoot, state.Generation, version, runtimePublicKey)
+		}),
 	)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -74,7 +90,46 @@ func main() {
 	var control *routing.ControlServer
 	var generalHandler, interactiveHandler http.Handler
 	if cfg.UpstreamMode == config.UpstreamModeExternalGateway {
-		runtime, err = newRelayRuntime(ctx, configPath, cfg, routingWatcher, tracker, logger)
+		appleLease := func(leaseCtx context.Context) (func() error, error) {
+			if homeErr != nil {
+				return nil, containerruntime.ErrRecoveryRequired
+			}
+			lock, lockErr := lifecyclelock.AcquireReader(
+				leaseCtx,
+				filepath.Clean(home),
+				os.Getenv(lifecyclelock.SourceInstallReservationEnvironment),
+			)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			return lock.Close, nil
+		}
+		appleGuard := func(guardCtx context.Context, routingGeneration uint64) error {
+			if homeErr != nil || runtimeRootErr != nil || runtimePublicKeyErr != nil {
+				return containerruntime.ErrRecoveryRequired
+			}
+			return containerruntime.ValidateActiveRuntimeBeforeCredentials(
+				guardCtx,
+				runtimeRoot,
+				routingGeneration,
+				version,
+				runtimePublicKey,
+				appleCLI,
+			)
+		}
+		runtime, err = newRelayRuntime(
+			ctx,
+			configPath,
+			cfg,
+			routingWatcher,
+			tracker,
+			logger,
+			appleRuntimeAccess{
+				lease:          appleLease,
+				guard:          appleGuard,
+				loadCredential: credentials.LoadContext,
+			},
+		)
 		if err != nil {
 			fatal(err)
 		}
@@ -187,4 +242,23 @@ func serveListener(server *http.Server, listener net.Listener, results chan<- er
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 	os.Exit(1)
+}
+
+func readBundledRuntimeTrustKey() ([]byte, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		return nil, err
+	}
+	contents := filepath.Dir(filepath.Dir(filepath.Dir(resolved)))
+	path := filepath.Join(contents, "Resources", "RuntimeTrust", runtimeTrustKeyName)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o022 != 0 || info.Size() <= 0 || info.Size() > runtimemanifest.MaximumPublicKeyBytes {
+		return nil, containerruntime.ErrUnsafeState
+	}
+	return os.ReadFile(path)
 }

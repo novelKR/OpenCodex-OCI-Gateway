@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 
-import base64
-import hashlib
-import os
 import pathlib
 import re
-import subprocess
-import tempfile
 import unittest
 
 
@@ -66,6 +61,7 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         workflow = self.text(".github/workflows/ci.yml")
         runtime = workflow.split("\n  runtime-image:\n", 1)[1]
         self.assertIn("name: runtime-image", runtime)
+        self.assertIn("timeout-minutes: 60", runtime)
         self.assertIn("runtime-image: not applicable", runtime)
         self.assertIn('".github/workflows/ci.yml"', runtime)
         self.assertIn("--target runtime", runtime)
@@ -265,6 +261,53 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, workflow)
         self.assertNotIn(":latest", workflow)
 
+    def test_npm_provenance_is_pinned_and_rechecked_at_build_boundaries(self):
+        helper = self.text("tools/opencodex_npm_provenance.py")
+        identity_helper = self.text("tools/verify_npm_slsa_identity.cjs")
+        upstream = self.text("tools/opencodex_upstream.py")
+        ci = self.text(".github/workflows/ci.yml")
+        runtime = self.text(".github/workflows/opencodex-runtime.yml")
+        gateway_release = self.text(".github/workflows/container-release.yml")
+        watch = self.text(".github/workflows/opencodex-upstream-watch.yml")
+
+        self.assertIn('NPM_PROVENANCE_VERIFIER_VERSION = "11.19.1"', helper)
+        self.assertIn(
+            "sha512-ztsxKxt/kkIaAs+2i0GU6I+DRmUdrNasxTZKJe9TCdSjKxlhah/4r/",
+            helper,
+        )
+        self.assertIn(
+            "node:24.20.0-bookworm-slim@",
+            helper,
+        )
+        self.assertIn(
+            "sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e",
+            helper,
+        )
+        self.assertIn(
+            '["audit", "signatures", "--json", "--include-attestations"]',
+            helper,
+        )
+        self.assertIn('f"--user={os.getuid()}:{os.getgid()}"', helper)
+        self.assertIn("certificateIdentityURI: CERTIFICATE_IDENTITY_PATTERN", identity_helper)
+        self.assertIn("certificateIssuer: CERTIFICATE_ISSUER", identity_helper)
+        self.assertIn("^https://github\\\\.com/lidge-jun/opencodex/", identity_helper)
+        self.assertIn("https://token.actions.githubusercontent.com", identity_helper)
+        self.assertIn("validate_slsa_identity_evidence", helper)
+        self.assertIn("npm_version_json(NPM_PACKAGE, version)", upstream)
+        self.assertIn('git_head != revision', upstream)
+        self.assertIn("client.verify_npm_provenance", upstream)
+        for workflow in (ci, runtime, gateway_release, watch):
+            self.assertIn("--verify-provenance", workflow)
+
+    def test_candidate_only_tree_has_no_stable_creator_or_publisher(self):
+        manifest = self.text("tools/opencodex_runtime_manifest.py")
+        self.assertFalse((ROOT / "tools/publish-opencodex-runtime-release.sh").exists())
+        self.assertNotIn('commands.add_parser("create")', manifest)
+        self.assertNotIn("def command_create(", manifest)
+        self.assertIn('commands.add_parser("create-candidate")', manifest)
+        self.assertIn('commands.add_parser("verify-candidate")', manifest)
+        self.assertIn('commands.add_parser("verify")', manifest)
+
     def test_runtime_builder_tools_are_immutable_before_privileged_use(self):
         workflow = self.text(".github/workflows/opencodex-runtime.yml")
         candidate = workflow.split("  candidate:\n", 1)[1].split(
@@ -346,325 +389,6 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("tonistiigi/binfmt:latest", workflow)
         self.assertNotIn("moby/buildkit:buildx-stable-1", workflow)
 
-    def test_runtime_release_publisher_is_immutable_two_asset_and_latest_false(self):
-        publisher = self.text("tools/publish-opencodex-runtime-release.sh")
-        self.assertIn("release input is not the exact two-asset set", publisher)
-        self.assertIn('find "$input_dir" -mindepth 1 -maxdepth 1 -exec basename', publisher)
-        self.assertGreaterEqual(publisher.count("--latest=false"), 2)
-        self.assertIn(".immutable == true", publisher)
-        self.assertIn("unexpectedly replaced releases/latest", publisher)
-        self.assertIn("already exists and will not be moved", publisher)
-        self.assertIn("existing immutable runtime release differs from the exact retry input", publisher)
-        self.assertIn("retry=verified", publisher)
-        self.assertIn('git/commits/${source_revision}', publisher)
-        self.assertNotIn("commits/main", publisher)
-        self.assertIn("release_attempted=true", publisher)
-        self.assertIn("opencodex-runtime-release-operation:", publisher)
-        self.assertIn("exact operation, target, and asset witness", publisher)
-        self.assertIn("an incomplete runtime tag exists without an attributable draft release", publisher)
-        draft_verifier = publisher.split("verify_release() {", 1)[1].split(
-            "verify_release true", 1
-        )[0]
-        for field in (
-            'manifest_digest "$manifest_digest"',
-            'signature_digest "$signature_digest"',
-            'manifest_size "$manifest_size"',
-            'signature_size "$signature_size"',
-            '.state == "uploaded"',
-            '.digest == $manifest_digest and .size == $manifest_size',
-            '.digest == $signature_digest and .size == $signature_size',
-        ):
-            self.assertIn(field, draft_verifier)
-        self.assertLess(
-            publisher.index("verify_release true"),
-            publisher.index('gh release edit "$release_tag"'),
-        )
-        self.assertLess(
-            publisher.index("release_attempted=true"),
-            publisher.index('gh release create "$release_tag"'),
-        )
-        self.assertNotIn("--clobber", publisher)
-
-    def test_runtime_release_publisher_rejects_corrupt_draft_assets_before_edit(self):
-        from pilot.tests.test_opencodex_runtime_manifest import (
-            manifest_document,
-            runtime,
-        )
-
-        publisher = ROOT / "tools" / "publish-opencodex-runtime-release.sh"
-        artifact_version = "2.40.0-r1"
-        source_revision = "1" * 40
-        release_tag = f"opencodex-runtime-{artifact_version}"
-
-        with tempfile.TemporaryDirectory() as temporary_name:
-            temporary = pathlib.Path(temporary_name)
-            assets = temporary / "assets"
-            assets.mkdir()
-            private_key = temporary / "runtime-private.pem"
-            public_key = temporary / "runtime-public.pem"
-            public_der = temporary / "runtime-public.der"
-            signature_binary = temporary / "runtime.sig.bin"
-            manifest = assets / f"{release_tag}.json"
-            signature = assets / f"{release_tag}.sig"
-            subprocess.run(
-                [
-                    "openssl",
-                    "genpkey",
-                    "-algorithm",
-                    "ED25519",
-                    "-out",
-                    str(private_key),
-                ],
-                check=True,
-                capture_output=True,
-            )
-            subprocess.run(
-                [
-                    "openssl",
-                    "pkey",
-                    "-in",
-                    str(private_key),
-                    "-pubout",
-                    "-out",
-                    str(public_key),
-                ],
-                check=True,
-                capture_output=True,
-            )
-            subprocess.run(
-                [
-                    "openssl",
-                    "pkey",
-                    "-pubin",
-                    "-in",
-                    str(public_key),
-                    "-outform",
-                    "DER",
-                    "-out",
-                    str(public_der),
-                ],
-                check=True,
-                capture_output=True,
-            )
-            document = manifest_document()
-            document["trust_key_id"] = hashlib.sha256(
-                public_der.read_bytes()
-            ).hexdigest()
-            manifest.write_bytes(runtime.canonical_manifest(document))
-            subprocess.run(
-                [
-                    "openssl",
-                    "pkeyutl",
-                    "-sign",
-                    "-inkey",
-                    str(private_key),
-                    "-rawin",
-                    "-in",
-                    str(manifest),
-                    "-out",
-                    str(signature_binary),
-                ],
-                check=True,
-                capture_output=True,
-            )
-            signature.write_text(
-                base64.b64encode(signature_binary.read_bytes()).decode("ascii") + "\n",
-                encoding="utf-8",
-            )
-
-            fake_bin = temporary / "bin"
-            fake_bin.mkdir()
-            fake_gh = fake_bin / "gh"
-            fake_gh.write_text(
-                """#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
-
-asset_json() {
-  local naming="$1"
-  local manifest_digest="sha256:$(shasum -a 256 "$FAKE_MANIFEST" | awk '{print $1}')"
-  local signature_digest="sha256:$(shasum -a 256 "$FAKE_SIGNATURE" | awk '{print $1}')"
-  local manifest_size signature_size draft immutable
-  manifest_size="$(wc -c < "$FAKE_MANIFEST" | tr -d ' ')"
-  signature_size="$(wc -c < "$FAKE_SIGNATURE" | tr -d ' ')"
-  draft="$(cat "$FAKE_GH_STATE/draft")"
-  immutable=false
-  [[ "$draft" == true ]] || immutable=true
-  if [[ "$FAKE_DRAFT_CORRUPTION" == manifest-digest ]]; then
-    manifest_digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  elif [[ "$FAKE_DRAFT_CORRUPTION" == manifest-size ]]; then
-    manifest_size="$((manifest_size + 1))"
-  elif [[ "$FAKE_DRAFT_CORRUPTION" == signature-digest ]]; then
-    signature_digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  elif [[ "$FAKE_DRAFT_CORRUPTION" == signature-size ]]; then
-    signature_size="$((signature_size + 1))"
-  fi
-  if [[ "$naming" == camel ]]; then
-    jq -n \
-      --arg tag "$FAKE_RELEASE_TAG" \
-      --arg revision "$FAKE_SOURCE_REVISION" \
-      --arg body "$(cat "$FAKE_GH_STATE/notes")" \
-      --arg manifest "$(basename "$FAKE_MANIFEST")" \
-      --arg signature "$(basename "$FAKE_SIGNATURE")" \
-      --arg manifest_digest "$manifest_digest" \
-      --arg signature_digest "$signature_digest" \
-      --argjson manifest_size "$manifest_size" \
-      --argjson signature_size "$signature_size" \
-      --argjson draft "$draft" \
-      '{tagName:$tag,targetCommitish:$revision,isDraft:$draft,isPrerelease:false,body:$body,assets:[{name:$manifest,state:"uploaded",digest:$manifest_digest,size:$manifest_size},{name:$signature,state:"uploaded",digest:$signature_digest,size:$signature_size}]}'
-  else
-    jq -n \
-      --arg tag "$FAKE_RELEASE_TAG" \
-      --arg revision "$FAKE_SOURCE_REVISION" \
-      --arg body "$(cat "$FAKE_GH_STATE/notes")" \
-      --arg manifest "$(basename "$FAKE_MANIFEST")" \
-      --arg signature "$(basename "$FAKE_SIGNATURE")" \
-      --arg manifest_digest "$manifest_digest" \
-      --arg signature_digest "$signature_digest" \
-      --argjson manifest_size "$manifest_size" \
-      --argjson signature_size "$signature_size" \
-      --argjson draft "$draft" \
-      --argjson immutable "$immutable" \
-      '{tag_name:$tag,target_commitish:$revision,draft:$draft,prerelease:false,immutable:$immutable,body:$body,assets:[{name:$manifest,state:"uploaded",digest:$manifest_digest,size:$manifest_size},{name:$signature,state:"uploaded",digest:$signature_digest,size:$signature_size}]}'
-  fi
-}
-
-if [[ ${1:-} == api ]]; then
-  endpoint="${2:-}"
-  if [[ "$endpoint" == "repos/${FAKE_REPOSITORY}" ]]; then
-    printf 'public\\n'
-    exit 0
-  fi
-  if [[ "$endpoint" == "repos/${FAKE_REPOSITORY}/git/commits/${FAKE_SOURCE_REVISION}" ]]; then
-    printf '%s\\n' "$FAKE_SOURCE_REVISION"
-    exit 0
-  fi
-  if [[ "$endpoint" == "repos/${FAKE_REPOSITORY}/releases/tags/${FAKE_RELEASE_TAG}" ]]; then
-    if [[ -f "$FAKE_GH_STATE/created" ]]; then
-      asset_json snake
-      exit 0
-    fi
-    printf 'HTTP 404\\n' >&2
-    exit 1
-  fi
-  if [[ "$endpoint" == "repos/${FAKE_REPOSITORY}/git/ref/tags/${FAKE_RELEASE_TAG}" ]]; then
-    if [[ -f "$FAKE_GH_STATE/created" ]]; then
-      printf '%s\\n' "$FAKE_SOURCE_REVISION"
-      exit 0
-    fi
-    printf 'HTTP 404\\n' >&2
-    exit 1
-  fi
-  if [[ "$endpoint" == "repos/${FAKE_REPOSITORY}/releases/latest" ]]; then
-    printf '0.3.9\\n'
-    exit 0
-  fi
-fi
-
-if [[ ${1:-} == release && ${2:-} == create ]]; then
-  notes_file=""
-  while [[ $# -gt 0 ]]; do
-    if [[ "$1" == --notes-file ]]; then
-      notes_file="$2"
-      shift 2
-    else
-      shift
-    fi
-  done
-  [[ -n "$notes_file" ]]
-  cp "$notes_file" "$FAKE_GH_STATE/notes"
-  : > "$FAKE_GH_STATE/created"
-  printf 'true\\n' > "$FAKE_GH_STATE/draft"
-  exit 0
-fi
-
-if [[ ${1:-} == release && ${2:-} == view ]]; then
-  asset_json camel
-  exit 0
-fi
-
-if [[ ${1:-} == release && ${2:-} == edit ]]; then
-  : > "$FAKE_GH_STATE/edited"
-  printf 'false\\n' > "$FAKE_GH_STATE/draft"
-  exit 0
-fi
-
-if [[ ${1:-} == release && ${2:-} == delete ]]; then
-  : > "$FAKE_GH_STATE/deleted"
-  exit 0
-fi
-
-printf 'unexpected fake gh call: %s\\n' "$*" >&2
-exit 2
-""",
-                encoding="utf-8",
-            )
-            fake_gh.chmod(0o700)
-
-            def run_publisher(corruption):
-                state = temporary / f"state-{corruption}"
-                state.mkdir()
-                log = state / "gh.log"
-                environment = os.environ.copy()
-                environment.update(
-                    {
-                        "PATH": f"{fake_bin}:{environment['PATH']}",
-                        "TMPDIR": str(temporary),
-                        "FAKE_GH_LOG": str(log),
-                        "FAKE_GH_STATE": str(state),
-                        "FAKE_DRAFT_CORRUPTION": corruption,
-                        "FAKE_MANIFEST": str(manifest),
-                        "FAKE_SIGNATURE": str(signature),
-                        "FAKE_RELEASE_TAG": release_tag,
-                        "FAKE_REPOSITORY": "novelKR/OpenCodex-OCI-Gateway",
-                        "FAKE_SOURCE_REVISION": source_revision,
-                    }
-                )
-                result = subprocess.run(
-                    [
-                        "bash",
-                        str(publisher),
-                        artifact_version,
-                        "--repo",
-                        environment["FAKE_REPOSITORY"],
-                        "--source-revision",
-                        source_revision,
-                        "--input",
-                        str(assets),
-                        "--public-key",
-                        str(public_key),
-                    ],
-                    cwd=ROOT,
-                    env=environment,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                return result, log.read_text(encoding="utf-8")
-
-            successful, successful_calls = run_publisher("none")
-            self.assertEqual(successful.returncode, 0, successful.stderr)
-            self.assertIn("immutable=true latest=false assets=2", successful.stdout)
-            self.assertIn("release edit", successful_calls)
-            self.assertNotIn("release delete", successful_calls)
-
-            for corruption in (
-                "manifest-digest",
-                "manifest-size",
-                "signature-digest",
-                "signature-size",
-            ):
-                with self.subTest(corruption=corruption):
-                    result, calls = run_publisher(corruption)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(
-                        "runtime GitHub Release readback differs from the requested state",
-                        result.stderr,
-                    )
-                    self.assertIn("release create", calls)
-                    self.assertNotIn("release edit", calls)
-                    self.assertNotIn("release delete", calls)
-
     def test_legacy_gateway_keeps_the_gateway_target(self):
         workflow = self.text(".github/workflows/container-release.yml")
         self.assertIn("target: gateway", workflow)
@@ -698,10 +422,12 @@ exit 2
             "tools/opencodex_runtime_image_test.py",
             "tools/opencodex_runtime_lifecycle_canary.py",
             "tools/opencodex_runtime_manifest.py",
+            "tools/opencodex_npm_provenance.py",
             "tools/opencodex_upstream.py",
-            "tools/publish-opencodex-runtime-release.sh",
+            "tools/verify_npm_slsa_identity.cjs",
         ):
             self.assertIn(path, allowlist)
+        self.assertNotIn("tools/publish-opencodex-runtime-release.sh", allowlist)
 
     def test_runtime_trust_root_is_separate_from_the_relay_release_key(self):
         runtime_key = (ROOT / "config/trust/opencodex-runtime-release-ed25519.pub").read_bytes()

@@ -23,6 +23,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/compat"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/responses"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/scheduler"
@@ -80,6 +81,7 @@ type Server struct {
 	responsesModels      []string
 	routing              *routing.Watcher
 	observation          *ConnectionObservation
+	appleAuthorize       loopbackauth.Authorizer
 }
 
 type Option func(*Server)
@@ -99,6 +101,15 @@ func WithConnectionObservation(observation *ConnectionObservation) Option {
 		if observation != nil {
 			server.observation = observation
 		}
+	}
+}
+
+// WithAppleRuntimeConnectionBinding keeps the lifecycle reader through a fresh
+// connection's post-dial identity proof and credential header write. The
+// RuntimeManager gate separately covers the complete loopback response.
+func WithAppleRuntimeConnectionBinding(authorize loopbackauth.Authorizer) Option {
+	return func(server *Server) {
+		server.appleAuthorize = authorize
 	}
 }
 
@@ -228,6 +239,11 @@ func New(cfg config.Config, loader CredentialLoader, tracker *Tracker, logger *s
 		responsesModels:      responseModels,
 		observation:          NewConnectionObservation(cfg.UpstreamMode),
 	}
+	for _, option := range options {
+		if option != nil {
+			option(s)
+		}
+	}
 	transport := &http.Transport{
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          16,
@@ -238,6 +254,14 @@ func New(cfg config.Config, loader CredentialLoader, tracker *Tracker, logger *s
 	}
 	if cfg.UpstreamMode == config.UpstreamModeExternalGateway {
 		transport.Proxy = http.ProxyFromEnvironment
+	}
+	var roundTripper http.RoundTripper = transport
+	if cfg.UpstreamMode == config.UpstreamModeLocalAppleContainer {
+		bound, bindErr := loopbackauth.NewTransport(transport, requireRuntimeConnectionLease, s.appleAuthorize)
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		roundTripper = bound
 	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite:        s.rewrite,
@@ -264,12 +288,7 @@ func New(cfg config.Config, loader CredentialLoader, tracker *Tracker, logger *s
 			s.logger.Warn("upstream relay failure", "method", r.Method, "path", r.URL.Path, "error", err.Error())
 			writeError(w, http.StatusBadGateway, "upstream_unavailable")
 		},
-		Transport: transport,
-	}
-	for _, option := range options {
-		if option != nil {
-			option(s)
-		}
+		Transport: roundTripper,
 	}
 	return s, nil
 }
@@ -419,7 +438,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	values := credentials.Values{}
 	profile := s.cfg.Credentials.RemoteAuthenticationProfile()
-	if profile != config.RemoteAuthenticationNone {
+	if profile != config.RemoteAuthenticationNone && s.cfg.UpstreamMode != config.UpstreamModeLocalAppleContainer {
 		values, err = s.credentials()
 		if err != nil {
 			s.logger.Error("relay credential lookup failed", "method", r.Method, "path", r.URL.Path, "error", err.Error())
@@ -640,6 +659,11 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	request.Header.Del("Cf-Access-Jwt-Assertion")
 	request.Header.Del("X-OpenCodex-API-Key")
 	request.Header.Del("X-OpenCodex-Relay")
+	for key := range request.Trailer {
+		if strings.EqualFold(key, loopbackauth.CredentialHeader) {
+			delete(request.Trailer, key)
+		}
+	}
 	profile := s.cfg.Credentials.RemoteAuthenticationProfile()
 	if profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		request.Header.Set("CF-Access-Client-Id", values.CFClientID)
@@ -648,7 +672,7 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	if profile == config.RemoteAuthenticationGatewayAPIKey || profile == config.RemoteAuthenticationCloudflareAccessAndGatewayKey {
 		request.Header.Set("X-OpenCodex-API-Key", values.GatewayKey)
 	}
-	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+	if profile == config.LocalAuthenticationOpenCodexAPIKey && s.cfg.UpstreamMode != config.UpstreamModeLocalAppleContainer {
 		request.Header.Set("X-OpenCodex-API-Key", values.LocalOpenCodexAPIKey)
 	}
 	if profile != config.RemoteAuthenticationNone {

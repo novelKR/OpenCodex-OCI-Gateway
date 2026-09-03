@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
-	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 const (
@@ -50,7 +50,8 @@ type Target struct {
 	BaseURL               string
 	ExpectedServicePort   int
 	AuthenticationProfile string
-	Credentials           credentials.Values
+	ConnectionLease       loopbackauth.LeaseAcquirer
+	AuthorizeConnection   loopbackauth.Authorizer
 }
 
 // NativeTarget returns the credentialless host-native OpenCodex contract.
@@ -65,12 +66,13 @@ func NativeTarget(baseURL string) Target {
 // AppleContainerTarget returns the fixed authenticated Apple Container
 // contract. The API key is used only for /v1/models; /healthz remains
 // credentialless.
-func AppleContainerTarget(values credentials.Values) Target {
+func AppleContainerTarget(lease loopbackauth.LeaseAcquirer, authorize loopbackauth.Authorizer) Target {
 	return Target{
 		BaseURL:               "http://127.0.0.1:10210/v1",
 		ExpectedServicePort:   10100,
 		AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
-		Credentials:           values,
+		ConnectionLease:       lease,
+		AuthorizeConnection:   authorize,
 	}
 }
 
@@ -116,19 +118,33 @@ func preflightTarget(ctx context.Context, target Target, client *http.Client) Re
 	if result := checkHealth(ctx, &hardened, healthURL, target.ExpectedServicePort); result != AvailabilityReady {
 		return Result{Availability: result}
 	}
-	count, availability := checkModels(ctx, &hardened, modelsURL, target.AuthenticationProfile, target.Credentials)
+	modelsClient := &hardened
+	if target.AuthenticationProfile == config.LocalAuthenticationOpenCodexAPIKey {
+		base, ok := hardened.Transport.(*http.Transport)
+		if !ok {
+			return Result{Availability: AvailabilityInvalid}
+		}
+		bound, err := loopbackauth.NewTransport(base, target.ConnectionLease, target.AuthorizeConnection)
+		if err != nil {
+			return Result{Availability: AvailabilityInvalid}
+		}
+		copy := hardened
+		copy.Transport = bound
+		modelsClient = &copy
+	}
+	count, availability := checkModels(ctx, modelsClient, modelsURL)
 	return Result{Availability: availability, ModelCount: count}
 }
 
 func validTarget(target Target) bool {
-	if target.ExpectedServicePort != 10100 || target.Credentials.ValidateForProfile(target.AuthenticationProfile) != nil {
+	if target.ExpectedServicePort != 10100 {
 		return false
 	}
 	switch target.AuthenticationProfile {
 	case config.RemoteAuthenticationNone:
-		return config.IsLocalOpenCodexBaseURL(target.BaseURL)
+		return config.IsLocalOpenCodexBaseURL(target.BaseURL) && target.ConnectionLease == nil && target.AuthorizeConnection == nil
 	case config.LocalAuthenticationOpenCodexAPIKey:
-		return config.IsLocalAppleContainerBaseURL(target.BaseURL)
+		return config.IsLocalAppleContainerBaseURL(target.BaseURL) && target.ConnectionLease != nil && target.AuthorizeConnection != nil
 	default:
 		return false
 	}
@@ -168,7 +184,7 @@ func endpoints(upstreamBaseURL string) (healthURL, modelsURL string, ok bool) {
 }
 
 func checkHealth(ctx context.Context, client *http.Client, endpoint string, expectedServicePort int) Availability {
-	payload, status, ok := getJSON(ctx, client, endpoint, config.RemoteAuthenticationNone, credentials.Values{})
+	payload, status, ok := getJSON(ctx, client, endpoint)
 	if !ok {
 		return status
 	}
@@ -194,8 +210,8 @@ func checkHealth(ctx context.Context, client *http.Client, endpoint string, expe
 	return AvailabilityReady
 }
 
-func checkModels(ctx context.Context, client *http.Client, endpoint, profile string, values credentials.Values) (int, Availability) {
-	payload, status, ok := getJSON(ctx, client, endpoint, profile, values)
+func checkModels(ctx context.Context, client *http.Client, endpoint string) (int, Availability) {
+	payload, status, ok := getJSON(ctx, client, endpoint)
 	if !ok {
 		return 0, status
 	}
@@ -269,7 +285,7 @@ func intField(document map[string]json.RawMessage, key string) (int, bool) {
 	return value, true
 }
 
-func getJSON(ctx context.Context, client *http.Client, endpoint, profile string, values credentials.Values) ([]byte, Availability, bool) {
+func getJSON(ctx context.Context, client *http.Client, endpoint string) ([]byte, Availability, bool) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, AvailabilityInvalid, false
@@ -281,9 +297,6 @@ func getJSON(ctx context.Context, client *http.Client, endpoint, profile string,
 	request.Header.Del("Cf-Access-Jwt-Assertion")
 	request.Header.Del("X-OpenCodex-API-Key")
 	request.Header.Del("X-OpenCodex-Relay")
-	if profile == config.LocalAuthenticationOpenCodexAPIKey {
-		request.Header.Set("X-OpenCodex-API-Key", values.LocalOpenCodexAPIKey)
-	}
 	response, err := client.Do(request)
 	if err != nil || response == nil {
 		return nil, AvailabilityUnavailable, false

@@ -43,7 +43,9 @@ jobs:
           set -euo pipefail
           version="${INPUT_VERSION:-${GITHUB_REF_NAME}}"
           tools/verify-release-ref.sh "$version"
-          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          python3 tools/opencodex_upstream.py verify-tree \
+            --container containers/opencodex \
+            --verify-provenance
           opencodex_version="$(
             jq -er '
               .dependencies["@bitkyc08/opencodex"]

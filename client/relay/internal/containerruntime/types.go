@@ -50,6 +50,21 @@ const (
 	StateRecoveryRequired State = "recovery_required"
 )
 
+// FixedContainerState is the bounded result of re-reading the one fixed-name
+// Apple Container resource.  Callers must distinguish a currently running
+// owned resource from a stopped resource: Apple Container releases its socket
+// forwarder when the guest exits, so static labels alone are not authority to
+// send credentials to the fixed loopback port.
+type FixedContainerState string
+
+const (
+	FixedContainerAbsent       FixedContainerState = "absent"
+	FixedContainerRunningOwned FixedContainerState = "running_owned"
+	FixedContainerStoppedOwned FixedContainerState = "stopped_owned"
+	FixedContainerForeign      FixedContainerState = "foreign"
+	FixedContainerUnknown      FixedContainerState = "unknown"
+)
+
 type Capability struct {
 	Available             bool   `json:"available"`
 	Reason                string `json:"reason"`
@@ -106,6 +121,15 @@ type StopRequest struct {
 	ConfirmDesktopExited      bool
 }
 
+// ParkRequest is the emergency fail-closed path used only when the exact
+// Desktop bundle reappears during a lifecycle mutation. It creates a durable
+// stop-recovery witness without requiring Desktop exit and without mutating
+// routing, Codex configuration, or the container.
+type ParkRequest struct {
+	ExpectedStateDigest       string
+	ExpectedRoutingGeneration uint64
+}
+
 type RecoverRequest struct {
 	ExpectedStateDigest  string
 	ConfirmDesktopExited bool
@@ -155,11 +179,12 @@ type ImageRuntime interface {
 	Stop(context.Context, string, StartSpec) error
 	Delete(context.Context, string, StartSpec) error
 	VerifyContainer(context.Context, string, StartSpec) error
+	ContainerState(context.Context, string, StartSpec) (FixedContainerState, error)
 	VerifyAbsent(context.Context, string) error
 }
 
 type HTTPProber interface {
-	Verify(context.Context, []byte, []byte) error
+	Verify(context.Context, []byte, []byte, func(context.Context) error) error
 }
 
 type StateCloner interface {

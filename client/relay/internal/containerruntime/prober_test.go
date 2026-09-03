@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -13,45 +15,50 @@ import (
 func TestRuntimeHTTPProberPollsReadinessBeforeAuthentication(t *testing.T) {
 	secrets := testSecrets()
 	healthCalls := 0
-	closedBodies := 0
 	paths := []string{}
 	tokens := []string{}
-	client := &http.Client{Transport: proberRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+	client := newProberTestClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		paths = append(paths, request.URL.Path)
 		token := request.Header.Get("X-OpenCodex-API-Key")
 		tokens = append(tokens, token)
 		if request.URL.Path == "/healthz" {
 			healthCalls++
 			if healthCalls < 3 {
-				return nil, errors.New("connection refused")
+				writeProberResponse(response, http.StatusServiceUnavailable, `{}`)
+				return
 			}
-			return proberResponse(http.StatusOK, `{"status":"ok","service":"opencodex","port":10100}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusOK, `{"status":"ok","service":"opencodex","port":10100}`)
+			return
 		}
 		switch {
 		case request.URL.Path == "/v1/models" && token == "":
-			return proberResponse(http.StatusUnauthorized, `{}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusUnauthorized, `{}`)
 		case request.URL.Path == "/v1/models" && token == string(secrets.APIToken):
-			return proberResponse(http.StatusOK, `{"object":"list","data":[{}]}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusOK, `{"object":"list","data":[{}]}`)
 		case request.URL.Path == "/v1/models" && token == string(secrets.AdminToken):
-			return proberResponse(http.StatusForbidden, `{}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusForbidden, `{}`)
 		case request.URL.Path == "/api/config" && token == "":
-			return proberResponse(http.StatusUnauthorized, `{}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusUnauthorized, `{}`)
 		case request.URL.Path == "/api/config" && token == string(secrets.APIToken):
-			return proberResponse(http.StatusForbidden, `{}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusForbidden, `{}`)
 		case request.URL.Path == "/api/config" && token == string(secrets.AdminToken):
-			return proberResponse(http.StatusOK, `{}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusOK, `{}`)
 		default:
-			return proberResponse(http.StatusInternalServerError, `{}`, &closedBodies), nil
+			writeProberResponse(response, http.StatusInternalServerError, `{}`)
 		}
-	})}
+	}))
 	prober := newRuntimeHTTPProberWithClient(client)
 	prober.readinessTimeout = 100 * time.Millisecond
 	prober.retryBackoff = time.Millisecond
-	if err := prober.Verify(context.Background(), secrets.APIToken, secrets.AdminToken); err != nil {
+	guardCalls := 0
+	if err := prober.Verify(context.Background(), secrets.APIToken, secrets.AdminToken, func(context.Context) error {
+		guardCalls++
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if healthCalls != 3 || len(paths) != 9 || closedBodies != 7 {
-		t.Fatalf("health=%d paths=%#v closed=%d", healthCalls, paths, closedBodies)
+	if healthCalls != 3 || len(paths) != 9 || guardCalls != 4 {
+		t.Fatalf("health=%d paths=%#v guards=%d", healthCalls, paths, guardCalls)
 	}
 	for index := 0; index < healthCalls; index++ {
 		if paths[index] != "/healthz" || tokens[index] != "" {
@@ -62,19 +69,19 @@ func TestRuntimeHTTPProberPollsReadinessBeforeAuthentication(t *testing.T) {
 
 func TestRuntimeHTTPProberReadinessIsContextBounded(t *testing.T) {
 	requests := 0
-	client := &http.Client{Transport: proberRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+	client := newProberTestClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		requests++
 		if request.URL.Path != "/healthz" || request.Header.Get("X-OpenCodex-API-Key") != "" {
 			t.Fatalf("request before readiness: %s", request.URL.Path)
 		}
-		return nil, errors.New("connection refused")
-	})}
+		writeProberResponse(response, http.StatusServiceUnavailable, `{}`)
+	}))
 	prober := newRuntimeHTTPProberWithClient(client)
 	prober.readinessTimeout = 15 * time.Millisecond
 	prober.retryBackoff = time.Millisecond
 	started := time.Now()
 	secrets := testSecrets()
-	if err := prober.Verify(context.Background(), secrets.APIToken, secrets.AdminToken); !errors.Is(err, ErrUnavailable) {
+	if err := prober.Verify(context.Background(), secrets.APIToken, secrets.AdminToken, func(context.Context) error { return nil }); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("error=%v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 250*time.Millisecond || requests < 2 {
@@ -82,47 +89,50 @@ func TestRuntimeHTTPProberReadinessIsContextBounded(t *testing.T) {
 	}
 }
 
-func TestRuntimeHTTPProberDoesNotExposeCredentialInErrors(t *testing.T) {
+func TestRuntimeHTTPProberDoesNotExposeCredentialAndRejectsFailedPostDialGuard(t *testing.T) {
 	secrets := testSecrets()
-	client := &http.Client{Transport: proberRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+	authenticatedRequests := 0
+	client := newProberTestClient(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if token := request.Header.Get("X-OpenCodex-API-Key"); token != "" {
+			authenticatedRequests++
+		}
 		switch {
 		case request.URL.Path == "/healthz":
-			return proberResponse(http.StatusOK, `{"status":"ok","service":"opencodex","port":10100}`, nil), nil
+			writeProberResponse(response, http.StatusOK, `{"status":"ok","service":"opencodex","port":10100}`)
 		case request.URL.Path == "/v1/models" && request.Header.Get("X-OpenCodex-API-Key") == "":
-			return proberResponse(http.StatusUnauthorized, `{}`, nil), nil
+			writeProberResponse(response, http.StatusUnauthorized, `{}`)
 		default:
-			return nil, errors.New("transport diagnostic " + request.Header.Get("X-OpenCodex-API-Key"))
+			writeProberResponse(response, http.StatusInternalServerError, string(secrets.APIToken))
 		}
-	})}
+	}))
 	prober := newRuntimeHTTPProberWithClient(client)
-	err := prober.Verify(context.Background(), secrets.APIToken, secrets.AdminToken)
+	err := prober.Verify(context.Background(), secrets.APIToken, secrets.AdminToken, func(context.Context) error {
+		return errors.New("owned runtime stopped")
+	})
 	if !errors.Is(err, ErrUnavailable) || strings.Contains(err.Error(), string(secrets.APIToken)) || strings.Contains(err.Error(), string(secrets.AdminToken)) {
 		t.Fatalf("credential-bearing error=%q", err)
 	}
-}
-
-type proberRoundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f proberRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return f(request)
-}
-
-type proberCloseBody struct {
-	io.Reader
-	closed *int
-}
-
-func (b *proberCloseBody) Close() error {
-	if b.closed != nil {
-		*b.closed++
+	if authenticatedRequests != 0 {
+		t.Fatalf("failed post-dial guard sent %d authenticated requests", authenticatedRequests)
 	}
-	return nil
 }
 
-func proberResponse(status int, body string, closed *int) *http.Response {
-	return &http.Response{
-		StatusCode: status,
-		Header:     make(http.Header),
-		Body:       &proberCloseBody{Reader: strings.NewReader(body), closed: closed},
+func newProberTestClient(t *testing.T, handler http.Handler) *http.Client {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	transport := &http.Transport{
+		Proxy:             nil,
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp4", server.Listener.Addr().String())
+		},
 	}
+	return &http.Client{Transport: transport, Timeout: time.Second}
+}
+
+func writeProberResponse(response http.ResponseWriter, status int, body string) {
+	response.Header().Set("Content-Type", "application/json")
+	response.WriteHeader(status)
+	_, _ = io.WriteString(response, body)
 }

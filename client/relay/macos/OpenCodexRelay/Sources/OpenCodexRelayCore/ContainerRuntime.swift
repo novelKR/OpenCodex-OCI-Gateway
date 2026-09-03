@@ -568,6 +568,10 @@ public protocol ContainerRuntimeManaging: Sendable {
         expectedRoutingGeneration: UInt64,
         confirmDesktopExited: Bool
     ) async throws -> ContainerRuntimeMutationReceipt
+    func park(
+        expectedStateDigest: String,
+        expectedRoutingGeneration: UInt64
+    ) async throws -> ContainerRuntimeMutationReceipt
     func recover(
         expectedStateDigest: String,
         confirmDesktopExited: Bool
@@ -662,6 +666,19 @@ public struct ProcessContainerRuntimeClient: ContainerRuntimeManaging, Sendable 
             "--confirm-desktop-exited",
             "--json",
         ], timeout: 120))
+    }
+
+    public func park(
+        expectedStateDigest: String,
+        expectedRoutingGeneration: UInt64
+    ) async throws -> ContainerRuntimeMutationReceipt {
+        try validateDigest(expectedStateDigest)
+        return try ContainerRuntimeMutationReceipt.decodeStrict(await execute(arguments: [
+            "container-runtime", "park",
+            "--expected-state-digest", expectedStateDigest,
+            "--expected-routing-generation", String(expectedRoutingGeneration),
+            "--json",
+        ], timeout: 30))
     }
 
     public func recover(
@@ -784,7 +801,13 @@ public struct ProcessContainerRuntimeClient: ContainerRuntimeManaging, Sendable 
             policy: RelayctlExecutionPolicy(
                 timeout: min(executionPolicy.timeout, timeout),
                 terminationGracePeriod: executionPolicy.terminationGracePeriod,
-                maximumOutputBytes: min(executionPolicy.maximumOutputBytes, 64 * 1_024)
+                maximumOutputBytes: min(executionPolicy.maximumOutputBytes, 64 * 1_024),
+                // Every container-runtime command can own an Apple CLI process
+                // group while holding the lifecycle flock (including inspect,
+                // check, and OAuth peer validation). SIGTERM asks relayctl to
+                // cancel and reap that group; killing relayctl first would
+                // release the flock while its descendant is still alive.
+                forceKillAfterGracePeriod: false
             )
         )
         let result = try await withTaskCancellationHandler {

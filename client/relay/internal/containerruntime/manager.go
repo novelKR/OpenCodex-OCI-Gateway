@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/runtimemanifest"
@@ -63,6 +64,262 @@ func DefaultRoot(home string) (string, error) {
 	return filepath.Join(home, "Library", "Application Support", "OpenCodex Relay", "ContainerRuntime"), nil
 }
 
+// ValidateActiveRoutingAuthority is the resident relay's read-only startup
+// gate for an already-committed Apple route. A stable Apple routing state is
+// not sufficient by itself: it must match the lifecycle manager's exact
+// durable generation and artifact/operation identity, with no unfinished
+// lifecycle journal. This does not inspect the container or load credentials;
+// Manager.Inspect performs those checks before any authenticated probe.
+func ValidateActiveRoutingAuthority(root string, routingGeneration uint64, relayVersion string, publicKeyPEM []byte) error {
+	_, _, err := activeRoutingAuthority(root, routingGeneration, relayVersion, publicKeyPEM)
+	return err
+}
+
+// ValidateActiveRuntimeBeforeCredentials extends the durable routing proof
+// with the exact live Apple Container proof required immediately before the
+// resident Relay reads the API token. This boundary is intentionally separate
+// from Manager.Inspect: normal proxy and catalog requests do not pass through
+// the lifecycle command, but they must still reject a stopped or replaced
+// fixed-name container before Keychain access.
+func ValidateActiveRuntimeBeforeCredentials(
+	ctx context.Context,
+	root string,
+	routingGeneration uint64,
+	relayVersion string,
+	publicKeyPEM []byte,
+	runtime ImageRuntime,
+) error {
+	if ctx == nil || runtime == nil {
+		return ErrUnsafeState
+	}
+	store, err := newStateStore(root)
+	if err != nil {
+		return err
+	}
+	state, found, err := store.load()
+	if err != nil || !found {
+		return ErrRecoveryRequired
+	}
+	if _, found, err := store.loadStopJournal(); err != nil || found {
+		return ErrRecoveryRequired
+	}
+	journal, transactionFound, err := store.loadJournal()
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+
+	var specs []StartSpec
+	if !transactionFound {
+		if routingGeneration == 0 {
+			return ErrRecoveryRequired
+		}
+		_, state, err = activeRoutingAuthority(root, routingGeneration, relayVersion, publicKeyPEM)
+		if err != nil || state.Active == nil {
+			return ErrRecoveryRequired
+		}
+		statePath, pathErr := store.generationPath(state.ActiveGeneration)
+		if pathErr != nil {
+			return ErrRecoveryRequired
+		}
+		specs = append(specs, startSpec(
+			state.InstallationID,
+			state.ActiveOperationID,
+			*state.Active,
+			state.ActiveGeneration,
+			statePath,
+			"",
+		))
+	} else {
+		// During a lifecycle-owned routing/maintenance handoff the durable
+		// state is intentionally updating. The exact transaction journal is
+		// the only authority for the newly verified container or a verified
+		// rollback replacement; generic routing cannot create this journal.
+		binding := &Manager{store: store}
+		if binding.validateRecoveryBinding(state, journal) != nil {
+			return ErrRecoveryRequired
+		}
+		if journal.NewContainerID == ContainerName &&
+			(journal.Phase == phaseNewStarted || journal.Phase == phaseVerified || journal.Phase == phaseRecoveryRequired) {
+			path, pathErr := store.generationPath(journal.NewGeneration)
+			if pathErr != nil || validateStoredArtifactAuthority(store, journal.NewArtifact, relayVersion, publicKeyPEM) != nil {
+				return ErrRecoveryRequired
+			}
+			specs = append(specs, startSpec(
+				journal.InstallationID,
+				journal.OperationID,
+				journal.NewArtifact,
+				journal.NewGeneration,
+				path,
+				"",
+			))
+		}
+		if journal.OldContainerID == ContainerName && journal.OldArtifact != nil &&
+			isSHA256(journal.OldOperationID) {
+			path, pathErr := store.generationPath(journal.OldGeneration)
+			if pathErr != nil || validateStoredArtifactAuthority(store, *journal.OldArtifact, relayVersion, publicKeyPEM) != nil {
+				return ErrRecoveryRequired
+			}
+			specs = append(specs, startSpec(
+				journal.InstallationID,
+				journal.OldOperationID,
+				*journal.OldArtifact,
+				journal.OldGeneration,
+				path,
+				"",
+			))
+		}
+		if len(specs) == 0 {
+			return ErrRecoveryRequired
+		}
+	}
+
+	matched := false
+	for _, spec := range specs {
+		if runtime.VerifyContainer(ctx, ContainerName, spec) != nil {
+			continue
+		}
+		containerState, stateErr := runtime.ContainerState(ctx, ContainerName, spec)
+		if stateErr != nil || containerState != FixedContainerRunningOwned || matched {
+			return ErrRecoveryRequired
+		}
+		matched = true
+	}
+	if !matched {
+		return ErrRecoveryRequired
+	}
+
+	// A lifecycle mutation may have changed the durable witness while the two
+	// independent Apple inspect calls were in flight. Re-read the exact signed
+	// authority before allowing the caller to cross the Keychain boundary.
+	current, currentFound, stateErr := store.load()
+	currentJournal, currentTransactionFound, journalErr := store.loadJournal()
+	_, currentStopFound, stopErr := store.loadStopJournal()
+	beforeDigest, beforeErr := store.digest(state)
+	afterDigest, afterErr := store.digest(current)
+	if stateErr != nil || !currentFound || journalErr != nil || stopErr != nil || currentStopFound ||
+		beforeErr != nil || afterErr != nil || beforeDigest != afterDigest ||
+		transactionFound != currentTransactionFound ||
+		transactionFound && !reflect.DeepEqual(currentJournal, journal) {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+// ValidateRuntimeBeforeCredentials is the lifecycle controller's transaction-
+// aware form of the same peer guard. A zero routing generation is accepted
+// only while the manager's exact activation/update journal is present; stable
+// resident traffic must use ValidateActiveRuntimeBeforeCredentials with the
+// routing generation it observed.
+func (m *Manager) ValidateRuntimeBeforeCredentials(ctx context.Context) error {
+	if m == nil || m.store == nil || m.runtime == nil {
+		return ErrRecoveryRequired
+	}
+	return ValidateActiveRuntimeBeforeCredentials(
+		ctx,
+		m.store.root,
+		0,
+		m.relayVersion,
+		m.publicKeyPEM,
+		m.runtime,
+	)
+}
+
+// ValidateStableRuntimeBeforeCredentials is the management-plane form used by
+// OAuth operations after their initial status read. It derives the generation
+// from the currently committed lifecycle state and then re-runs the same exact
+// signed-container/running-state proof immediately before Admin-token access.
+func (m *Manager) ValidateStableRuntimeBeforeCredentials(ctx context.Context) error {
+	if m == nil || m.store == nil || m.runtime == nil {
+		return ErrRecoveryRequired
+	}
+	state, found, err := m.store.load()
+	if err != nil || !found || state.Status != StateHealthy || state.RoutingGeneration == 0 {
+		return ErrRecoveryRequired
+	}
+	return ValidateActiveRuntimeBeforeCredentials(
+		ctx,
+		m.store.root,
+		state.RoutingGeneration,
+		m.relayVersion,
+		m.publicKeyPEM,
+		m.runtime,
+	)
+}
+
+// AcquireStableRuntimeCredentialLease serializes one management-plane request
+// with every lifecycle mutation. The caller holds the lease from the live
+// container proof through the HTTP request, so Stop cannot release/rebind the
+// fixed loopback port between validation and Admin-token transmission.
+func (m *Manager) AcquireStableRuntimeCredentialLease(ctx context.Context) (func() error, error) {
+	if m == nil || m.locker == nil {
+		return nil, ErrRecoveryRequired
+	}
+	unlock, err := m.locker.Lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.ValidateStableRuntimeBeforeCredentials(ctx); err != nil {
+		_ = unlock()
+		return nil, err
+	}
+	return unlock, nil
+}
+
+func validateStoredArtifactAuthority(store *stateStore, record artifactRecord, relayVersion string, publicKeyPEM []byte) error {
+	if store == nil || validateArtifact(record) != nil || relayVersion == "" {
+		return ErrRecoveryRequired
+	}
+	manifestBytes, signature, err := store.loadManifest(record.ManifestSHA256)
+	defer zeroBytes(manifestBytes)
+	defer zeroBytes(signature)
+	if err != nil {
+		return ErrRecoveryRequired
+	}
+	manifest, err := runtimemanifest.Verify(manifestBytes, signature, publicKeyPEM, runtimemanifest.VerifyOptions{
+		HighestSeenSequence: record.ReleaseSequence,
+		RelayVersion:        relayVersion,
+	})
+	if err != nil || runtimemanifest.ManifestSHA256(manifestBytes) != record.ManifestSHA256 {
+		return ErrRecoveryRequired
+	}
+	verified, err := recordFromCandidate(runtimemanifest.Candidate{
+		ReleaseID:      record.ReleaseID,
+		Tag:            record.ReleaseTag,
+		ManifestSHA256: record.ManifestSHA256,
+		Manifest:       manifest,
+	})
+	if err != nil || verified != record {
+		return ErrRecoveryRequired
+	}
+	return nil
+}
+
+func activeRoutingAuthority(root string, routingGeneration uint64, relayVersion string, publicKeyPEM []byte) (*stateStore, durableState, error) {
+	if routingGeneration == 0 || relayVersion == "" {
+		return nil, durableState{}, ErrUnsafeState
+	}
+	store, err := newStateStore(root)
+	if err != nil {
+		return nil, durableState{}, err
+	}
+	state, found, err := store.load()
+	if err != nil || !found || state.Status != StateHealthy || state.RoutingGeneration != routingGeneration ||
+		state.Active == nil || state.ActiveGeneration == 0 || state.ContainerID != ContainerName ||
+		!isSHA256(state.ActiveOperationID) || validateArtifact(*state.Active) != nil {
+		return nil, durableState{}, ErrRecoveryRequired
+	}
+	if _, found, err := store.loadJournal(); err != nil || found {
+		return nil, durableState{}, ErrRecoveryRequired
+	}
+	if _, found, err := store.loadStopJournal(); err != nil || found {
+		return nil, durableState{}, ErrRecoveryRequired
+	}
+	if validateStoredArtifactAuthority(store, *state.Active, relayVersion, publicKeyPEM) != nil {
+		return nil, durableState{}, ErrRecoveryRequired
+	}
+	return store, state, nil
+}
+
 func NewManager(options ManagerOptions) (*Manager, error) {
 	store, err := newStateStore(options.Root)
 	if err != nil {
@@ -87,6 +344,11 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 }
 
 func (m *Manager) Inspect(ctx context.Context) (Inspection, error) {
+	unlock, err := m.locker.Lock(ctx)
+	if err != nil {
+		return Inspection{}, err
+	}
+	defer unlock()
 	state, err := m.readState()
 	if err != nil {
 		return Inspection{}, err
@@ -104,19 +366,21 @@ func (m *Manager) Check(ctx context.Context) (CheckReceipt, error) {
 		return CheckReceipt{}, err
 	}
 	state, err := m.loadForMutation()
-	unlockErr := unlock()
 	if err != nil {
+		_ = unlock()
 		return CheckReceipt{}, err
-	}
-	if unlockErr != nil {
-		return CheckReceipt{}, unlockErr
 	}
 	inspection, err := m.inspectState(ctx, state)
 	if err != nil {
+		_ = unlock()
 		return CheckReceipt{}, err
 	}
 	if inspection.RecoveryRequired {
+		_ = unlock()
 		return CheckReceipt{}, ErrRecoveryRequired
+	}
+	if err := unlock(); err != nil {
+		return CheckReceipt{}, err
 	}
 	request := m.checkRequest(state, inspection.Capability)
 	result, err := m.checker.Check(ctx, request)
@@ -360,6 +624,56 @@ func (m *Manager) Stop(ctx context.Context, request StopRequest) (MutationReceip
 		return m.parkStopRecovery(state, journal, err)
 	}
 	if err := m.store.removeStopJournal(); err != nil {
+		return MutationReceipt{}, ErrRecoveryRequired
+	}
+	return m.inspectState(ctx, state)
+}
+
+// Park makes an interrupted Desktop-bound mutation durably fail closed. The
+// exact active state is converted into a recoverable stop transaction, but no
+// endpoint, credential, routing, Codex configuration, or Apple CLI mutation is
+// touched while Desktop may be running.
+func (m *Manager) Park(ctx context.Context, request ParkRequest) (MutationReceipt, error) {
+	unlock, err := m.locker.Lock(ctx)
+	if err != nil {
+		return MutationReceipt{}, err
+	}
+	defer unlock()
+	state, err := m.loadForMutation()
+	if err != nil {
+		return MutationReceipt{}, err
+	}
+	routing, err := m.routing.Current(ctx)
+	if err != nil || routing.RecoveryRequired {
+		return MutationReceipt{}, ErrRecoveryRequired
+	}
+	if err := m.requireCAS(state, routing, request.ExpectedStateDigest, request.ExpectedRoutingGeneration); err != nil {
+		return MutationReceipt{}, err
+	}
+	if state.Status != StateHealthy || state.Active == nil || state.ContainerID != ContainerName ||
+		!isSHA256(state.ActiveOperationID) || !routing.AppleActive ||
+		routing.RuntimeRoutingPending || routing.MaintenancePending || runtimeRouteMismatch(state, routing) {
+		return MutationReceipt{}, ErrRecoveryRequired
+	}
+	if found, transactionErr := m.transactionPresent(); transactionErr != nil || found {
+		return MutationReceipt{}, ErrRecoveryRequired
+	}
+	operationID, err := randomHex(32)
+	if err != nil {
+		return MutationReceipt{}, err
+	}
+	journal := stopTransactionJournal{
+		Schema: SchemaVersion, InstallationID: state.InstallationID, OperationID: operationID,
+		Phase: stopPhaseRecoveryRequired, ExpectedStateDigest: request.ExpectedStateDigest,
+		ExpectedRoutingGeneration: routing.Generation, Artifact: *state.Active,
+		StateGeneration: state.ActiveGeneration, ContainerID: state.ContainerID,
+		ActiveOperationID: state.ActiveOperationID,
+	}
+	if err := m.store.saveStopJournal(journal); err != nil {
+		return MutationReceipt{}, ErrRecoveryRequired
+	}
+	state.Status = StateRecoveryRequired
+	if err := m.store.save(state); err != nil {
 		return MutationReceipt{}, ErrRecoveryRequired
 	}
 	return m.inspectState(ctx, state)
@@ -739,7 +1053,10 @@ func (m *Manager) startAndVerify(ctx context.Context, spec StartSpec, manifest r
 	if err := m.runtime.VerifyContainer(ctx, containerID, spec); err != nil {
 		return failAfterStart(err)
 	}
-	if err := m.prober.Verify(ctx, secrets.APIToken, secrets.AdminToken); err != nil {
+	if err := m.verifyContainerRunning(ctx, containerID, spec); err != nil {
+		return failAfterStart(err)
+	}
+	if err := m.verifyRuntimeHTTP(ctx, containerID, spec, secrets); err != nil {
 		return failAfterStart(err)
 	}
 	return containerID, nil
@@ -1127,7 +1444,9 @@ func (m *Manager) recoverForward(ctx context.Context, state durableState, journa
 		}
 		return MutationReceipt{}, false, nil
 	}
-	if containerID != "" && (m.runtime.VerifyContainer(ctx, containerID, spec) != nil || m.prober.Verify(ctx, secrets.APIToken, secrets.AdminToken) != nil) {
+	if containerID != "" && (m.runtime.VerifyContainer(ctx, containerID, spec) != nil ||
+		m.verifyContainerRunning(ctx, containerID, spec) != nil ||
+		m.verifyRuntimeHTTP(ctx, containerID, spec, secrets) != nil) {
 		if err := m.cleanupJournalNew(ctx, journal); err != nil {
 			return MutationReceipt{}, false, errors.Join(errForwardRecoveryIndeterminate, err)
 		}
@@ -1509,14 +1828,16 @@ func (m *Manager) restoreOrRecreate(ctx context.Context, existingSpec, replaceme
 				return ContainerName, replacementSpec.OperationID, err
 			}
 		}
-		if m.prober.Verify(ctx, secrets.APIToken, secrets.AdminToken) == nil {
+		if m.verifyContainerRunning(ctx, ContainerName, replacementSpec) == nil &&
+			m.verifyRuntimeHTTP(ctx, ContainerName, replacementSpec, secrets) == nil {
 			return ContainerName, replacementSpec.OperationID, nil
 		}
 		if err := m.stopAndDelete(ctx, ContainerName, replacementSpec); err != nil {
 			return ContainerName, replacementSpec.OperationID, err
 		}
 	} else if m.runtime.VerifyContainer(ctx, ContainerName, existingSpec) == nil {
-		if m.prober.Verify(ctx, secrets.APIToken, secrets.AdminToken) == nil {
+		if m.verifyContainerRunning(ctx, ContainerName, existingSpec) == nil &&
+			m.verifyRuntimeHTTP(ctx, ContainerName, existingSpec, secrets) == nil {
 			return ContainerName, existingSpec.OperationID, nil
 		}
 		if err := m.stopAndDelete(ctx, ContainerName, existingSpec); err != nil {
@@ -1845,6 +2166,9 @@ func (m *Manager) verifyActiveRuntime(ctx context.Context, state durableState) e
 	if err := m.runtime.VerifyContainer(ctx, state.ContainerID, spec); err != nil {
 		return err
 	}
+	if err := m.verifyContainerRunning(ctx, state.ContainerID, spec); err != nil {
+		return err
+	}
 	// Inspect is read-only: Load may consult the two fixed Keychain items but
 	// must never create or rotate them. Without both existing credentials the
 	// manager cannot authenticate the models/admin separation contract, so a
@@ -1858,7 +2182,37 @@ func (m *Manager) verifyActiveRuntime(ctx context.Context, state durableState) e
 	if !validSecret(secrets.APIToken) || !validSecret(secrets.AdminToken) || bytes.Equal(secrets.APIToken, secrets.AdminToken) {
 		return ErrCredential
 	}
-	return m.prober.Verify(ctx, secrets.APIToken, secrets.AdminToken)
+	return m.verifyRuntimeHTTP(ctx, state.ContainerID, spec, secrets)
+}
+
+func (m *Manager) verifyRuntimeHTTP(ctx context.Context, containerID string, spec StartSpec, secrets Secrets) error {
+	if m == nil || m.prober == nil {
+		return ErrUnavailable
+	}
+	guard := func(guardCtx context.Context) error {
+		if err := m.runtime.VerifyContainer(guardCtx, containerID, spec); err != nil {
+			return err
+		}
+		return m.verifyContainerRunning(guardCtx, containerID, spec)
+	}
+	return m.prober.Verify(ctx, secrets.APIToken, secrets.AdminToken, guard)
+}
+
+func (m *Manager) verifyContainerRunning(ctx context.Context, containerID string, spec StartSpec) error {
+	state, err := m.runtime.ContainerState(ctx, containerID, spec)
+	if err != nil {
+		return err
+	}
+	switch state {
+	case FixedContainerRunningOwned:
+		return nil
+	case FixedContainerForeign:
+		return ErrForeignResource
+	case FixedContainerAbsent, FixedContainerStoppedOwned:
+		return ErrUnavailable
+	default:
+		return ErrUnsafeState
+	}
 }
 
 func capabilityImpliesActiveDrift(capability Capability) bool {

@@ -2,7 +2,6 @@ package routing
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -371,120 +370,111 @@ func TestLocalOpenCodexRequestAndApplyUseExplicitBackendBoundary(t *testing.T) {
 	}
 }
 
-func TestAppleContainerRequestAndApplyUseAuthenticatedFixedProfile(t *testing.T) {
-	directory := t.TempDir()
-	relayPath := filepath.Join(directory, "relay.json")
-	codexPath := filepath.Join(directory, "config.toml")
-	cfg, err := config.NewDefault("https://gateway.example.test/v1", config.CredentialsSourceNone)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Catalog.Path = filepath.Join(directory, "external-catalog.json")
-	cfg.LocalAppleContainer, err = config.NewLocalAppleContainerProfileForCodexConfig(codexPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := config.Write(relayPath, cfg); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(codexPath, []byte("model = \"gpt\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := codexconfig.EnableWithInteractiveProfile(codexPath, "http://127.0.0.1:18180/v1", "http://127.0.0.1:18182/v1", cfg.Catalog.Path); err != nil {
-		t.Fatal(err)
-	}
-	store, err := Open(relayPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	var applied []Backend
-	var materialized []config.Config
-	var targets []localopencodex.Target
-	controller, err := NewController(
-		relayPath,
-		codexPath,
-		WithTransitionTiming(time.Second, time.Millisecond),
-		withLocalProfileAllowed(true),
-		withCredentialLoader(func(cfg config.CredentialsConfig) (credentials.Values, error) {
-			if cfg.Source != config.CredentialsSourceKeychain || cfg.RemoteAuthenticationProfile() != config.LocalAuthenticationOpenCodexAPIKey {
-				t.Fatalf("Apple credential config = %#v", cfg)
-			}
-			return credentials.Values{LocalOpenCodexAPIKey: apiToken}, nil
-		}),
-		withLocalTargetPreflight(func(_ context.Context, target localopencodex.Target) localopencodex.Result {
-			targets = append(targets, target)
-			if target.BaseURL != "http://127.0.0.1:10210/v1" || target.ExpectedServicePort != 10100 ||
-				target.AuthenticationProfile != config.LocalAuthenticationOpenCodexAPIKey || target.Credentials.LocalOpenCodexAPIKey != apiToken {
-				t.Fatalf("Apple preflight target = %#v", target)
-			}
-			return localopencodex.Result{Availability: localopencodex.AvailabilityReady, ModelCount: 1}
-		}),
-		withLocalCatalogMaterializer(func(_ context.Context, local config.Config) error {
-			materialized = append(materialized, local)
-			if local.UpstreamMode != config.UpstreamModeLocalAppleContainer ||
-				local.UpstreamBaseURL != "http://127.0.0.1:10210/v1" ||
-				local.Credentials.RemoteAuthenticationProfile() != config.LocalAuthenticationOpenCodexAPIKey ||
-				local.Catalog.Owner != config.CatalogOwnerRelay {
-				t.Fatalf("Apple catalog barrier received unsafe runtime config: %#v", local)
-			}
-			return nil
-		}),
-		WithRuntimeControl(runtimeControlFunc(func(_ context.Context, _ uint64, backend Backend) error {
-			applied = append(applied, backend)
-			return nil
-		})),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	controller.health = stateHealth{store: store, active: 0}
-
-	requested, err := controller.RequestBackend(context.Background(), BackendLocalAppleContainer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if requested.Phase != PhaseBackendPendingRestart || requested.DesiredBackend != BackendLocalAppleContainer || requested.AppliedBackend != BackendExternal {
-		t.Fatalf("Apple request status = %#v", requested)
-	}
-	completed, err := controller.Apply(context.Background(), true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.Phase != PhaseRelayActive || completed.DesiredBackend != BackendLocalAppleContainer ||
-		completed.AppliedBackend != BackendLocalAppleContainer || completed.RelayAdmission != "allow" {
-		t.Fatalf("Apple apply status = %#v", completed)
-	}
-	if len(targets) != 2 {
-		t.Fatalf("Apple target preflight calls = %d, want request + apply", len(targets))
-	}
-	if len(materialized) != 1 || materialized[0].Catalog.Path != cfg.LocalAppleContainer.CatalogPath {
-		t.Fatalf("Apple catalog barrier calls = %#v", materialized)
-	}
-	if len(applied) != 1 || applied[0] != BackendLocalAppleContainer {
-		t.Fatalf("Apple runtime apply calls = %#v", applied)
-	}
-	content, err := os.ReadFile(codexPath)
-	if err != nil || !strings.Contains(string(content), cfg.LocalAppleContainer.CatalogPath) {
-		t.Fatalf("Apple apply did not bind Apple catalog: %q err=%v", content, err)
-	}
-
-	// Production installers preserve the already-applied backend with a
-	// same-mode request. That path must remain witness-only: it may not turn an
-	// otherwise healthy release replacement into another Keychain/token read or
-	// authenticated runtime preflight.
-	credentialLoads := 0
+func TestAppleContainerGenericRequestApplyAndRecoveryAreLifecycleOnly(t *testing.T) {
+	controller, store, codexPath := optionalLocalControllerFixture(t, nil, true)
+	credentialLoads, runtimeApplies := 0, 0
 	controller.loadCredentials = func(config.CredentialsConfig) (credentials.Values, error) {
 		credentialLoads++
-		return credentials.Values{}, errors.New("credential access is forbidden for a same-backend request")
+		return credentials.Values{}, errors.New("generic Apple routing must not load credentials")
 	}
-	reselected, err := controller.RequestBackend(context.Background(), BackendLocalAppleContainer)
+	controller.runtimeControl = runtimeControlFunc(func(context.Context, uint64, Backend) error {
+		runtimeApplies++
+		return nil
+	})
+
+	before, err := NewRelayState(store.ConfigPath())
+	if err == nil {
+		before, err = BindCodexConfig(before, codexPath)
+	}
 	if err != nil {
-		t.Fatalf("same Apple backend request failed: %v", err)
+		t.Fatal(err)
 	}
-	if reselected.Generation != completed.Generation || reselected.Phase != PhaseRelayActive ||
-		reselected.AppliedBackend != BackendLocalAppleContainer || credentialLoads != 0 || len(targets) != 2 {
-		t.Fatalf("same Apple backend request mutated or re-read credentials: status=%#v loads=%d targets=%d", reselected, credentialLoads, len(targets))
+	lock, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(before); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RequestBackend(context.Background(), BackendLocalAppleContainer); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("generic Apple request error = %v", err)
+	}
+	after, err := store.Load()
+	if err != nil || after != before || credentialLoads != 0 || runtimeApplies != 0 {
+		t.Fatalf("rejected request mutated state or crossed credential/runtime boundary: before=%#v after=%#v loads=%d applies=%d err=%v", before, after, credentialLoads, runtimeApplies, err)
+	}
+
+	legacyPending := before
+	legacyPending.Generation++
+	legacyPending.DesiredBackend = BackendLocalAppleContainer
+	legacyPending.DesiredMode = ModeRelay
+	legacyPending.Phase = PhaseBackendPendingRestart
+	lock, err = store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(legacyPending); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Apply(context.Background(), true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("generic Apple apply error = %v", err)
+	}
+
+	legacyRecovery := legacyPending
+	legacyRecovery.Generation++
+	legacyRecovery.Phase = PhaseRecoveryRequired
+	lock, err = store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(legacyRecovery); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Recover(context.Background(), RecoveryComplete, true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("generic Apple recovery error = %v", err)
+	}
+	if credentialLoads != 0 || runtimeApplies != 0 {
+		t.Fatalf("generic Apple paths crossed credential/runtime boundary: loads=%d applies=%d", credentialLoads, runtimeApplies)
+	}
+
+	stableApple := before
+	stableApple.Generation++
+	stableApple.DesiredBackend = BackendLocalAppleContainer
+	stableApple.AppliedBackend = BackendLocalAppleContainer
+	stableApple.DesiredMode = ModeRelay
+	stableApple.AppliedMode = ModeRelay
+	stableApple.Phase = PhaseRelayActive
+	lock, err = store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(stableApple); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []Backend{BackendExternal, BackendNone, BackendLocalOpenCodex} {
+		if _, err := controller.RequestBackend(context.Background(), target); !errors.Is(err, ErrRecoveryRequired) {
+			t.Fatalf("generic request away from Apple to %q error = %v", target, err)
+		}
+	}
+	unchanged, err := store.Load()
+	if err != nil || unchanged != stableApple || credentialLoads != 0 || runtimeApplies != 0 {
+		t.Fatalf("generic request away from Apple mutated state or crossed boundary: state=%#v loads=%d applies=%d err=%v", unchanged, credentialLoads, runtimeApplies, err)
 	}
 }
 
@@ -746,6 +736,45 @@ func TestObservedCanonicalProfileDistinguishesLocalCatalogBinding(t *testing.T) 
 	}
 	if credentialLoads != 0 {
 		t.Fatalf("observed catalog classification loaded external credentials: %d", credentialLoads)
+	}
+}
+
+func TestAppleConnectionAuthorizerCancelsContextualCredentialLoad(t *testing.T) {
+	started := make(chan struct{})
+	controller := &Controller{
+		appleRuntimeCredentialGuard: func(context.Context) error { return nil },
+		loadCredentialsContext: func(ctx context.Context, _ config.CredentialsConfig) (credentials.Values, error) {
+			if _, ok := ctx.Deadline(); !ok {
+				return credentials.Values{}, errors.New("Apple credential context is unbounded")
+			}
+			close(started)
+			<-ctx.Done()
+			return credentials.Values{}, ctx.Err()
+		},
+	}
+	cfg := config.Config{Credentials: config.CredentialsConfig{
+		Source:                config.CredentialsSourceKeychain,
+		AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := controller.appleConnectionAuthorizer(cfg)(ctx)
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("contextual Apple credential load did not begin")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrCredentialPreflight) {
+			t.Fatalf("cancelled Apple credential load error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled Apple credential load did not unwind")
 	}
 }
 

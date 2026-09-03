@@ -59,6 +59,14 @@ class AwaitingNPM(RuntimeError):
     """A valid release exists but npm has not published the same version yet."""
 
 
+def provenance_contract():
+    try:
+        import opencodex_npm_provenance  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        from tools import opencodex_npm_provenance  # type: ignore[no-redef]
+    return opencodex_npm_provenance
+
+
 def fail(message: str) -> NoReturn:
     raise ContractError(message)
 
@@ -263,19 +271,20 @@ class NetworkClient:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return load_json_bytes(self._read(self.github_api + path, MAX_JSON_BYTES, headers), "GitHub response")
 
-    def npm_json(self, package: str) -> Any:
+    def npm_version_json(self, package: str, version: str) -> Any:
         encoded = urllib.parse.quote(package, safe="")
+        encoded_version = urllib.parse.quote(version, safe="")
         try:
             data = self._read(
-                f"{self.npm_registry}/{encoded}",
+                f"{self.npm_registry}/{encoded}/{encoded_version}",
                 MAX_JSON_BYTES,
-                {"Accept": "application/vnd.npm.install-v1+json"},
+                {"Accept": "application/json"},
             )
         except urllib.error.HTTPError as error:
             if error.code == 404:
-                raise AwaitingNPM("npm package metadata is not available") from error
+                raise AwaitingNPM("npm version metadata is not available") from error
             raise
-        return load_json_bytes(data, "npm metadata")
+        return load_json_bytes(data, "npm version metadata")
 
     def tarball_bytes(self, url: str) -> bytes:
         try:
@@ -288,6 +297,29 @@ class NetworkClient:
             if error.code == 404:
                 raise AwaitingNPM("npm tarball is not available") from error
             raise
+
+    def verify_npm_provenance(
+        self,
+        version: str,
+        revision: str,
+        integrity: str,
+        tarball: bytes,
+    ) -> dict[str, Any]:
+        if self.npm_registry != NPM_REGISTRY:
+            fail("npm provenance verification requires the canonical public registry")
+        opencodex_npm_provenance = provenance_contract()
+
+        try:
+            return opencodex_npm_provenance.verify_live(
+                version,
+                revision,
+                integrity,
+                tarball,
+            )
+        except opencodex_npm_provenance.AwaitingNPMProvenance as error:
+            raise AwaitingNPM(str(error)) from error
+        except opencodex_npm_provenance.ContractError as error:
+            raise ContractError(str(error)) from error
 
 
 def release_rows(client: Any) -> list[dict[str, Any]]:
@@ -372,6 +404,49 @@ def verify_tarball(data: bytes, integrity: str, version: str) -> None:
         archive.close()
     if not isinstance(package, dict) or package.get("name") != NPM_PACKAGE or package.get("version") != version:
         fail("npm tarball package identity does not match the release")
+
+
+def verify_npm_artifact(
+    client: Any,
+    version: str,
+    revision: str,
+    npm_origin: str = NPM_REGISTRY,
+) -> dict[str, str]:
+    npm_version = client.npm_version_json(NPM_PACKAGE, version)
+    if (
+        not isinstance(npm_version, dict)
+        or npm_version.get("name") != NPM_PACKAGE
+        or npm_version.get("version") != version
+    ):
+        fail("npm version metadata identity is invalid")
+    git_head = npm_version.get("gitHead")
+    if git_head is None:
+        raise AwaitingNPM("npm gitHead metadata is not available")
+    if git_head != revision:
+        fail("npm gitHead does not match the direct release tag commit")
+    dist = npm_version.get("dist")
+    if not isinstance(dist, dict):
+        fail("npm version metadata has no dist identity")
+    integrity = validate_sri(dist.get("integrity"))
+    tarball = validate_tarball_url(dist.get("tarball"), version, npm_origin)
+    attestations = dist.get("attestations")
+    if attestations is None:
+        raise AwaitingNPM("npm provenance metadata is not available")
+    opencodex_npm_provenance = provenance_contract()
+
+    try:
+        opencodex_npm_provenance.validate_attestation_metadata(attestations, version)
+    except opencodex_npm_provenance.ContractError as error:
+        raise ContractError(str(error)) from error
+    tarball_bytes = client.tarball_bytes(tarball)
+    verify_tarball(tarball_bytes, integrity, version)
+    client.verify_npm_provenance(version, revision, integrity, tarball_bytes)
+    return {
+        "package": NPM_PACKAGE,
+        "version": version,
+        "integrity": integrity,
+        "tarball": tarball,
+    }
 
 
 def decode_repository_package(value: Any, revision: str, version: str) -> None:
@@ -467,35 +542,11 @@ def detect(client: Any, current: dict[str, Any], npm_origin: str = NPM_REGISTRY)
             fail("same-version upstream GitHub release identity changed")
 
     try:
-        npm_root = client.npm_json(NPM_PACKAGE)
-    except AwaitingNPM:
+        npm_identity = verify_npm_artifact(client, version, revision, npm_origin)
+    except AwaitingNPM as error:
         if detected_version > current_version:
             return "awaiting-npm", None
-        fail("same-version npm metadata disappeared")
-    if not isinstance(npm_root, dict):
-        fail("npm metadata root is invalid")
-    if npm_root.get("name") != NPM_PACKAGE:
-        fail("npm metadata package name is invalid")
-    versions = npm_root.get("versions")
-    if not isinstance(versions, dict) or version not in versions:
-        if detected_version > current_version:
-            return "awaiting-npm", None
-        fail("same-version npm metadata disappeared")
-    npm_version = versions[version]
-    if not isinstance(npm_version, dict) or npm_version.get("name") != NPM_PACKAGE or npm_version.get("version") != version:
-        fail("npm version metadata identity is invalid")
-    dist = npm_version.get("dist")
-    if not isinstance(dist, dict):
-        fail("npm version metadata has no dist identity")
-    integrity = validate_sri(dist.get("integrity"))
-    tarball = validate_tarball_url(dist.get("tarball"), version, npm_origin)
-    try:
-        tarball_bytes = client.tarball_bytes(tarball)
-    except AwaitingNPM:
-        if detected_version > current_version:
-            return "awaiting-npm", None
-        fail("same-version npm tarball disappeared")
-    verify_tarball(tarball_bytes, integrity, version)
+        fail(f"same-version {error}")
 
     candidate = {
         "schema": 1,
@@ -504,12 +555,7 @@ def detect(client: Any, current: dict[str, Any], npm_origin: str = NPM_REGISTRY)
         "release": {"id": release_id, "tag": tag, "published_at": published_at},
         "version": version,
         "revision": revision,
-        "npm": {
-            "package": NPM_PACKAGE,
-            "version": version,
-            "integrity": integrity,
-            "tarball": tarball,
-        },
+        "npm": npm_identity,
     }
     validate_lock(candidate, npm_origin)
 
@@ -659,6 +705,20 @@ def command_apply(arguments: argparse.Namespace) -> int:
 
 def command_verify(arguments: argparse.Namespace) -> int:
     verified = verify_tree(arguments.container)
+    if getattr(arguments, "verify_provenance", False):
+        npm_registry = getattr(arguments, "npm_registry", NPM_REGISTRY)
+        client = NetworkClient(GITHUB_API, npm_registry)
+        try:
+            npm_identity = verify_npm_artifact(
+                client,
+                verified["version"],
+                verified["revision"],
+                npm_registry,
+            )
+        except AwaitingNPM as error:
+            fail(f"locked npm provenance is unavailable: {error}")
+        if npm_identity != verified["npm"]:
+            fail("live npm artifact identity differs from the upstream lock")
     print(
         json.dumps(
             {
@@ -697,6 +757,8 @@ def parser() -> argparse.ArgumentParser:
 
     verify = subcommands.add_parser("verify-tree", help="verify lock/package/bun/notices agreement")
     verify.add_argument("--container", type=pathlib.Path, required=True)
+    verify.add_argument("--verify-provenance", action="store_true")
+    verify.add_argument("--npm-registry", default=NPM_REGISTRY)
     verify.set_defaults(handler=command_verify)
     return result
 

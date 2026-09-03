@@ -444,6 +444,7 @@ func runtimeRoutingFixture(t *testing.T, runtimeApply runtimeControlFunc) (*Cont
 		}),
 		withLocalCatalogMaterializer(func(context.Context, config.Config) error { return nil }),
 		WithRuntimeControl(runtimeApply),
+		WithAppleRuntimeCredentialGuard(func(context.Context) error { return nil }),
 	)
 	if err != nil {
 		t.Fatal(err)

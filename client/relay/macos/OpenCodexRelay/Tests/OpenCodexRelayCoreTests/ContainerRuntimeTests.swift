@@ -336,6 +336,10 @@ final class ContainerRuntimeTests: XCTestCase {
             expectedRoutingGeneration: 9,
             confirmDesktopExited: true
         )
+        _ = try await client.park(
+            expectedStateDigest: hexA,
+            expectedRoutingGeneration: 9
+        )
         _ = try await client.recover(
             expectedStateDigest: hexA,
             confirmDesktopExited: true
@@ -349,6 +353,11 @@ final class ContainerRuntimeTests: XCTestCase {
             "--expected-state-digest", hexA,
             "--expected-routing-generation", "9",
             "--confirm-desktop-exited", "--json",
+            "--config", relayConfig.path,
+            "--codex-config", codexConfig.path,
+            "container-runtime", "park",
+            "--expected-state-digest", hexA,
+            "--expected-routing-generation", "9", "--json",
             "--config", relayConfig.path,
             "--codex-config", codexConfig.path,
             "container-runtime", "recover",
@@ -405,6 +414,55 @@ final class ContainerRuntimeTests: XCTestCase {
             "--config", secondRelay.path,
             "--codex-config", secondCodex.path,
         ])
+    }
+
+    func testProcessClientTimeoutWaitsForRelayctlSignalCleanupPastGracePeriod() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("container-runtime-timeout-cleanup.\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let script = directory.appendingPathComponent("relayctl")
+        let cleanupMarker = directory.appendingPathComponent("cleanup-complete")
+        let body = """
+        #!/bin/sh
+        trap '/bin/sleep 0.20; /usr/bin/touch "\(cleanupMarker.path)"; exit 143' TERM
+        while :; do :; done
+        """
+        try Data(body.utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+        let bindingURL = directory.appendingPathComponent("routing-binding.json")
+        try writeBinding(
+            at: bindingURL,
+            relayConfig: directory.appendingPathComponent("relay.json"),
+            codexConfig: directory.appendingPathComponent("config.toml")
+        )
+        let client = ProcessContainerRuntimeClient(
+            executableURL: script,
+            bindingURL: bindingURL,
+            runtimeMode: .managed,
+            distributionFlavor: .production,
+            executionPolicy: RelayctlExecutionPolicy(
+                // Leave enough startup time for the shell to install its TERM
+                // trap even on a contended CI host. The 200 ms trap still
+                // exceeds the 10 ms Swift grace period by a wide margin.
+                timeout: 2.00,
+                terminationGracePeriod: 0.01,
+                maximumOutputBytes: 64 * 1_024
+            )
+        )
+
+        do {
+            _ = try await client.inspect()
+            XCTFail("timed-out container-runtime helper succeeded")
+        } catch {
+            XCTAssertEqual(error as? RelayctlError, .timedOut)
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: cleanupMarker.path),
+            "Swift force-killed relayctl before its SIGTERM cleanup completed"
+        )
     }
 
     func testProcessClientFailsClosedOutsideManagedProduction() async throws {

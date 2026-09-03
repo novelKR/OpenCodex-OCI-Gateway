@@ -302,7 +302,7 @@ func maintenanceFixture(t *testing.T) (*MaintenanceCoordinator, *Store, *Watcher
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	watcher := NewWatcher(store, 0)
+	watcher := NewWatcher(store, 0, WithWatcherStateRecoveryGate(func(State) error { return nil }))
 	runtime := &maintenanceRuntimeRecorder{}
 	coordinator, err := NewMaintenanceCoordinator(configPath, watcher, runtime)
 	if err != nil {

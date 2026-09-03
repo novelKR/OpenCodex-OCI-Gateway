@@ -166,16 +166,20 @@ func (a *AppleCLI) Capability(ctx context.Context, minimum, installationID strin
 		result.Reason = "apple_container_service_not_running"
 		return result, nil
 	}
-	occupied, foreign, err := a.fixedContainerExists(ctx, installationID)
+	containerState, err := a.fixedContainerState(ctx, installationID)
 	if err != nil {
 		result.Reason = "apple_container_conflict_check_failed"
 		return result, nil
 	}
-	if occupied && foreign {
+	if containerState == FixedContainerForeign {
 		result.Reason = "apple_container_foreign_container"
 		return result, nil
 	}
-	if !occupied {
+	if containerState == FixedContainerUnknown {
+		result.Reason = "apple_container_conflict_check_failed"
+		return result, nil
+	}
+	if containerState == FixedContainerAbsent {
 		if listenErr := a.probePort(); listenErr != nil {
 			result.Reason = "apple_container_port_unavailable"
 			return result, nil
@@ -309,13 +313,16 @@ func (a *AppleCLI) Start(ctx context.Context, spec StartSpec) (string, error) {
 	if a.networkName != "" && !validRuntimeCanaryNetworkName(a.networkName) {
 		return "", ErrInvalidRequest
 	}
-	occupied, foreign, err := a.fixedContainerExists(ctx, spec.InstallationID)
+	containerState, err := a.fixedContainerState(ctx, spec.InstallationID)
 	if err != nil {
 		return "", err
 	}
-	if occupied {
-		if foreign {
+	if containerState != FixedContainerAbsent {
+		if containerState == FixedContainerForeign {
 			return "", ErrForeignResource
+		}
+		if containerState == FixedContainerUnknown {
+			return "", ErrUnsafeState
 		}
 		return "", ErrStateChanged
 	}
@@ -417,6 +424,37 @@ func (a *AppleCLI) VerifyContainer(ctx context.Context, containerID string, spec
 	return nil
 }
 
+// ContainerState is a second, independent inspect performed immediately
+// before credentials may cross the fixed loopback port. VerifyContainer owns
+// the full static confinement proof; this read binds the current process state
+// to the same complete label witness and accepts only the exact `running`
+// spelling emitted by Apple Container 1.3.1.
+func (a *AppleCLI) ContainerState(ctx context.Context, containerID string, spec StartSpec) (FixedContainerState, error) {
+	if a == nil {
+		return FixedContainerUnknown, ErrUnavailable
+	}
+	if containerID != ContainerName || validateReadbackSpec(spec, a.socketDirectory) != nil {
+		return FixedContainerUnknown, ErrInvalidRequest
+	}
+	value, raw, err := a.inspectContainer(ctx, containerID)
+	if err != nil {
+		return FixedContainerUnknown, err
+	}
+	defer zeroBytes(raw)
+	resource := findContainerResource(value, containerID)
+	container := findContainerObject(value, containerID)
+	if resource == nil || container == nil {
+		return FixedContainerAbsent, nil
+	}
+	labels := mapAt(container, "labels")
+	for key, expected := range ownedLabels(spec) {
+		if stringAt(labels, key) != expected {
+			return FixedContainerForeign, nil
+		}
+	}
+	return inspectedFixedContainerState(resource), nil
+}
+
 func validRuntimeCanaryNetworkName(value string) bool {
 	const prefix = "ocx-lifecycle-canary-"
 	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+12 {
@@ -460,14 +498,17 @@ func (a *AppleCLI) VerifyAbsent(ctx context.Context, installationID string) erro
 	if !isSHA256(installationID) {
 		return ErrInvalidRequest
 	}
-	occupied, foreign, err := a.fixedContainerExists(ctx, installationID)
+	containerState, err := a.fixedContainerState(ctx, installationID)
 	if err != nil {
 		return err
 	}
-	if foreign {
+	if containerState == FixedContainerForeign {
 		return ErrForeignResource
 	}
-	if occupied {
+	if containerState == FixedContainerUnknown {
+		return ErrUnsafeState
+	}
+	if containerState != FixedContainerAbsent {
 		return ErrStateChanged
 	}
 	return nil
@@ -482,23 +523,38 @@ func (a *AppleCLI) verifyOwnership(ctx context.Context, containerID string, spec
 	return a.VerifyContainer(ctx, containerID, spec)
 }
 
-func (a *AppleCLI) fixedContainerExists(ctx context.Context, installationID string) (bool, bool, error) {
+func (a *AppleCLI) fixedContainerState(ctx context.Context, installationID string) (FixedContainerState, error) {
 	output, err := a.runContainer(ctx, []string{"list", "--all", "--format", "json"}, maximumCommandOutputBytes)
 	if err != nil {
-		return false, false, ErrUnavailable
+		return FixedContainerUnknown, ErrUnavailable
 	}
 	defer zeroCommandOutput(&output)
 	value, err := decodeGenericJSON(output.stdout)
 	if err != nil {
-		return false, false, ErrUnavailable
+		return FixedContainerUnknown, ErrUnavailable
 	}
+	resource := findContainerResource(value, ContainerName)
 	container := findContainerObject(value, ContainerName)
-	if container == nil {
-		return false, false, nil
+	if resource == nil || container == nil {
+		return FixedContainerAbsent, nil
 	}
 	labels := mapAt(container, "labels")
 	owned := stringAt(labels, labelOwner) == "opencodex-relay" && stringAt(labels, labelInstallation) == installationID
-	return true, !owned, nil
+	if !owned {
+		return FixedContainerForeign, nil
+	}
+	return inspectedFixedContainerState(resource), nil
+}
+
+func inspectedFixedContainerState(container map[string]any) FixedContainerState {
+	switch stringAt(mapAt(container, "status"), "state") {
+	case "running":
+		return FixedContainerRunningOwned
+	case "stopped":
+		return FixedContainerStoppedOwned
+	default:
+		return FixedContainerUnknown
+	}
 }
 
 func (a *AppleCLI) inspectContainer(ctx context.Context, containerID string) (any, []byte, error) {
@@ -865,6 +921,28 @@ func findContainerObject(value any, identifier string) map[string]any {
 	case []any:
 		for _, nested := range current {
 			if found := findContainerObject(nested, identifier); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
+func findContainerResource(value any, identifier string) map[string]any {
+	switch current := value.(type) {
+	case map[string]any:
+		if stringAt(current, "id") == identifier || stringAt(current, "name") == identifier ||
+			stringAt(mapAt(current, "configuration"), "id") == identifier {
+			return current
+		}
+		for _, nested := range current {
+			if found := findContainerResource(nested, identifier); found != nil {
+				return found
+			}
+		}
+	case []any:
+		for _, nested := range current {
+			if found := findContainerResource(nested, identifier); found != nil {
 				return found
 			}
 		}

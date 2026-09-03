@@ -93,7 +93,7 @@ func TestJSONOutputRequestedRecognizesOnlyExplicitJSONFlag(t *testing.T) {
 	}
 }
 
-func TestParseBackendRequestIncludesAppleContainerWithoutChangingAliases(t *testing.T) {
+func TestParseBackendRequestKeepsAppleContainerLifecycleOnly(t *testing.T) {
 	tests := []struct {
 		value string
 		want  routing.Backend
@@ -102,7 +102,6 @@ func TestParseBackendRequestIncludesAppleContainerWithoutChangingAliases(t *test
 		{"external", routing.BackendExternal},
 		{"relay", routing.BackendExternal},
 		{"local_opencodex", routing.BackendLocalOpenCodex},
-		{"local_apple_container", routing.BackendLocalAppleContainer},
 	}
 	for _, test := range tests {
 		t.Run(test.value, func(t *testing.T) {
@@ -112,13 +111,16 @@ func TestParseBackendRequestIncludesAppleContainerWithoutChangingAliases(t *test
 			}
 		})
 	}
-	if got, err := parseBackendRequest("apple"); err == nil || got != routing.BackendUnknown || !strings.Contains(err.Error(), "local_apple_container") {
+	if got, err := parseBackendRequest("local_apple_container"); err == nil || got != routing.BackendUnknown || !strings.Contains(err.Error(), "container-runtime activate") {
+		t.Fatalf("generic Apple request = %q, %v", got, err)
+	}
+	if got, err := parseBackendRequest("apple"); err == nil || got != routing.BackendUnknown {
 		t.Fatalf("unsupported alias = %q, %v", got, err)
 	}
 
 	var output strings.Builder
 	writeUsage(&output)
-	if !strings.Contains(output.String(), "native|external|local_opencodex|local_apple_container|relay") {
-		t.Fatalf("usage omits Apple Container backend: %q", output.String())
+	if !strings.Contains(output.String(), "native|external|local_opencodex|relay") || strings.Contains(output.String(), "local_opencodex|local_apple_container") {
+		t.Fatalf("usage exposes lifecycle-only Apple Container backend: %q", output.String())
 	}
 }

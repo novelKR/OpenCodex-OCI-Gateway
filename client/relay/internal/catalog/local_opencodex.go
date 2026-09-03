@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
-	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 // LocalOpenCodexAvailability is safe to include in the relayctl/MenuBar
@@ -40,16 +40,18 @@ var ErrLocalOpenCodexPreflight = errors.New("local OpenCodex preflight failed")
 // allowing an Apply to wait indefinitely.
 const localOpenCodexMaterializationTimeout = 12 * time.Second
 
-// LocalOpenCodexFetcher is deliberately separate from Fetcher: it never asks
-// for credentials, never adds admission headers, and never consults an
-// environment proxy. Callers provide the already policy-validated numeric
+// LocalOpenCodexFetcher is deliberately separate from Fetcher and never
+// consults an environment proxy. Native Local is credentialless; the Apple
+// profile can obtain one API token only through its connection-bound lease
+// and post-dial authorizer. Callers provide the policy-validated numeric
 // loopback /v1 base URL.
 type LocalOpenCodexFetcher struct {
 	BaseURL               string
 	CatalogPath           string
 	ExpectedServicePort   int
 	AuthenticationProfile string
-	Credentials           func() (credentials.Values, error)
+	ConnectionLease       loopbackauth.LeaseAcquirer
+	AuthorizeConnection   loopbackauth.Authorizer
 	HTTPClient            *http.Client
 }
 
@@ -59,9 +61,9 @@ type LocalOpenCodexFetcher struct {
 // resident Local catalog lifecycle: callers use it at the Desktop restart
 // boundary so Codex is never pointed at an absent or unchecked catalog.
 //
-// LocalOpenCodexFetcher deliberately constructs the no-proxy, no-credential,
-// no-redirect client used here.  This helper accepts only the policy-validated
-// numeric loopback endpoint and does not expose any external gateway settings.
+// This native helper deliberately constructs a no-proxy, no-credential,
+// no-redirect client. It accepts only the policy-validated numeric loopback
+// endpoint and does not expose any external gateway settings.
 func MaterializeLocalOpenCodexCatalog(ctx context.Context, baseURL, catalogPath string) (Result, error) {
 	return materializeLocalOpenCodexCatalog(ctx, LocalOpenCodexFetcher{
 		BaseURL:     baseURL,
@@ -178,17 +180,17 @@ func (f LocalOpenCodexFetcher) fetchEntries(ctx context.Context, client http.Cli
 		return nil, fmt.Errorf("%w: models request", ErrLocalOpenCodexPreflight)
 	}
 	profile := f.authenticationProfile()
-	values := credentials.Values{}
-	if profile != config.RemoteAuthenticationNone {
-		if f.Credentials == nil {
+	if profile == config.LocalAuthenticationOpenCodexAPIKey {
+		base, ok := client.Transport.(*http.Transport)
+		if !ok {
 			return nil, fmt.Errorf("%w: models authentication", ErrLocalOpenCodexPreflight)
 		}
-		values, err = f.Credentials()
-		if err != nil || values.ValidateForProfile(profile) != nil {
+		bound, bindErr := loopbackauth.NewTransport(base, f.ConnectionLease, f.AuthorizeConnection)
+		if bindErr != nil {
 			return nil, fmt.Errorf("%w: models authentication", ErrLocalOpenCodexPreflight)
 		}
+		client.Transport = bound
 	}
-	applyCredentialHeaders(request.Header, profile, values)
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("%w: models unavailable", ErrLocalOpenCodexPreflight)
@@ -217,7 +219,9 @@ func (f LocalOpenCodexFetcher) endpoint() (*url.URL, error) {
 	profile := f.authenticationProfile()
 	validBaseURL := profile == config.RemoteAuthenticationNone && config.IsLocalOpenCodexBaseURL(f.BaseURL)
 	if profile == config.LocalAuthenticationOpenCodexAPIKey {
-		validBaseURL = config.IsLocalAppleContainerBaseURL(f.BaseURL)
+		validBaseURL = config.IsLocalAppleContainerBaseURL(f.BaseURL) && f.ConnectionLease != nil && f.AuthorizeConnection != nil
+	} else if f.ConnectionLease != nil || f.AuthorizeConnection != nil {
+		validBaseURL = false
 	}
 	if !validBaseURL || f.expectedServicePort() != 10100 {
 		return nil, errors.New("invalid local OpenCodex endpoint")

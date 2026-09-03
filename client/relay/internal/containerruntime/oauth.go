@@ -37,13 +37,19 @@ type OAuthSessionManager struct {
 	store    *oauthSessionStore
 	api      ManagementAPI
 	keychain Keychain
+	lease    RuntimeCredentialLease
 	account  string
 	now      func() time.Time
 	mu       sync.Mutex
 }
 
-func NewOAuthSessionManager(root string, api ManagementAPI, keychain Keychain, account string) (*OAuthSessionManager, error) {
-	if api == nil || keychain == nil || !validKeychainAccount(account) {
+// RuntimeCredentialLease proves the exact signed Apple container is still
+// running and serializes the complete Admin-token HTTP request with lifecycle
+// mutations that can release and rebind its fixed loopback port.
+type RuntimeCredentialLease func(context.Context) (func() error, error)
+
+func NewOAuthSessionManager(root string, api ManagementAPI, keychain Keychain, account string, lease RuntimeCredentialLease) (*OAuthSessionManager, error) {
+	if api == nil || keychain == nil || lease == nil || !validKeychainAccount(account) {
 		return nil, ErrInvalidRequest
 	}
 	store, err := newOAuthSessionStore(root)
@@ -54,6 +60,7 @@ func NewOAuthSessionManager(root string, api ManagementAPI, keychain Keychain, a
 		store:    store,
 		api:      api,
 		keychain: keychain,
+		lease:    lease,
 		account:  account,
 		now:      time.Now,
 	}, nil
@@ -65,11 +72,12 @@ func (m *OAuthSessionManager) Providers(ctx context.Context) (OAuthProvidersRece
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	admin, err := m.loadAdminToken(ctx)
+	admin, release, err := m.loadAdminToken(ctx)
 	if err != nil {
 		return OAuthProvidersReceipt{}, err
 	}
 	defer zeroBytes(admin)
+	defer release()
 	providers, err := m.api.Providers(ctx, admin)
 	if err != nil {
 		return OAuthProvidersReceipt{}, err
@@ -99,11 +107,12 @@ func (m *OAuthSessionManager) Start(ctx context.Context, provider string, kind O
 			return OAuthReceipt{}, ErrStateChanged
 		}
 	}
-	admin, err := m.loadAdminToken(ctx)
+	admin, release, err := m.loadAdminToken(ctx)
 	if err != nil {
 		return OAuthReceipt{}, err
 	}
 	defer zeroBytes(admin)
+	defer release()
 	flow, err := m.api.Start(ctx, admin, provider, kind)
 	if err != nil {
 		return OAuthReceipt{}, err
@@ -160,11 +169,12 @@ func (m *OAuthSessionManager) Status(ctx context.Context, operationID string) (O
 		_ = m.store.remove(operationID)
 		return receiptForSession(session, OAuthStatusFailed), nil
 	}
-	admin, err := m.loadAdminToken(ctx)
+	admin, release, err := m.loadAdminToken(ctx)
 	if err != nil {
 		return OAuthReceipt{}, err
 	}
 	defer zeroBytes(admin)
+	defer release()
 	status, err := m.api.Status(ctx, admin, flowForSession(session))
 	if err != nil {
 		return OAuthReceipt{}, err
@@ -199,11 +209,12 @@ func (m *OAuthSessionManager) Submit(ctx context.Context, request OAuthSubmitReq
 		_ = m.store.remove(request.OperationID)
 		return OAuthReceipt{}, ErrInvalidRequest
 	}
-	admin, err := m.loadAdminToken(ctx)
+	admin, release, err := m.loadAdminToken(ctx)
 	if err != nil {
 		return OAuthReceipt{}, err
 	}
 	defer zeroBytes(admin)
+	defer release()
 	if err := m.api.Submit(ctx, admin, flowForSession(session), string(input)); err != nil {
 		return OAuthReceipt{}, err
 	}
@@ -220,11 +231,12 @@ func (m *OAuthSessionManager) Cancel(ctx context.Context, operationID string) (O
 	if err != nil {
 		return OAuthReceipt{}, err
 	}
-	admin, err := m.loadAdminToken(ctx)
+	admin, release, err := m.loadAdminToken(ctx)
 	if err != nil {
 		return OAuthReceipt{}, err
 	}
 	defer zeroBytes(admin)
+	defer release()
 	if err := m.api.Cancel(ctx, admin, flowForSession(session)); err != nil {
 		return OAuthReceipt{}, err
 	}
@@ -234,19 +246,28 @@ func (m *OAuthSessionManager) Cancel(ctx context.Context, operationID string) (O
 	return receiptForSession(session, OAuthStatusCancelled), nil
 }
 
-func (m *OAuthSessionManager) loadAdminToken(ctx context.Context) ([]byte, error) {
+func (m *OAuthSessionManager) loadAdminToken(ctx context.Context) ([]byte, func() error, error) {
+	if ctx == nil || m.lease == nil {
+		return nil, nil, ErrRecoveryRequired
+	}
+	release, err := m.lease(ctx)
+	if err != nil || release == nil {
+		return nil, nil, ErrRecoveryRequired
+	}
 	secrets, err := m.keychain.Load(ctx, m.account)
 	if err != nil {
 		zeroBytes(secrets.APIToken)
 		zeroBytes(secrets.AdminToken)
-		return nil, ErrCredential
+		_ = release()
+		return nil, nil, ErrCredential
 	}
 	defer zeroBytes(secrets.APIToken)
 	defer zeroBytes(secrets.AdminToken)
 	if !validSecret(secrets.APIToken) || !validSecret(secrets.AdminToken) || bytes.Equal(secrets.APIToken, secrets.AdminToken) {
-		return nil, ErrCredential
+		_ = release()
+		return nil, nil, ErrCredential
 	}
-	return append([]byte(nil), secrets.AdminToken...), nil
+	return append([]byte(nil), secrets.AdminToken...), release, nil
 }
 
 func (m *OAuthSessionManager) sessionExpired(session oauthSession) bool {

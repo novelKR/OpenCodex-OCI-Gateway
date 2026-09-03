@@ -175,6 +175,7 @@ jobs:
     name: runtime-image
     if: github.event.repository.private == false
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       BUILDX_DOWNLOAD_URL: https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-amd64
       BUILDX_SHA256: c37114fcd034025ec68e224657c8a5a850df472ded3ddcbca75ad3a7ebb9710d
@@ -205,7 +206,7 @@ jobs:
               ".github/workflows/opencodex-",
               "containers/opencodex/",
               "tools/opencodex_",
-              "tools/publish-opencodex-runtime-release.sh",
+              "tools/verify_npm_slsa_identity.cjs",
               "pilot/tests/test_opencodex_",
               "config/trust/opencodex-runtime-release-ed25519.pub",
           )
@@ -273,7 +274,9 @@ jobs:
         if: steps.scope.outputs.applicable == 'true'
         run: |
           set -euo pipefail
-          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          python3 tools/opencodex_upstream.py verify-tree \
+            --container containers/opencodex \
+            --verify-provenance
           node --test containers/opencodex/bootstrap.test.mjs
           version="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["version"])')"
           revision="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["revision"])')"

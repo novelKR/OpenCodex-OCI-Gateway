@@ -239,6 +239,112 @@ final class ContainerRuntimeController: ObservableObject {
         }
     }
 
+    /// Reconcile only after the interrupted relayctl process has been reaped.
+    /// A completed activation is durably parked through the existing Stop CAS
+    /// path; interrupted/update states remain explicit recovery_required.
+    func parkAfterDesktopRestart(confirmDesktopExited: Bool) async -> Bool {
+        guard confirmDesktopExited else {
+            requestID += 1
+            let current = requestID
+            isBusy = true
+            lastErrorCode = "container_runtime_desktop_restarted"
+            do {
+                let refreshed = try await client.inspect()
+                guard requestID == current else { return false }
+                inspection = refreshed
+                if refreshed.state == .stopped {
+                    isBusy = false
+                    return true
+                }
+                if refreshed.active != nil,
+                   refreshed.state == .healthy || refreshed.state == .recoveryRequired ||
+                   refreshed.state == .unavailable {
+                    do {
+                        let receipt = try await client.park(
+                            expectedStateDigest: refreshed.stateDigest,
+                            expectedRoutingGeneration: refreshed.routingGeneration
+                        )
+                        guard requestID == current else { return false }
+                        inspection = receipt.inspection
+                        isBusy = false
+                        return receipt.inspection.state == .recoveryRequired ||
+                            receipt.inspection.state == .stopped
+                    } catch {
+                        // A canceled relayctl may have persisted its own recovery
+                        // journal before this compensating CAS reached it. Read back
+                        // the durable result; never treat an in-memory projection as
+                        // successful parking.
+                        let after = try await client.inspect()
+                        guard requestID == current else { return false }
+                        inspection = after
+                        isBusy = false
+                        return after.state == .recoveryRequired || after.state == .stopped
+                    }
+                }
+                projectRecoveryRequired(refreshed)
+                isBusy = false
+                return false
+            } catch {
+                guard requestID == current else { return false }
+                projectRecoveryRequired(inspection)
+                isBusy = false
+                return false
+            }
+        }
+        requestID += 1
+        let current = requestID
+        isBusy = true
+        lastErrorCode = "container_runtime_desktop_restarted"
+        do {
+            let refreshed = try await client.inspect()
+            guard requestID == current else { return false }
+            inspection = refreshed
+            switch refreshed.state {
+            case .stopped, .recoveryRequired:
+                isBusy = false
+                return true
+            case .healthy:
+                let receipt = try await client.stop(
+                    expectedStateDigest: refreshed.stateDigest,
+                    expectedRoutingGeneration: refreshed.routingGeneration,
+                    confirmDesktopExited: true
+                )
+                guard requestID == current else { return false }
+                inspection = receipt.inspection
+                isBusy = false
+                return receipt.inspection.state == .stopped ||
+                    receipt.inspection.state == .recoveryRequired
+            case .unavailable, .staging, .updating:
+                projectRecoveryRequired(refreshed)
+                isBusy = false
+                return false
+            }
+        } catch {
+            guard requestID == current else { return false }
+            projectRecoveryRequired(inspection)
+            isBusy = false
+            return false
+        }
+    }
+
+    private func projectRecoveryRequired(_ basis: ContainerRuntimeInspection?) {
+        if let basis {
+            inspection = ContainerRuntimeInspection(
+                schemaVersion: basis.schemaVersion,
+                ok: basis.ok,
+                state: .recoveryRequired,
+                capability: basis.capability,
+                staged: basis.staged,
+                active: basis.active,
+                stateDigest: basis.stateDigest,
+                routingGeneration: basis.routingGeneration,
+                recoveryRequired: true
+            )
+        } else {
+            inspection = nil
+        }
+    }
+
     func loadOAuthProviders() {
         guard canManageOAuth, !isOAuthBusy else { return }
         performOAuth { client in

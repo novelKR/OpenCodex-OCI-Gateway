@@ -24,6 +24,11 @@ type DriftCheck func(State) error
 // admission without exposing its details through health or status.
 type RecoveryGate func() error
 
+// StateRecoveryGate validates authority that lives outside routing state.
+// The Apple lifecycle manager uses it only after a stable Apple route no
+// longer has a transition witness; other backends remain unaffected.
+type StateRecoveryGate func(State) error
+
 type WatcherOption func(*Watcher)
 
 func WithDriftCheck(check DriftCheck) WatcherOption {
@@ -34,18 +39,23 @@ func WithWatcherRecoveryGate(check RecoveryGate) WatcherOption {
 	return func(watcher *Watcher) { watcher.recoveryGate = check }
 }
 
+func WithWatcherStateRecoveryGate(check StateRecoveryGate) WatcherOption {
+	return func(watcher *Watcher) { watcher.stateRecoveryGate = check }
+}
+
 func (s Snapshot) AllowsDataPlane() bool { return !s.Invalid && s.State.AllowsDataPlane() }
 func (s Snapshot) AllowsCatalog() bool   { return !s.Invalid && s.State.AllowsCatalog() }
 
 // Watcher polls the atomically-replaced state file. Polling avoids a native
 // filesystem watcher dependency and works after editor/rename based writes.
 type Watcher struct {
-	store        *Store
-	interval     time.Duration
-	mu           sync.RWMutex
-	snapshot     Snapshot
-	driftCheck   DriftCheck
-	recoveryGate RecoveryGate
+	store             *Store
+	interval          time.Duration
+	mu                sync.RWMutex
+	snapshot          Snapshot
+	driftCheck        DriftCheck
+	recoveryGate      RecoveryGate
+	stateRecoveryGate StateRecoveryGate
 }
 
 func NewWatcher(store *Store, interval time.Duration, options ...WatcherOption) *Watcher {
@@ -101,6 +111,18 @@ func (w *Watcher) Refresh() {
 			transaction, transactionFound, loadErr := controller.loadJournal()
 			if loadErr != nil || maintenanceFound || !runtimeRouting.matchesState(state, transaction, transactionFound) {
 				err = fmt.Errorf("container runtime routing witness conflicts with routing state")
+			}
+		}
+		// After a successful lifecycle commit the transition witness is
+		// acknowledged and removed. A stable Apple route must then be backed by
+		// the independently durable container-runtime state. Historical/dev
+		// routing state without that authority is parked as recovery_required.
+		if err == nil && !legacy && !pending && !maintenanceFound && !runtimeRoutingFound &&
+			stableStateForBackend(state, BackendLocalAppleContainer) {
+			if w.stateRecoveryGate == nil {
+				err = fmt.Errorf("container runtime lifecycle authority is unavailable")
+			} else if gateErr := w.stateRecoveryGate(state); gateErr != nil {
+				err = fmt.Errorf("container runtime lifecycle authority requires recovery")
 			}
 		}
 		if err == nil && !legacy && w.driftCheck != nil && state.Phase != PhaseApplying && state.Phase != PhaseRecoveryRequired {

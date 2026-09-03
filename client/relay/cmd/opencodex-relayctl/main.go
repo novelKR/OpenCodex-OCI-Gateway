@@ -88,7 +88,7 @@ func writeUsage(writer io.Writer) {
   opencodex-relayctl enable [--config PATH] [--codex-config PATH] # deprecated request alias; does not apply
   opencodex-relayctl disable [--config PATH] [--codex-config PATH] # deprecated request alias; does not apply
   opencodex-relayctl mode status [--config PATH] [--codex-config PATH] --json
-  opencodex-relayctl mode request native|external|local_opencodex|local_apple_container|relay [--config PATH] [--codex-config PATH] [--json]
+  opencodex-relayctl mode request native|external|local_opencodex|relay [--config PATH] [--codex-config PATH] [--json]
   opencodex-relayctl mode seed-native [--config PATH] [--codex-config PATH] [--json] # local-dev installer only
   opencodex-relayctl mode verify-native [--config PATH] [--codex-config PATH] [--json] # local-dev installer only
   opencodex-relayctl mode repair-native --expected-routing-generation N
@@ -164,6 +164,8 @@ func writeUsage(writer io.Writer) {
       --expected-routing-generation N --confirm-desktop-exited --json
   opencodex-relayctl container-runtime stop --expected-state-digest SHA256
       --expected-routing-generation N --confirm-desktop-exited --json
+  opencodex-relayctl container-runtime park --expected-state-digest SHA256
+      --expected-routing-generation N --json # internal Desktop-restart fail-closed path
   opencodex-relayctl container-runtime recover --expected-state-digest SHA256
       --confirm-desktop-exited --json
   opencodex-relayctl container-runtime oauth providers --json
@@ -190,11 +192,12 @@ func defaultPaths() (string, string) {
 // static local_opencodex topology deliberately has no runtime manager/socket;
 // retain its pre-existing controller behavior instead of making the new
 // macOS-only mechanism a breaking Linux dependency.
-func routingController(configPath, codexPath string) (*routing.Controller, error) {
+func routingController(configPath, codexPath string, additionalOptions ...routing.ControllerOption) (*routing.Controller, error) {
 	return routingControllerWithRecoveryGate(
 		configPath,
 		codexPath,
 		func() error { return handoff.RemovalRoutingGate(configPath) },
+		additionalOptions...,
 	)
 }
 
@@ -973,7 +976,7 @@ func modeStatus(args []string) {
 
 func modeRequest(args []string) {
 	if len(args) == 0 {
-		fatal(errorsNew("mode request requires native, external, local_opencodex, local_apple_container, or relay"))
+		fatal(errorsNew("mode request requires native, external, local_opencodex, or relay"))
 	}
 	target, err := parseBackendRequest(args[0])
 	if err != nil {
@@ -1042,9 +1045,9 @@ func parseBackendRequest(value string) (routing.Backend, error) {
 	case "local_opencodex":
 		return routing.BackendLocalOpenCodex, nil
 	case "local_apple_container":
-		return routing.BackendLocalAppleContainer, nil
+		return routing.BackendUnknown, errorsNew("local_apple_container is lifecycle-only; use container-runtime activate")
 	default:
-		return routing.BackendUnknown, errorsNew("mode request requires native, external, local_opencodex, local_apple_container, or relay")
+		return routing.BackendUnknown, errorsNew("mode request requires native, external, local_opencodex, or relay")
 	}
 }
 

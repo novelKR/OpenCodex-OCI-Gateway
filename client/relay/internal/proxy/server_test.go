@@ -21,6 +21,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/compat"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/responses"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/scheduler"
@@ -103,7 +104,17 @@ func TestAppleRuntimeRewriteStripsCallerAdmissionHeadersAndInjectsOnlyAPIKey(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(cfg, func() (credentials.Values, error) { return credentials.Values{}, nil }, nil, nil)
+	server, err := New(
+		cfg,
+		func() (credentials.Values, error) { return credentials.Values{}, nil },
+		nil,
+		nil,
+		WithAppleRuntimeConnectionBinding(
+			func(context.Context) (loopbackauth.Authorization, error) {
+				return loopbackauth.Authorization{Token: []byte("apple-api-key")}, nil
+			},
+		),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,18 +125,12 @@ func TestAppleRuntimeRewriteStripsCallerAdmissionHeadersAndInjectsOnlyAPIKey(t *
 	incoming.Header.Set("Cf-Access-Jwt-Assertion", "caller-jwt")
 	incoming.Header.Set("X-OpenCodex-API-Key", "caller-key")
 	incoming.Header.Set("X-OpenCodex-Relay", "caller-marker")
-	incoming = incoming.WithContext(context.WithValue(incoming.Context(), credentialContextKey{}, credentials.Values{
-		CFClientID:           "must-not-be-used",
-		CFClientSecret:       "must-not-be-used",
-		GatewayKey:           "must-not-be-used",
-		LocalOpenCodexAPIKey: "apple-api-key",
-	}))
 	outgoing := incoming.Clone(incoming.Context())
 	server.rewrite(&httputil.ProxyRequest{In: incoming, Out: outgoing})
 	if outgoing.URL.String() != "http://127.0.0.1:10210/v1/models" {
 		t.Fatalf("Apple upstream URL = %q", outgoing.URL.String())
 	}
-	if outgoing.Header.Get("X-OpenCodex-API-Key") != "apple-api-key" || outgoing.Header.Get("X-OpenCodex-Relay") != "pw-local-v1" {
+	if outgoing.Header.Get("X-OpenCodex-API-Key") != "" || outgoing.Header.Get("X-OpenCodex-Relay") != "pw-local-v1" {
 		t.Fatalf("Apple injected headers = %#v", outgoing.Header)
 	}
 	if outgoing.Header.Get("CF-Access-Client-Id") != "" || outgoing.Header.Get("CF-Access-Client-Secret") != "" || outgoing.Header.Get("Cf-Access-Jwt-Assertion") != "" {

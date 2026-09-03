@@ -213,3 +213,48 @@ func TestWatcherParksOnExternalRecoveryGate(t *testing.T) {
 		t.Fatalf("released external recovery gate snapshot=%#v", snapshot)
 	}
 }
+
+func TestWatcherParksStableAppleRouteWithoutLifecycleAuthority(t *testing.T) {
+	store, state := testStoreAndState(t)
+	state.DesiredBackend = BackendLocalAppleContainer
+	state.AppliedBackend = BackendLocalAppleContainer
+	state.DesiredMode = ModeRelay
+	state.AppliedMode = ModeRelay
+	state.Phase = PhaseRelayActive
+	lock, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Replace(state); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	watcher := NewWatcher(store, 0)
+	if snapshot := watcher.Snapshot(); !snapshot.Invalid || snapshot.State.Phase != PhaseRecoveryRequired || snapshot.AllowsDataPlane() {
+		t.Fatalf("Apple snapshot without an authority provider = %#v", snapshot)
+	}
+
+	watcher = NewWatcher(store, 0, WithWatcherStateRecoveryGate(func(observed State) error {
+		calls++
+		if observed.Generation != state.Generation || observed.AppliedBackend != BackendLocalAppleContainer {
+			t.Fatalf("authority state = %#v", observed)
+		}
+		return errors.New("lifecycle state missing")
+	}))
+	if snapshot := watcher.Snapshot(); !snapshot.Invalid || snapshot.State.Phase != PhaseRecoveryRequired || snapshot.AllowsDataPlane() {
+		t.Fatalf("unwitnessed Apple snapshot = %#v", snapshot)
+	}
+	if calls != 1 {
+		t.Fatalf("authority calls = %d", calls)
+	}
+
+	watcher = NewWatcher(store, 0, WithWatcherStateRecoveryGate(func(State) error { return nil }))
+	if snapshot := watcher.Snapshot(); snapshot.Invalid || snapshot.State.AppliedBackend != BackendLocalAppleContainer || !snapshot.AllowsDataPlane() {
+		t.Fatalf("committed Apple snapshot = %#v", snapshot)
+	}
+}

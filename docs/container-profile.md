@@ -17,7 +17,13 @@ The Apple Container runtime is a separate image and release lifecycle. Its only
 upstream input is `containers/opencodex/upstream.lock.json`; the external
 `lidge-jun/opencodex` repository is never modified. A six-hour detector verifies
 an immutable GitHub release, direct commit tag, source `package.json`, npm
-metadata, tarball SRI, and the tarball's package identity. A repository-scoped
+metadata, tarball SRI, and the tarball's package identity. It then runs the
+official npm signature verifier and requires both the registry signature and
+Sigstore/SLSA provenance to bind that exact SHA-512 tarball subject to
+`https://github.com/lidge-jun/opencodex`,
+`.github/workflows/release.yml`, and the direct-tag commit. The packument's
+`gitHead` must also equal that commit, but is only corroborating metadata. A
+repository-scoped
 GitHub App may then create a review-only `automation/opencodex-<version>-r1`
 pull request. It cannot write Actions, Workflows, Packages, or Administration,
 and the workflow never force-pushes or enables auto-merge.
@@ -45,6 +51,16 @@ reads the running builder container back and verifies that it uses that selected
 BuildKit image. Updating any of these three build inputs is therefore a
 reviewed Core change, not a mutable tag or hosted-runner tool update.
 
+The npm verifier is equally pinned. The detector downloads the official
+`npm@11.19.1` package by its repository-recorded SHA-512 SRI, safely extracts
+it, asserts its package version, and invokes `npm audit signatures --json
+--include-attestations` inside the exact multi-architecture
+`node:24.20.0-bookworm-slim` OCI index digest recorded in the verifier module.
+The same wrapper is required when PR, candidate, public-candidate, and legacy
+gateway release jobs verify the locked tree. Missing signature or provenance
+evidence for a newly observed release is `awaiting-npm`; missing evidence for
+the already locked version and any present-but-mismatched evidence fail closed.
+
 Candidate publication is deliberately separate from package visibility. The
 workflow never changes GHCR visibility. After the first candidate creates the
 package, an operator may separately approve making it public. A bounded
@@ -57,6 +73,9 @@ or promote the candidate.
 This hosted-only phase creates no stable OCI tag, signed Runtime Manifest,
 Runtime GitHub Release, production Runtime signing key, or Relay application
 release. It also provisions no self-hosted runner and uses no personal Mac.
+The repository therefore includes only candidate receipt creation and
+signature-first stable-manifest verification; the stable-manifest creation
+subcommand and Runtime GitHub Release publisher are deliberately absent.
 GitHub-hosted macOS arm64 runners cannot provide the nested virtualization
 required by Apple Container, so their contract tests are not live Apple
 Container acceptance. A future, separately approved PR may restore stable

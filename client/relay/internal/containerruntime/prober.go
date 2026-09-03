@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 const (
@@ -40,44 +42,44 @@ func newRuntimeHTTPProberWithClient(client *http.Client) *RuntimeHTTPProber {
 	return &RuntimeHTTPProber{client: client, readinessTimeout: maximumReadinessWait, retryBackoff: defaultReadinessRetryBackoff}
 }
 
-func (p *RuntimeHTTPProber) Verify(ctx context.Context, apiToken, adminToken []byte) error {
-	if p == nil || p.client == nil || !validSecret(apiToken) || !validSecret(adminToken) || bytes.Equal(apiToken, adminToken) {
+func (p *RuntimeHTTPProber) Verify(ctx context.Context, apiToken, adminToken []byte, guard func(context.Context) error) error {
+	if p == nil || p.client == nil || guard == nil || !validSecret(apiToken) || !validSecret(adminToken) || bytes.Equal(apiToken, adminToken) {
 		return ErrCredential
 	}
 	if err := p.waitUntilReady(ctx); err != nil {
 		return ErrUnavailable
 	}
-	if body, status, err := p.get(ctx, "/v1/models", nil); err != nil || !isDenied(status) {
+	if body, status, err := p.get(ctx, "/v1/models", nil, nil); err != nil || !isDenied(status) {
 		zeroBytes(body)
 		return ErrUnavailable
 	} else {
 		zeroBytes(body)
 	}
-	models, status, err := p.get(ctx, "/v1/models", apiToken)
+	models, status, err := p.get(ctx, "/v1/models", apiToken, guard)
 	if err != nil || status < 200 || status >= 300 || !validModels(models) {
 		zeroBytes(models)
 		return ErrUnavailable
 	}
 	zeroBytes(models)
-	if body, status, err := p.get(ctx, "/v1/models", adminToken); err != nil || !isDenied(status) {
+	if body, status, err := p.get(ctx, "/v1/models", adminToken, guard); err != nil || !isDenied(status) {
 		zeroBytes(body)
 		return ErrUnavailable
 	} else {
 		zeroBytes(body)
 	}
-	if body, status, err := p.get(ctx, "/api/config", nil); err != nil || !isDenied(status) {
+	if body, status, err := p.get(ctx, "/api/config", nil, nil); err != nil || !isDenied(status) {
 		zeroBytes(body)
 		return ErrUnavailable
 	} else {
 		zeroBytes(body)
 	}
-	if body, status, err := p.get(ctx, "/api/config", apiToken); err != nil || !isDenied(status) {
+	if body, status, err := p.get(ctx, "/api/config", apiToken, guard); err != nil || !isDenied(status) {
 		zeroBytes(body)
 		return ErrUnavailable
 	} else {
 		zeroBytes(body)
 	}
-	configuration, status, err := p.get(ctx, "/api/config", adminToken)
+	configuration, status, err := p.get(ctx, "/api/config", adminToken, guard)
 	if err != nil || status < 200 || status >= 300 || !validJSONObject(configuration) {
 		zeroBytes(configuration)
 		return ErrUnavailable
@@ -98,7 +100,7 @@ func (p *RuntimeHTTPProber) waitUntilReady(ctx context.Context) error {
 	readinessContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
-		health, status, err := p.get(readinessContext, "/healthz", nil)
+		health, status, err := p.get(readinessContext, "/healthz", nil, nil)
 		valid := err == nil && status == http.StatusOK && validHealthIdentity(health)
 		zeroBytes(health)
 		if valid {
@@ -131,17 +133,37 @@ func (p *RuntimeHTTPProber) waitUntilReady(ctx context.Context) error {
 	}
 }
 
-func (p *RuntimeHTTPProber) get(ctx context.Context, path string, token []byte) ([]byte, int, error) {
+func (p *RuntimeHTTPProber) get(ctx context.Context, path string, token []byte, guard func(context.Context) error) ([]byte, int, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, runtimeLoopbackBaseURL+path, nil)
 	if err != nil {
 		return nil, 0, ErrUnavailable
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Connection", "close")
+	client := p.client
 	if len(token) != 0 {
-		request.Header.Set("X-OpenCodex-API-Key", string(token))
+		base, ok := p.client.Transport.(*http.Transport)
+		if !ok || guard == nil {
+			return nil, 0, ErrUnavailable
+		}
+		bound, bindErr := loopbackauth.NewTransport(
+			base,
+			func(context.Context) (func() error, error) { return func() error { return nil }, nil },
+			func(authorizeCtx context.Context) (loopbackauth.Authorization, error) {
+				if err := guard(authorizeCtx); err != nil {
+					return loopbackauth.Authorization{}, err
+				}
+				return loopbackauth.Authorization{Token: append([]byte(nil), token...)}, nil
+			},
+		)
+		if bindErr != nil {
+			return nil, 0, ErrUnavailable
+		}
+		copy := *p.client
+		copy.Transport = bound
+		client = &copy
 	}
-	response, err := p.client.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, 0, ErrUnavailable
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -241,10 +242,11 @@ func TestRelayRuntimeInitialParkedStatesPublishPausedCatalog(t *testing.T) {
 }
 
 type runtimeFixture struct {
-	cancel  context.CancelFunc
-	store   *routing.Store
-	watcher *routing.Watcher
-	state   routing.State
+	cancel          context.CancelFunc
+	store           *routing.Store
+	watcher         *routing.Watcher
+	state           routing.State
+	credentialLoads int
 }
 
 type noopMaintenanceRuntime struct{}
@@ -253,7 +255,7 @@ func (noopMaintenanceRuntime) Prepare(context.Context) error                    
 func (noopMaintenanceRuntime) Verify(context.Context, routing.ControlOperation) error { return nil }
 func (noopMaintenanceRuntime) Resume()                                                {}
 
-func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool) (*relayRuntime, *runtimeFixture, routing.MaintenanceWitness, *int) {
+func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool, guards ...appleRuntimeCredentialGuard) (*relayRuntime, *runtimeFixture, routing.MaintenanceWitness, *int) {
 	t.Helper()
 	directory := t.TempDir()
 	configPath := filepath.Join(directory, "relay.json")
@@ -298,7 +300,7 @@ func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool) (*relayRuntim
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	watcher := routing.NewWatcher(store, 0)
+	watcher := routing.NewWatcher(store, 0, routing.WithWatcherStateRecoveryGate(func(routing.State) error { return nil }))
 	witness := routing.MaintenanceWitness{}
 	if pendingMaintenance {
 		coordinator, err := routing.NewMaintenanceCoordinator(configPath, watcher, noopMaintenanceRuntime{})
@@ -323,6 +325,10 @@ func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool) (*relayRuntim
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture := &runtimeFixture{cancel: cancel, store: store, watcher: watcher, state: state}
+	guard := appleRuntimeCredentialGuard(func(context.Context, uint64) error { return nil })
+	if len(guards) > 0 {
+		guard = guards[0]
+	}
 	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
 	probes := 0
 	runtime, err := newRelayRuntimeWithDependencies(
@@ -332,16 +338,33 @@ func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool) (*relayRuntim
 		watcher,
 		proxy.NewTracker(),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		func(_ context.Context, target localopencodex.Target) localopencodex.Result {
-			probes++
+		func(probeCtx context.Context, target localopencodex.Target) localopencodex.Result {
 			if target.BaseURL != "http://127.0.0.1:10210/v1" || target.ExpectedServicePort != 10100 ||
-				target.AuthenticationProfile != config.LocalAuthenticationOpenCodexAPIKey || target.Credentials.LocalOpenCodexAPIKey != apiToken {
+				target.AuthenticationProfile != config.LocalAuthenticationOpenCodexAPIKey || target.ConnectionLease == nil || target.AuthorizeConnection == nil {
 				t.Fatalf("Apple runtime preflight target = %#v", target)
 			}
+			release, leaseErr := target.ConnectionLease(probeCtx)
+			if leaseErr != nil || release == nil {
+				return localopencodex.Result{Availability: localopencodex.AvailabilityUnavailable}
+			}
+			defer release()
+			authorization, authorizeErr := target.AuthorizeConnection(probeCtx)
+			if authorizeErr != nil {
+				return localopencodex.Result{Availability: localopencodex.AvailabilityUnavailable}
+			}
+			if string(authorization.Token) != apiToken {
+				t.Fatalf("Apple runtime preflight token mismatch")
+			}
+			probes++
 			return localopencodex.Result{Availability: localopencodex.AvailabilityReady, ModelCount: 1}
 		},
 		func(config.CredentialsConfig) (credentials.Values, error) {
+			fixture.credentialLoads++
 			return credentials.Values{LocalOpenCodexAPIKey: apiToken}, nil
+		},
+		appleRuntimeAccess{
+			lease: func(context.Context) (func() error, error) { return func() error { return nil }, nil },
+			guard: guard,
 		},
 	)
 	if err != nil {
@@ -349,6 +372,68 @@ func newAppleRuntimeFixture(t *testing.T, pendingMaintenance bool) (*relayRuntim
 		t.Fatal(err)
 	}
 	return runtime, fixture, witness, &probes
+}
+
+func TestRelayRuntimeRejectsApplePeerBeforeCredentialLoadAndProbe(t *testing.T) {
+	if gort.GOOS != "darwin" || gort.GOARCH != "arm64" {
+		t.Skip("the Apple Container runtime profile is macOS Apple Silicon only")
+	}
+	guardCalls := 0
+	runtime, fixture, _, probes := newAppleRuntimeFixture(t, false, func(context.Context, uint64) error {
+		guardCalls++
+		return errors.New("fixed Apple peer is not running")
+	})
+	defer fixture.close(t, runtime)
+
+	snapshot := runtime.Handler().Snapshot()
+	if snapshot.LocalAvailability == proxy.LocalAvailabilityReady {
+		t.Fatalf("rejected Apple peer was marked ready: %#v", snapshot)
+	}
+	if guardCalls == 0 || fixture.credentialLoads != 0 || *probes != 0 {
+		t.Fatalf("Apple peer guard calls=%d credential loads=%d probes=%d", guardCalls, fixture.credentialLoads, *probes)
+	}
+
+	cfg, err := config.Load(fixture.store.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.credentialsForBackend(context.Background(), cfg, routing.BackendLocalAppleContainer); err == nil {
+		t.Fatal("rejected Apple peer allowed credential lookup")
+	}
+	if fixture.credentialLoads != 0 || *probes != 0 {
+		t.Fatalf("direct rejected Apple peer loaded credentials or probed: loads=%d probes=%d", fixture.credentialLoads, *probes)
+	}
+}
+
+func TestAppleProbeLeaseBypassesResidentReaderOnlyForLifecycleOwnedContext(t *testing.T) {
+	leaseCalls := 0
+	runtime := &relayRuntime{appleLease: func(context.Context) (func() error, error) {
+		leaseCalls++
+		return func() error { return nil }, nil
+	}}
+
+	lifecycleContext := context.WithValue(context.Background(), lifecycleOwnedAppleProbeContextKey{}, true)
+	release, err := runtime.appleProbeLease(lifecycleContext)
+	if err != nil || release == nil {
+		t.Fatalf("lifecycle-owned probe lease missing=%t, err=%v", release == nil, err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	if leaseCalls != 0 {
+		t.Fatalf("lifecycle-owned probe recursively acquired the resident reader %d times", leaseCalls)
+	}
+
+	release, err = runtime.appleProbeLease(context.Background())
+	if err != nil || release == nil {
+		t.Fatalf("resident probe lease missing=%t, err=%v", release == nil, err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	if leaseCalls != 1 {
+		t.Fatalf("resident probe reader acquisitions = %d, want 1", leaseCalls)
+	}
 }
 
 func newRuntimeFixture(t *testing.T, state routing.State, preflight localOpenCodexPreflight) (*relayRuntime, *runtimeFixture) {

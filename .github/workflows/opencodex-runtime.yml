@@ -12,8 +12,11 @@ on:
       - "tools/opencodex_runtime_image_test.py"
       - "tools/opencodex_runtime_lifecycle_canary.py"
       - "tools/opencodex_runtime_manifest.py"
+      - "tools/opencodex_npm_provenance.py"
+      - "tools/verify_npm_slsa_identity.cjs"
       - "tools/opencodex_upstream.py"
       - "pilot/tests/test_opencodex_runtime_*.py"
+      - "pilot/tests/test_opencodex_npm_provenance.py"
       - "pilot/tests/test_opencodex_upstream.py"
   workflow_dispatch:
     inputs:
@@ -117,7 +120,9 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$GITHUB_RUN_NUMBER" =~ ^[1-9][0-9]*$ ]]
-          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          python3 tools/opencodex_upstream.py verify-tree \
+            --container containers/opencodex \
+            --verify-provenance
           version="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["version"])')"
           revision="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["revision"])')"
           image_revision="$(python3 -c 'import json; print(json.load(open("containers/opencodex/upstream.lock.json"))["image_revision"])')"
@@ -399,7 +404,8 @@ jobs:
             pilot.tests.test_opencodex_runtime_manifest \
             pilot.tests.test_opencodex_runtime_apple_canary \
             pilot.tests.test_opencodex_runtime_lifecycle_canary \
-            pilot.tests.test_opencodex_runtime_hosted_qualification
+            pilot.tests.test_opencodex_runtime_hosted_qualification \
+            pilot.tests.test_opencodex_npm_provenance
       - name: Create the macOS contract-only receipt
         run: |
           set -euo pipefail
@@ -666,7 +672,9 @@ jobs:
             --source-revision "$source" \
             --workflow-run-id "$run_id" \
             --workflow-run-attempt "$attempt"
-          python3 tools/opencodex_upstream.py verify-tree --container containers/opencodex
+          python3 tools/opencodex_upstream.py verify-tree \
+            --container containers/opencodex \
+            --verify-provenance
           [[ "$(sha256sum containers/opencodex/upstream.lock.json | awk '{print $1}')" == \
              "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream_lock_sha256"])' "$candidate")" ]]
           index_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"]["index_digest"])' "$candidate")"

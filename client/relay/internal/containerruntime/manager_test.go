@@ -448,6 +448,43 @@ func TestManagerStopFailurePersistsWitnessAndRecoverCompletesForward(t *testing.
 	}
 }
 
+func TestManagerParkPersistsFailClosedStopWitnessWithoutRuntimeMutation(t *testing.T) {
+	manager, runtimeFake, routingFake, active := activateManagerFixture(t)
+	beforeEvents := len(*runtimeFake.events)
+	parked, err := manager.Park(context.Background(), ParkRequest{
+		ExpectedStateDigest:       active.StateDigest,
+		ExpectedRoutingGeneration: active.RoutingGeneration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.State != StateRecoveryRequired || !parked.RecoveryRequired || parked.Active == nil {
+		t.Fatalf("park receipt = %#v", parked)
+	}
+	if len(*runtimeFake.events) != beforeEvents || !routingFake.snapshot.AppleActive {
+		t.Fatalf("park mutated runtime/route: events=%v route=%#v", *runtimeFake.events, routingFake.snapshot)
+	}
+	state, found, stateErr := manager.store.load()
+	journal, journalFound, journalErr := manager.store.loadStopJournal()
+	if stateErr != nil || !found || journalErr != nil || !journalFound ||
+		state.Status != StateRecoveryRequired || journal.Phase != stopPhaseRecoveryRequired ||
+		journal.ExpectedStateDigest != active.StateDigest ||
+		journal.ExpectedRoutingGeneration != active.RoutingGeneration {
+		t.Fatalf("park witness state=%#v found=%t err=%v journal=%#v found=%t err=%v", state, found, stateErr, journal, journalFound, journalErr)
+	}
+
+	recovered, err := manager.Recover(context.Background(), RecoverRequest{
+		ExpectedStateDigest:  parked.StateDigest,
+		ConfirmDesktopExited: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != StateStopped || routingFake.snapshot.AppleActive {
+		t.Fatalf("park recovery = %#v route=%#v", recovered, routingFake.snapshot)
+	}
+}
+
 func TestManagerRecoversExactOrdinaryRoutingRecoveryWitnessForActivationAndStop(t *testing.T) {
 	t.Run("first activation", func(t *testing.T) {
 		fixture := newManagerFixture(t)
@@ -1689,7 +1726,132 @@ func TestManagerInspectRevalidatesActiveRuntimeWithoutCreatingCredentials(t *tes
 	if keychain.loadCount != 1 || keychain.ensureCount != 0 {
 		t.Fatalf("Keychain calls: load=%d ensure=%d", keychain.loadCount, keychain.ensureCount)
 	}
-	assertEventOrder(t, events, "runtime-verify", "keychain-load", "http-probe")
+	assertEventOrder(t, events, "runtime-verify", "runtime-state", "keychain-load", "http-probe")
+}
+
+func TestManagerInspectRejectsNonRunningContainerBeforeCredentials(t *testing.T) {
+	for _, fixedState := range []FixedContainerState{
+		FixedContainerStoppedOwned,
+		FixedContainerAbsent,
+		FixedContainerUnknown,
+		FixedContainerForeign,
+	} {
+		t.Run(string(fixedState), func(t *testing.T) {
+			manager, runtimeFake, _, _ := activateManagerFixture(t)
+			events := []string{}
+			keychain := &managerInspectKeychainFake{events: &events, secrets: testSecrets()}
+			manager.keychain = keychain
+			manager.prober = &managerProberFake{events: &events}
+			runtimeFake.events = &events
+			runtimeFake.containerState = fixedState
+
+			inspection, err := manager.Inspect(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inspection.State != StateRecoveryRequired || !inspection.RecoveryRequired {
+				t.Fatalf("inspection = %#v", inspection)
+			}
+			if keychain.loadCount != 0 || keychain.ensureCount != 0 {
+				t.Fatalf("non-running container accessed Keychain: load=%d ensure=%d", keychain.loadCount, keychain.ensureCount)
+			}
+			for _, event := range events {
+				if event == "keychain-load" || event == "http-probe" {
+					t.Fatalf("non-running container crossed credential/probe boundary: %#v", events)
+				}
+			}
+			assertEventOrder(t, events, "runtime-verify", "runtime-state")
+		})
+	}
+}
+
+func TestValidateActiveRoutingAuthorityRequiresCommittedLifecycleState(t *testing.T) {
+	manager, _, _, active := activateManagerFixture(t)
+	fixtureKey := manager.publicKeyPEM
+	if err := ValidateActiveRoutingAuthority(manager.store.root, active.RoutingGeneration, "0.3.9", fixtureKey); err != nil {
+		t.Fatalf("committed lifecycle authority rejected: %v", err)
+	}
+	if err := ValidateActiveRoutingAuthority(manager.store.root, active.RoutingGeneration+1, "0.3.9", fixtureKey); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("mismatched routing generation error = %v", err)
+	}
+	_, originalSignature, err := manager.store.loadManifest(active.Active.ManifestSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signaturePath := filepath.Join(manager.store.root, "manifests", active.Active.ManifestSHA256+".sig")
+	invalidSignature := []byte(base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)))
+	if err := writeOwnerFile(signaturePath, invalidSignature); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateActiveRoutingAuthority(manager.store.root, active.RoutingGeneration, "0.3.9", fixtureKey); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("invalid stored signature error = %v", err)
+	}
+	if err := writeOwnerFile(signaturePath, originalSignature); err != nil {
+		t.Fatal(err)
+	}
+
+	state, found, err := manager.store.load()
+	if err != nil || !found || state.Active == nil {
+		t.Fatalf("load active state: found=%t err=%v state=%#v", found, err, state)
+	}
+	originalState := state
+	state.Active.IndexDigest = "sha256:" + strings.Repeat("9", 64)
+	if err := manager.store.save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateActiveRoutingAuthority(manager.store.root, active.RoutingGeneration, "0.3.9", fixtureKey); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("manifest/state digest mismatch error = %v", err)
+	}
+	state = originalState
+	if err := manager.store.save(state); err != nil {
+		t.Fatal(err)
+	}
+	journal := transactionJournal{
+		Schema: SchemaVersion, InstallationID: state.InstallationID, OperationID: strings.Repeat("9", 64),
+		Phase: phasePrepared, ExpectedStateDigest: active.StateDigest,
+		ExpectedRoutingGeneration: active.RoutingGeneration,
+		OldArtifact:               cloneRecord(state.Active), NewArtifact: *state.Active,
+		OldGeneration: state.ActiveGeneration, NewGeneration: state.ActiveGeneration + 1,
+	}
+	if err := manager.store.saveJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateActiveRoutingAuthority(manager.store.root, active.RoutingGeneration, "0.3.9", fixtureKey); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("unfinished lifecycle journal error = %v", err)
+	}
+}
+
+func TestValidateActiveRuntimeBeforeCredentialsRequiresExactRunningOwnedPeer(t *testing.T) {
+	manager, runtimeFake, _, active := activateManagerFixture(t)
+	for _, test := range []struct {
+		name  string
+		state FixedContainerState
+		ok    bool
+	}{
+		{name: "running owned", state: FixedContainerRunningOwned, ok: true},
+		{name: "stopped owned", state: FixedContainerStoppedOwned},
+		{name: "absent", state: FixedContainerAbsent},
+		{name: "foreign", state: FixedContainerForeign},
+		{name: "unknown", state: FixedContainerUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtimeFake.containerState = test.state
+			err := ValidateActiveRuntimeBeforeCredentials(
+				context.Background(),
+				manager.store.root,
+				active.RoutingGeneration,
+				manager.relayVersion,
+				manager.publicKeyPEM,
+				runtimeFake,
+			)
+			if test.ok && err != nil {
+				t.Fatalf("running owned peer rejected: %v", err)
+			}
+			if !test.ok && !errors.Is(err, ErrRecoveryRequired) {
+				t.Fatalf("state %q error = %v", test.state, err)
+			}
+		})
+	}
 }
 
 func TestManagerInspectProjectsCredentialAndHealthFailureAsRecoveryRequired(t *testing.T) {
@@ -2180,6 +2342,7 @@ type managerRuntimeFake struct {
 	startError              error
 	stopHook                func()
 	foreignExisting         bool
+	containerState          FixedContainerState
 	capability              *Capability
 }
 
@@ -2254,6 +2417,19 @@ func (f *managerRuntimeFake) VerifyContainer(_ context.Context, _ string, spec S
 		return ErrUnavailable
 	}
 	return nil
+}
+func (f *managerRuntimeFake) ContainerState(_ context.Context, _ string, spec StartSpec) (FixedContainerState, error) {
+	f.event("runtime-state")
+	if f.exists && f.foreignExisting {
+		return FixedContainerForeign, nil
+	}
+	if !f.exists || !sameRuntimeSpec(f.current, spec) || spec.ManifestSHA256 == f.failManifest {
+		return FixedContainerAbsent, nil
+	}
+	if f.containerState != "" {
+		return f.containerState, nil
+	}
+	return FixedContainerRunningOwned, nil
 }
 func (f *managerRuntimeFake) VerifyAbsent(context.Context, string) error {
 	if f.exists {
@@ -2500,7 +2676,10 @@ type managerProberFake struct {
 	verifyErrors []error
 }
 
-func (f *managerProberFake) Verify(context.Context, []byte, []byte) error {
+func (f *managerProberFake) Verify(_ context.Context, _, _ []byte, guard func(context.Context) error) error {
+	if guard == nil {
+		return ErrUnavailable
+	}
 	if f.events != nil {
 		*f.events = append(*f.events, "http-probe")
 	}

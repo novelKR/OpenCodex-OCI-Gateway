@@ -19,6 +19,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/localopencodex"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 const (
@@ -168,6 +169,12 @@ func (r *HTTPHealthReader) readEndpoint(ctx context.Context, address, expectedLa
 
 type ControllerOption func(*Controller)
 
+// AppleRuntimeCredentialGuard is the lifecycle-owned peer proof that must run
+// immediately before any Apple profile Keychain read. It is deliberately
+// separate from the credential loader so tests and generic routing cannot
+// manufacture authority by supplying a token alone.
+type AppleRuntimeCredentialGuard func(context.Context) error
+
 func WithHealthReader(reader HealthReader) ControllerOption {
 	return func(controller *Controller) { controller.health = reader }
 }
@@ -188,7 +195,19 @@ func withConfigLoader(load func(string) (config.Config, error)) ControllerOption
 }
 
 func withCredentialLoader(load func(config.CredentialsConfig) (credentials.Values, error)) ControllerOption {
-	return func(controller *Controller) { controller.loadCredentials = load }
+	return func(controller *Controller) {
+		controller.loadCredentials = load
+		controller.loadCredentialsContext = func(ctx context.Context, cfg config.CredentialsConfig) (credentials.Values, error) {
+			if ctx == nil || ctx.Err() != nil {
+				return credentials.Values{}, ErrCredentialPreflight
+			}
+			return load(cfg)
+		}
+	}
+}
+
+func withContextCredentialLoader(load func(context.Context, config.CredentialsConfig) (credentials.Values, error)) ControllerOption {
+	return func(controller *Controller) { controller.loadCredentialsContext = load }
 }
 
 func withGatewayValidator(validate func(context.Context, config.Config, credentials.Values) (catalog.Result, error)) ControllerOption {
@@ -229,6 +248,10 @@ func WithRuntimeControl(control RuntimeControl) ControllerOption {
 	return func(controller *Controller) { controller.runtimeControl = control }
 }
 
+func WithAppleRuntimeCredentialGuard(guard AppleRuntimeCredentialGuard) ControllerOption {
+	return func(controller *Controller) { controller.appleRuntimeCredentialGuard = guard }
+}
+
 // WithCodexConfigOwner binds a controller to one compiled-in marker/profile
 // namespace. The local-only development installer uses this to keep a shared
 // Codex home fail-closed when production artifacts are present.
@@ -259,24 +282,26 @@ func WithControllerRemovalRecoveryWitness(witness *RemovalRecoveryWitness) Contr
 // configuration is the exact config path bound in State; it never guesses a
 // different CODEX_HOME or direct OpenAI endpoint.
 type Controller struct {
-	store                   *Store
-	codexConfigPath         string
-	health                  HealthReader
-	loadConfig              func(string) (config.Config, error)
-	loadCredentials         func(config.CredentialsConfig) (credentials.Values, error)
-	validateGateway         func(context.Context, config.Config, credentials.Values) (catalog.Result, error)
-	localPreflight          func(context.Context, string) localopencodex.Result
-	localTargetPreflight    func(context.Context, localopencodex.Target) localopencodex.Result
-	materializeLocalCatalog func(context.Context, config.Config) error
-	ackTimeout              time.Duration
-	pollInterval            time.Duration
-	journalPath             string
-	runtimeControl          RuntimeControl
-	recoveryGate            RecoveryGate
-	recoveryGateReleasable  func() bool
-	removalRecoveryWitness  *RemovalRecoveryWitness
-	localProfileOK          bool
-	codexOwner              codexconfig.Owner
+	store                       *Store
+	codexConfigPath             string
+	health                      HealthReader
+	loadConfig                  func(string) (config.Config, error)
+	loadCredentials             func(config.CredentialsConfig) (credentials.Values, error)
+	loadCredentialsContext      func(context.Context, config.CredentialsConfig) (credentials.Values, error)
+	appleRuntimeCredentialGuard AppleRuntimeCredentialGuard
+	validateGateway             func(context.Context, config.Config, credentials.Values) (catalog.Result, error)
+	localPreflight              func(context.Context, string) localopencodex.Result
+	localTargetPreflight        func(context.Context, localopencodex.Target) localopencodex.Result
+	materializeLocalCatalog     func(context.Context, config.Config) error
+	ackTimeout                  time.Duration
+	pollInterval                time.Duration
+	journalPath                 string
+	runtimeControl              RuntimeControl
+	recoveryGate                RecoveryGate
+	recoveryGateReleasable      func() bool
+	removalRecoveryWitness      *RemovalRecoveryWitness
+	localProfileOK              bool
+	codexOwner                  codexconfig.Owner
 }
 
 func NewController(configPath, codexConfigPath string, options ...ControllerOption) (*Controller, error) {
@@ -289,19 +314,20 @@ func NewController(configPath, codexConfigPath string, options ...ControllerOpti
 		return nil, err
 	}
 	controller := &Controller{
-		store:                store,
-		codexConfigPath:      boundCodex,
-		health:               NewHTTPHealthReader(),
-		loadConfig:           config.Load,
-		loadCredentials:      credentials.Load,
-		validateGateway:      validateExternalGatewayCatalog,
-		localPreflight:       localopencodex.Preflight,
-		localTargetPreflight: localopencodex.PreflightTarget,
-		ackTimeout:           30 * time.Second,
-		pollInterval:         100 * time.Millisecond,
-		journalPath:          store.TransactionPath(),
-		localProfileOK:       runtime.GOOS == "darwin" && runtime.GOARCH == "arm64",
-		codexOwner:           codexconfig.ProductionOwner,
+		store:                  store,
+		codexConfigPath:        boundCodex,
+		health:                 NewHTTPHealthReader(),
+		loadConfig:             config.Load,
+		loadCredentials:        credentials.Load,
+		loadCredentialsContext: credentials.LoadContext,
+		validateGateway:        validateExternalGatewayCatalog,
+		localPreflight:         localopencodex.Preflight,
+		localTargetPreflight:   localopencodex.PreflightTarget,
+		ackTimeout:             30 * time.Second,
+		pollInterval:           100 * time.Millisecond,
+		journalPath:            store.TransactionPath(),
+		localProfileOK:         runtime.GOOS == "darwin" && runtime.GOARCH == "arm64",
+		codexOwner:             codexconfig.ProductionOwner,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -316,6 +342,9 @@ func NewController(configPath, codexConfigPath string, options ...ControllerOpti
 	}
 	if controller.localTargetPreflight == nil {
 		controller.localTargetPreflight = localopencodex.PreflightTarget
+	}
+	if controller.loadCredentialsContext == nil {
+		controller.loadCredentialsContext = credentials.LoadContext
 	}
 	if controller.materializeLocalCatalog == nil {
 		controller.materializeLocalCatalog = controller.materializeLocalCatalogForBackend
@@ -830,6 +859,13 @@ func (c *Controller) requestBackendWithIntentAndWitness(
 	if !validBackend(target) {
 		return Status{}, fmt.Errorf("unsupported routing backend %q", target)
 	}
+	// Apple Container is not a general routing choice. Only the container
+	// lifecycle coordinator may create the cross-journal witness and call
+	// SwitchRuntimeRouting; accepting it here would bypass the signed manifest,
+	// exact digest, state generation, and installation/operation identities.
+	if target == BackendLocalAppleContainer {
+		return Status{}, ErrRecoveryRequired
+	}
 	if knownLegacyBackupAndMigrate && target != BackendExternal {
 		return Status{}, ErrRecoveryRequired
 	}
@@ -847,6 +883,13 @@ func (c *Controller) requestBackendWithIntentAndWitness(
 	state, legacy, err := c.boundState(lock)
 	if err != nil {
 		return Status{}, err
+	}
+	// A generic request must not create either half of a transition that
+	// originates from Apple Container. Stopping or replacing that backend must
+	// remain one lifecycle transaction so its container state, signed artifact,
+	// and routing journals cannot diverge.
+	if state.DesiredBackend == BackendLocalAppleContainer || state.AppliedBackend == BackendLocalAppleContainer {
+		return Status{}, ErrRecoveryRequired
 	}
 	if expectedConfigDigest != "" {
 		if state.Generation != expectedRoutingGeneration {
@@ -921,11 +964,10 @@ func (c *Controller) preflightRequestedBackend(ctx context.Context, target Backe
 		if err != nil {
 			return ErrLocalOpenCodexPreflight
 		}
-		values, err := c.loadCredentials(local.Credentials)
-		if err != nil || values.ValidateForProfile(config.LocalAuthenticationOpenCodexAPIKey) != nil {
-			return ErrCredentialPreflight
-		}
-		if !c.localTargetPreflight(ctx, localopencodex.AppleContainerTarget(values)).Ready() {
+		if !c.localTargetPreflight(ctx, localopencodex.AppleContainerTarget(
+			c.existingLifecycleLease,
+			c.appleConnectionAuthorizer(local),
+		)).Ready() {
 			return ErrLocalOpenCodexPreflight
 		}
 	}
@@ -984,6 +1026,9 @@ func (c *Controller) Apply(ctx context.Context, desktopExited bool) (Status, err
 	if legacy || (state.Phase != PhaseNativePendingRestart && state.Phase != PhaseRelayPendingRestart && state.Phase != PhaseBackendPendingRestart) {
 		return Status{}, ErrTransitionPending
 	}
+	if state.DesiredBackend == BackendLocalAppleContainer || state.AppliedBackend == BackendLocalAppleContainer {
+		return Status{}, ErrRecoveryRequired
+	}
 	return c.applyLocked(ctx, lock, state)
 }
 
@@ -1026,6 +1071,14 @@ func (c *Controller) Recover(ctx context.Context, action RecoveryAction, desktop
 
 	state, legacy, stateErr := c.boundState(lock)
 	transaction, journalFound, journalErr := c.loadJournal()
+	if stateErr == nil && !legacy &&
+		(state.DesiredBackend == BackendLocalAppleContainer || state.AppliedBackend == BackendLocalAppleContainer) {
+		return Status{}, ErrRecoveryRequired
+	}
+	if journalErr == nil && journalFound &&
+		(transaction.TargetBackend == BackendLocalAppleContainer || transaction.OriginBackend == BackendLocalAppleContainer) {
+		return Status{}, ErrRecoveryRequired
+	}
 	if c.removalRecoveryWitness != nil {
 		if c.recoveryGate == nil ||
 			c.removalRecoveryWitness.matchesRecoveryInputsLocked(
@@ -1167,6 +1220,9 @@ func (c *Controller) recoverObservedLocked(ctx context.Context, lock *Lock, curr
 		return Status{}, err
 	}
 	target := observed.DesiredBackend
+	if target == BackendLocalAppleContainer {
+		return Status{}, ErrRecoveryRequired
+	}
 	origin := forcedRecoveryOrigin(target)
 	if !validBackend(target) || !validBackend(origin) || origin == target {
 		return Status{}, ErrRecoveryRequired
@@ -1202,7 +1258,7 @@ func (c *Controller) applyLocked(ctx context.Context, lock *Lock, state State) (
 	if !validBackend(target) {
 		return Status{}, ErrRecoveryRequired
 	}
-	preflight, err := c.preflightBackendWithLegacyIntent(target, state.KnownLegacyBackupAndMigrate)
+	preflight, err := c.preflightBackendWithLegacyIntent(ctx, target, state.KnownLegacyBackupAndMigrate)
 	if err != nil {
 		return Status{}, err
 	}
@@ -1227,7 +1283,7 @@ func (c *Controller) applyRecoveryLocked(ctx context.Context, lock *Lock, recove
 // a selected target, but must never later masquerade as proof of an original
 // backend for rollback.
 func (c *Controller) applyRecoveryLockedWithOriginAuthority(ctx context.Context, lock *Lock, recovery State, target Backend, originAuthoritative bool, preservedLegacyMigration bool) (Status, error) {
-	preflight, err := c.preflightBackendWithLegacyIntent(target, recovery.KnownLegacyBackupAndMigrate)
+	preflight, err := c.preflightBackendWithLegacyIntent(ctx, target, recovery.KnownLegacyBackupAndMigrate)
 	if err != nil {
 		return Status{}, err
 	}
@@ -1365,9 +1421,8 @@ func (c *Controller) materializeLocalCatalogForBackend(ctx context.Context, cfg 
 			CatalogPath:           cfg.Catalog.Path,
 			ExpectedServicePort:   10100,
 			AuthenticationProfile: config.LocalAuthenticationOpenCodexAPIKey,
-			Credentials: func() (credentials.Values, error) {
-				return c.loadCredentials(cfg.Credentials)
-			},
+			ConnectionLease:       c.existingLifecycleLease,
+			AuthorizeConnection:   c.appleConnectionAuthorizer(cfg),
 		}
 		if _, err := fetcher.Refresh(ctx); err != nil {
 			return ErrLocalOpenCodexPreflight
@@ -1389,7 +1444,7 @@ func (c *Controller) failApplyingLocked(lock *Lock, state State, cause error) (S
 }
 
 func (c *Controller) preflightBackend(target Backend) (config.Config, error) {
-	preflight, err := c.preflightBackendWithLegacyIntent(target, false)
+	preflight, err := c.preflightBackendWithLegacyIntent(context.Background(), target, false)
 	return preflight.Config, err
 }
 
@@ -1398,7 +1453,10 @@ type backendPreflight struct {
 	LegacyMigrationRequired bool
 }
 
-func (c *Controller) preflightBackendWithLegacyIntent(target Backend, knownLegacyBackupAndMigrate bool) (backendPreflight, error) {
+func (c *Controller) preflightBackendWithLegacyIntent(ctx context.Context, target Backend, knownLegacyBackupAndMigrate bool) (backendPreflight, error) {
+	if ctx == nil {
+		return backendPreflight{}, ErrRecoveryRequired
+	}
 	cfg, err := c.loadConfig(c.store.ConfigPath())
 	if err != nil {
 		return backendPreflight{}, errors.New("relay configuration is unavailable")
@@ -1444,7 +1502,7 @@ func (c *Controller) preflightBackendWithLegacyIntent(target Backend, knownLegac
 		if err != nil {
 			return backendPreflight{}, err
 		}
-		if result := c.localPreflight(context.Background(), local.UpstreamBaseURL); !result.Ready() {
+		if result := c.localPreflight(ctx, local.UpstreamBaseURL); !result.Ready() {
 			return backendPreflight{}, ErrCredentialPreflight
 		}
 		result.Config = local
@@ -1460,11 +1518,10 @@ func (c *Controller) preflightBackendWithLegacyIntent(target Backend, knownLegac
 		if err != nil {
 			return backendPreflight{}, err
 		}
-		values, err := c.loadCredentials(local.Credentials)
-		if err != nil || values.ValidateForProfile(config.LocalAuthenticationOpenCodexAPIKey) != nil {
-			return backendPreflight{}, ErrCredentialPreflight
-		}
-		if !c.localTargetPreflight(context.Background(), localopencodex.AppleContainerTarget(values)).Ready() {
+		if !c.localTargetPreflight(ctx, localopencodex.AppleContainerTarget(
+			c.existingLifecycleLease,
+			c.appleConnectionAuthorizer(local),
+		)).Ready() {
 			return backendPreflight{}, ErrLocalOpenCodexPreflight
 		}
 		result.Config = local
@@ -1473,6 +1530,38 @@ func (c *Controller) preflightBackendWithLegacyIntent(target Backend, knownLegac
 		return backendPreflight{}, ErrRecoveryRequired
 	}
 	return result, nil
+}
+
+// existingLifecycleLease is used only by lifecycle-owned SwitchRuntimeRouting
+// paths. The outer container Manager already holds the exclusive lifecycle
+// lock before it invokes the routing bridge, so acquiring it again would
+// deadlock. Generic mode request/apply/recovery cannot select Apple.
+func (c *Controller) existingLifecycleLease(context.Context) (func() error, error) {
+	if c == nil || c.appleRuntimeCredentialGuard == nil {
+		return nil, ErrRecoveryRequired
+	}
+	return func() error { return nil }, nil
+}
+
+func (c *Controller) appleConnectionAuthorizer(cfg config.Config) loopbackauth.Authorizer {
+	return func(ctx context.Context) (loopbackauth.Authorization, error) {
+		if c == nil || ctx == nil || c.appleRuntimeCredentialGuard == nil {
+			return loopbackauth.Authorization{}, ErrRecoveryRequired
+		}
+		bounded, cancel := context.WithTimeout(ctx, loopbackauth.AuthorizationTimeout)
+		defer cancel()
+		if c.appleRuntimeCredentialGuard(bounded) != nil {
+			return loopbackauth.Authorization{}, ErrRecoveryRequired
+		}
+		if c.loadCredentialsContext == nil {
+			return loopbackauth.Authorization{}, ErrCredentialPreflight
+		}
+		values, err := c.loadCredentialsContext(bounded, cfg.Credentials)
+		if err != nil || values.ValidateForProfile(config.LocalAuthenticationOpenCodexAPIKey) != nil {
+			return loopbackauth.Authorization{}, ErrCredentialPreflight
+		}
+		return loopbackauth.Authorization{Token: []byte(values.LocalOpenCodexAPIKey)}, nil
+	}
 }
 
 func (c *Controller) preflightNative() error {

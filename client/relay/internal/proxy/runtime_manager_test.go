@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -620,7 +621,8 @@ func TestRuntimeManagerAppleMaintenanceParksVerifiesAndResumes(t *testing.T) {
 		<-ctx.Done()
 	}
 	spec := RuntimeSpec{
-		Profile: RuntimeProfileLocalAppleContainer,
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
 		LocalProbe: func(context.Context) (LocalAvailability, error) {
 			probes.Add(1)
 			return LocalAvailabilityReady, nil
@@ -677,7 +679,8 @@ func TestRuntimeManagerAppleMaintenanceDrainsActiveRequestsAndBlocksNewAdmission
 		<-releaseRequest
 	})
 	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
-		Profile: RuntimeProfileLocalAppleContainer,
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
 		LocalProbe: func(context.Context) (LocalAvailability, error) {
 			return LocalAvailabilityReady, nil
 		},
@@ -747,7 +750,8 @@ func TestRuntimeManagerAppleMaintenanceCanRetryAfterDrainTimeout(t *testing.T) {
 		<-releaseRequest
 	})
 	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
-		Profile: RuntimeProfileLocalAppleContainer,
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
 		LocalProbe: func(context.Context) (LocalAvailability, error) {
 			return LocalAvailabilityReady, nil
 		},
@@ -804,8 +808,9 @@ func TestRuntimeManagerReconstructsPendingAppleMaintenanceParked(t *testing.T) {
 		<-ctx.Done()
 	}
 	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
-		Profile:     RuntimeProfileLocalAppleContainer,
-		StartParked: true,
+		Profile:         RuntimeProfileLocalAppleContainer,
+		StartParked:     true,
+		ConnectionLease: testRuntimeConnectionLease,
 		LocalProbe: func(context.Context) (LocalAvailability, error) {
 			probes.Add(1)
 			return LocalAvailabilityReady, nil
@@ -840,7 +845,8 @@ func TestRuntimeManagerReconstructsPendingAppleMaintenanceParked(t *testing.T) {
 func TestRuntimeManagerCloseRemainsBoundedWhileMaintenancePrepared(t *testing.T) {
 	tracker := NewTracker()
 	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
-		Profile: RuntimeProfileLocalAppleContainer,
+		Profile:         RuntimeProfileLocalAppleContainer,
+		ConnectionLease: testRuntimeConnectionLease,
 		LocalProbe: func(context.Context) (LocalAvailability, error) {
 			return LocalAvailabilityReady, nil
 		},
@@ -862,8 +868,145 @@ func TestRuntimeManagerCloseRemainsBoundedWhileMaintenancePrepared(t *testing.T)
 	}
 }
 
+func TestRuntimeManagerReleasesAppleLeaseAndGateWhenHandlerPanics(t *testing.T) {
+	tracker := NewTracker()
+	var acquired, released atomic.Int64
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile: RuntimeProfileLocalAppleContainer,
+		ConnectionLease: func(context.Context) (func() error, error) {
+			acquired.Add(1)
+			return func() error {
+				released.Add(1)
+				return nil
+			}, nil
+		},
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtimeForTest(tracker, func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("panic = %#v", recovered)
+			}
+		}()
+		manager.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	}()
+	if acquired.Load() != 1 || released.Load() != 1 {
+		t.Fatalf("Apple lease acquired=%d released=%d", acquired.Load(), released.Load())
+	}
+	applyCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Apply(applyCtx, RuntimeSpec{Profile: RuntimeProfileExternal}, func(context.Context, *Tracker) (Runtime, error) {
+		return runtimeForTest(tracker, func(response http.ResponseWriter, _ *http.Request) {
+			response.WriteHeader(http.StatusNoContent)
+		}), nil
+	}); err != nil {
+		t.Fatalf("apply after panicking Apple request: %v", err)
+	}
+	closeRuntimeManager(t, manager)
+}
+
+func TestRuntimeManagerTransfersAppleReaderAtHeaderAndKeepsResponseDrainGate(t *testing.T) {
+	tracker := NewTracker()
+	var lifecycle sync.RWMutex
+	headerAuthenticated := make(chan struct{})
+	finishResponse := make(chan struct{})
+	requestDone := make(chan struct{})
+	manager, err := NewRuntimeManager(context.Background(), tracker, RuntimeSpec{
+		Profile: RuntimeProfileLocalAppleContainer,
+		ConnectionLease: func(context.Context) (func() error, error) {
+			lifecycle.RLock()
+			return func() error {
+				lifecycle.RUnlock()
+				return nil
+			}, nil
+		},
+		LocalProbe: func(context.Context) (LocalAvailability, error) {
+			return LocalAvailabilityReady, nil
+		},
+		LocalProbeInterval: time.Hour,
+	}, runtimeForTest(tracker, func(response http.ResponseWriter, request *http.Request) {
+		// This is the transport ownership-transfer point: the authenticated
+		// request header has been written, so the connection-bound reader can
+		// be released. RuntimeManager's in-process gate must still cover the
+		// complete response body/drain.
+		release, leaseErr := requireRuntimeConnectionLease(request.Context())
+		if leaseErr != nil || release == nil {
+			panic("missing Apple connection lease")
+		}
+		if releaseErr := release(); releaseErr != nil {
+			panic(releaseErr)
+		}
+		close(headerAuthenticated)
+		<-finishResponse
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		defer close(requestDone)
+		manager.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	}()
+	select {
+	case <-headerAuthenticated:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not transfer the connection reader")
+	}
+
+	writerAcquired := make(chan struct{})
+	applyDone := make(chan error, 1)
+	go func() {
+		lifecycle.Lock()
+		defer lifecycle.Unlock()
+		close(writerAcquired)
+		applyDone <- manager.Apply(context.Background(), RuntimeSpec{Profile: RuntimeProfileExternal}, func(context.Context, *Tracker) (Runtime, error) {
+			return runtimeForTest(tracker, func(response http.ResponseWriter, _ *http.Request) {
+				response.WriteHeader(http.StatusNoContent)
+			}), nil
+		})
+	}()
+	select {
+	case <-writerAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle writer stayed blocked after authenticated header transfer")
+	}
+	select {
+	case err := <-applyDone:
+		t.Fatalf("runtime apply passed an undrained response: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(finishResponse)
+	select {
+	case err := <-applyDone:
+		if err != nil {
+			t.Fatalf("runtime apply after response drain: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime apply did not continue after response drain")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("Apple request did not finish")
+	}
+	closeRuntimeManager(t, manager)
+}
+
 func runtimeForTest(tracker *Tracker, handler http.HandlerFunc) Runtime {
 	return Runtime{GeneralHandler: handler, InteractiveHandler: handler}
+}
+
+func testRuntimeConnectionLease(context.Context) (func() error, error) {
+	return func() error { return nil }, nil
 }
 
 func waitForRuntime(t *testing.T, manager *RuntimeManager, timeout time.Duration, predicate func(RuntimeSnapshot) bool) {

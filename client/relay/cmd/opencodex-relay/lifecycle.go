@@ -10,6 +10,7 @@ import (
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/catalog"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/proxy"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
@@ -68,7 +69,8 @@ func runCatalogLifecycle(
 func runLocalOpenCodexCatalogLifecycle(
 	ctx context.Context,
 	cfg config.Config,
-	load func() (credentials.Values, error),
+	lease loopbackauth.LeaseAcquirer,
+	authorize loopbackauth.Authorizer,
 	tracker *proxy.Tracker,
 	logger *slog.Logger,
 	watcher *routing.Watcher,
@@ -79,7 +81,8 @@ func runLocalOpenCodexCatalogLifecycle(
 		CatalogPath:           cfg.Catalog.Path,
 		ExpectedServicePort:   10100,
 		AuthenticationProfile: cfg.Credentials.RemoteAuthenticationProfile(),
-		Credentials:           load,
+		ConnectionLease:       lease,
+		AuthorizeConnection:   authorize,
 	}
 	lifecycle := catalogLifecycle{
 		cfg:         cfg,

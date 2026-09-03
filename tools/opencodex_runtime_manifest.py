@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Build and strictly validate signed OpenCodex runtime release manifests.
+"""Create candidate receipts and strictly validate runtime manifests.
 
-This helper deliberately does not hold or read the release signing key.  The
-release workflow writes canonical manifest bytes with this program and signs
-those exact bytes with OpenSSL in the protected ``runtime-release``
-environment.
+The hosted-candidate phase intentionally has no stable-manifest creator or
+release-signing path.  Signature-first stable manifest verification remains so
+Relay consumers fail closed until a separately approved stable release exists.
 """
 
 from __future__ import annotations
@@ -714,76 +713,6 @@ def command_verify_candidate(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def command_create(arguments: argparse.Namespace) -> int:
-    # Import locally so this standalone release helper shares the detector's
-    # strict lock parser without duplicating its npm/timestamp rules.
-    import opencodex_upstream  # type: ignore[import-not-found]
-
-    lock_bytes = load_regular(arguments.lock, "upstream lock")
-    lock = opencodex_upstream.validate_lock(
-        opencodex_upstream.load_json_bytes(lock_bytes, "upstream lock")
-    )
-    version_tuple(arguments.artifact_version)
-    expected_artifact = f"{lock['version']}-r{lock['image_revision']}"
-    if arguments.artifact_version != expected_artifact:
-        fail("artifact version does not match upstream lock")
-    descriptors = load_index(arguments.index, arguments.index_digest)
-    inspect_attestations(
-        arguments.sbom_amd64,
-        arguments.provenance_amd64,
-        arguments.sbom_arm64,
-        arguments.provenance_arm64,
-    )
-    document = {
-        "schema": 1,
-        "artifact_kind": ARTIFACT_KIND,
-        "artifact_version": arguments.artifact_version,
-        "release_sequence": arguments.release_sequence,
-        "channel": "stable",
-        "source": {
-            "repository": SOURCE_REPOSITORY,
-            "revision": arguments.source_revision,
-            "upstream_lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
-        },
-        "upstream": {
-            "repository": lock["repository"],
-            "release_id": lock["release"]["id"],
-            "release_tag": lock["release"]["tag"],
-            "version": lock["version"],
-            "revision": lock["revision"],
-            "npm_package": lock["npm"]["package"],
-            "npm_integrity": lock["npm"]["integrity"],
-        },
-        "image": {
-            "repository": RUNTIME_REPOSITORY,
-            "index_digest": descriptors["index_digest"],
-            "platforms": [
-                {"os": "linux", "arch": "amd64", "digest": descriptors["amd64_digest"]},
-                {"os": "linux", "arch": "arm64", "digest": descriptors["arm64_digest"]},
-            ],
-        },
-        "compatibility": {
-            "minimum_relay_version": "0.3.9",
-            "minimum_macos": "26.0",
-            "minimum_apple_container": "1.3.1",
-            "management_api_revision": 1,
-            "secret_delivery": "uds-v1",
-            "state_format_revision": 1,
-        },
-        "canary": {
-            "source_revision": arguments.source_revision,
-            "workflow_run_id": arguments.workflow_run_id,
-            "workflow_run_attempt": arguments.workflow_run_attempt,
-            "result": "passed",
-        },
-        "trust_key_id": arguments.trust_key_id,
-    }
-    if arguments.output.exists() or arguments.output.is_symlink():
-        fail("manifest output must not already exist")
-    arguments.output.write_bytes(canonical_manifest(document))
-    return 0
-
-
 def command_verify(arguments: argparse.Namespace) -> int:
     data = load_regular(arguments.manifest, "runtime manifest")
     manifest = validate_manifest(load_json_bytes(data, "runtime manifest"))
@@ -850,20 +779,6 @@ def parser() -> argparse.ArgumentParser:
     verify_candidate.add_argument("--workflow-run-attempt", type=int)
     verify_candidate.add_argument("--index-digest")
     verify_candidate.set_defaults(handler=command_verify_candidate)
-
-    create = commands.add_parser("create")
-    create.add_argument("--lock", type=pathlib.Path, required=True)
-    create.add_argument("--index", type=pathlib.Path, required=True)
-    create.add_argument("--index-digest", required=True)
-    create.add_argument("--artifact-version", required=True)
-    create.add_argument("--release-sequence", type=int, required=True)
-    create.add_argument("--source-revision", required=True)
-    create.add_argument("--workflow-run-id", required=True)
-    create.add_argument("--workflow-run-attempt", type=int, required=True)
-    create.add_argument("--trust-key-id", required=True)
-    create.add_argument("--output", type=pathlib.Path, required=True)
-    add_attestation_arguments(create)
-    create.set_defaults(handler=command_create)
 
     verify = commands.add_parser("verify")
     verify.add_argument("--manifest", type=pathlib.Path, required=True)

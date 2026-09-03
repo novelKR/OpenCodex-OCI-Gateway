@@ -548,7 +548,7 @@ func (c *Controller) resumeApplyingRuntimeRouting(ctx context.Context, lock *Loc
 	if state.DesiredBackend != selected || state.AppliedBackend == selected {
 		return 0, ErrRuntimeRoutingConflict
 	}
-	preflight, err := c.preflightBackendWithLegacyIntent(selected, state.KnownLegacyBackupAndMigrate)
+	preflight, err := c.preflightBackendWithLegacyIntent(ctx, selected, state.KnownLegacyBackupAndMigrate)
 	if err != nil {
 		return 0, err
 	}
@@ -733,7 +733,7 @@ func (c *Controller) verifyStableRuntimeRoute(ctx context.Context, state State, 
 	if check := AppliedRoutingDriftCheck(c.store.ConfigPath()); check != nil && check(state) != nil {
 		return ErrRuntimeRoutingConflict
 	}
-	preflight, err := c.preflightBackendWithLegacyIntent(selected, false)
+	preflight, err := c.preflightBackendWithLegacyIntent(ctx, selected, false)
 	if err != nil {
 		return err
 	}

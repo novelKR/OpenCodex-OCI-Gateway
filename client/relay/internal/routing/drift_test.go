@@ -106,7 +106,12 @@ func TestWatcherValidatesAppleCatalogBindingAndParksItsDrift(t *testing.T) {
 	}
 	_ = lock.Close()
 
-	watcher := NewWatcher(store, 0, WithDriftCheck(AppliedRoutingDriftCheck(relayPath)))
+	watcher := NewWatcher(
+		store,
+		0,
+		WithDriftCheck(AppliedRoutingDriftCheck(relayPath)),
+		WithWatcherStateRecoveryGate(func(State) error { return nil }),
+	)
 	if snapshot := watcher.Snapshot(); snapshot.Invalid || !snapshot.AllowsDataPlane() {
 		t.Fatalf("matching Apple routing was parked: %#v", snapshot)
 	}

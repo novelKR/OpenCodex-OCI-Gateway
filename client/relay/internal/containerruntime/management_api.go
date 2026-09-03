@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 const (
@@ -31,7 +33,8 @@ var errManagementAPI = errors.New("OpenCodex management API request failed")
 // already exposed by OpenCodex. It never follows redirects, consults a proxy,
 // or reuses a connection. The origin cannot be supplied by configuration.
 type HTTPManagementAPI struct {
-	client *http.Client
+	client    *http.Client
+	peerGuard func(context.Context) error
 }
 
 // These projections enumerate the complete v2.40.0 response surface for the
@@ -63,7 +66,7 @@ type codexOAuthStatusResponse struct {
 
 var _ ManagementAPI = (*HTTPManagementAPI)(nil)
 
-func NewHTTPManagementAPI() *HTTPManagementAPI {
+func NewHTTPManagementAPI(peerGuard func(context.Context) error) *HTTPManagementAPI {
 	dialer := &net.Dialer{Timeout: 3 * time.Second, KeepAlive: -1}
 	transport := &http.Transport{
 		Proxy:                 nil,
@@ -74,7 +77,7 @@ func NewHTTPManagementAPI() *HTTPManagementAPI {
 		IdleConnTimeout:       0,
 		ResponseHeaderTimeout: 5 * time.Second,
 	}
-	return &HTTPManagementAPI{client: &http.Client{
+	return &HTTPManagementAPI{peerGuard: peerGuard, client: &http.Client{
 		Timeout:   managementRequestTimeout,
 		Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -270,7 +273,7 @@ func (a *HTTPManagementAPI) Cancel(ctx context.Context, adminToken []byte, flow 
 }
 
 func (a *HTTPManagementAPI) request(ctx context.Context, adminToken []byte, method, path string, body, destination any) error {
-	if a == nil || a.client == nil || !validSecret(adminToken) || (method != http.MethodGet && method != http.MethodPost) || !strings.HasPrefix(path, "/api/") {
+	if a == nil || a.client == nil || a.peerGuard == nil || !validSecret(adminToken) || (method != http.MethodGet && method != http.MethodPost) || !strings.HasPrefix(path, "/api/") {
 		return ErrInvalidRequest
 	}
 	base, err := url.Parse(managementBaseURL)
@@ -298,12 +301,30 @@ func (a *HTTPManagementAPI) request(ctx context.Context, adminToken []byte, meth
 	if err != nil {
 		return errManagementAPI
 	}
-	request.Header.Set(adminTokenHeader, string(adminToken))
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := a.client.Do(request)
+	baseTransport, ok := a.client.Transport.(*http.Transport)
+	if !ok {
+		return errManagementAPI
+	}
+	bound, err := loopbackauth.NewTransport(
+		baseTransport,
+		func(context.Context) (func() error, error) { return func() error { return nil }, nil },
+		func(authorizeCtx context.Context) (loopbackauth.Authorization, error) {
+			if err := a.peerGuard(authorizeCtx); err != nil {
+				return loopbackauth.Authorization{}, err
+			}
+			return loopbackauth.Authorization{Token: append([]byte(nil), adminToken...)}, nil
+		},
+	)
+	if err != nil {
+		return errManagementAPI
+	}
+	client := *a.client
+	client.Transport = bound
+	response, err := client.Do(request)
 	if err != nil {
 		return errManagementAPI
 	}

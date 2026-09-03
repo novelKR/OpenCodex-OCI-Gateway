@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -50,6 +51,8 @@ func containerRuntimeCommand(arguments []string) {
 		containerRuntimeActivate(arguments[1:])
 	case "stop":
 		containerRuntimeStop(arguments[1:])
+	case "park":
+		containerRuntimePark(arguments[1:])
 	case "recover":
 		containerRuntimeRecover(arguments[1:])
 	case "oauth":
@@ -93,7 +96,7 @@ func containerRuntimeStage(arguments []string) {
 	if err != nil {
 		fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := containerRuntimeOperationContext(15 * time.Minute)
 	defer cancel()
 	receipt, err := services.manager.Stage(ctx, containerruntime.StageRequest{
 		ExpectedManifestSHA256: manifestDigest, ExpectedStateDigest: stateDigest,
@@ -122,7 +125,7 @@ func containerRuntimeActivate(arguments []string) {
 	if err != nil {
 		fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := containerRuntimeOperationContext(5 * time.Minute)
 	defer cancel()
 	receipt, err := services.manager.Activate(ctx, containerruntime.ActivateRequest{
 		ExpectedStateDigest: stateDigest, ExpectedRoutingGeneration: routingGeneration,
@@ -151,11 +154,38 @@ func containerRuntimeStop(arguments []string) {
 	if err != nil {
 		fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := containerRuntimeOperationContext(2 * time.Minute)
 	defer cancel()
 	receipt, err := services.manager.Stop(ctx, containerruntime.StopRequest{
 		ExpectedStateDigest: stateDigest, ExpectedRoutingGeneration: routingGeneration,
 		ConfirmDesktopExited: true,
+	})
+	writeContainerRuntimeReceipt(receipt, err)
+}
+
+func containerRuntimePark(arguments []string) {
+	configPath, codexPath := defaultPaths()
+	flags := containerRuntimeFlags("container-runtime park")
+	stateDigest := ""
+	var routingGeneration uint64
+	var jsonOutput bool
+	flags.StringVar(&stateDigest, "expected-state-digest", "", "runtime state digest")
+	flags.Uint64Var(&routingGeneration, "expected-routing-generation", 0, "routing generation")
+	flags.StringVar(&configPath, "config", configPath, "relay JSON path")
+	flags.StringVar(&codexPath, "codex-config", codexPath, "Codex config path")
+	flags.BoolVar(&jsonOutput, "json", false, "emit JSON")
+	parseContainerRuntimeFlags(flags, arguments)
+	if !jsonOutput || !lowerSHA256(stateDigest) || routingGeneration == 0 {
+		fatal(containerruntime.ErrInvalidRequest)
+	}
+	services, err := containerRuntimeServicesFactory(configPath, codexPath)
+	if err != nil {
+		fatal(err)
+	}
+	ctx, cancel := containerRuntimeOperationContext(30 * time.Second)
+	defer cancel()
+	receipt, err := services.manager.Park(ctx, containerruntime.ParkRequest{
+		ExpectedStateDigest: stateDigest, ExpectedRoutingGeneration: routingGeneration,
 	})
 	writeContainerRuntimeReceipt(receipt, err)
 }
@@ -178,12 +208,28 @@ func containerRuntimeRecover(arguments []string) {
 	if err != nil {
 		fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := containerRuntimeOperationContext(5 * time.Minute)
 	defer cancel()
 	receipt, err := services.manager.Recover(ctx, containerruntime.RecoverRequest{
 		ExpectedStateDigest: stateDigest, ConfirmDesktopExited: true,
 	})
 	writeContainerRuntimeReceipt(receipt, err)
+}
+
+// Every runtime operation can own an Apple CLI child and the per-user
+// lifecycle lock, including inspection and OAuth peer validation. Relayctl
+// must turn both interactive cancellation and the Swift client's SIGTERM into
+// context cancellation, then let the manager reap the exact child before the
+// command returns and releases that lock.
+func containerRuntimeOperationContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	signalContext, stopSignals := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM,
+	)
+	ctx, cancelTimeout := context.WithTimeout(signalContext, timeout)
+	return ctx, func() {
+		cancelTimeout()
+		stopSignals()
+	}
 }
 
 func containerRuntimeOAuth(arguments []string) {
@@ -209,12 +255,8 @@ func containerRuntimeOAuth(arguments []string) {
 	if err != nil {
 		fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := containerRuntimeOperationContext(30 * time.Second)
 	defer cancel()
-	inspection, err := services.manager.Inspect(ctx)
-	if err != nil || inspection.State != containerruntime.StateHealthy || inspection.Active == nil || inspection.RecoveryRequired {
-		fatal(containerruntime.ErrUnavailable)
-	}
 	switch operation {
 	case "providers":
 		if provider != "" || kindText != "" || operationID != "" {
@@ -268,7 +310,7 @@ func parseContainerRuntimeBase(name string, arguments []string, timeout time.Dur
 	if err != nil {
 		fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := containerRuntimeOperationContext(timeout)
 	return services, ctx, cancel
 }
 
@@ -328,7 +370,17 @@ func newContainerRuntimeServices(configPath, codexPath string) (*containerRuntim
 	if _, _, err := runtimemanifest.ParsePublicKey(publicKey); err != nil {
 		return nil, containerruntime.ErrUnsafeState
 	}
-	controller, err := routingController(configPath, codexPath)
+	var manager *containerruntime.Manager
+	controller, err := routingController(
+		configPath,
+		codexPath,
+		routing.WithAppleRuntimeCredentialGuard(func(ctx context.Context) error {
+			if manager == nil {
+				return containerruntime.ErrRecoveryRequired
+			}
+			return manager.ValidateRuntimeBeforeCredentials(ctx)
+		}),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +392,7 @@ func newContainerRuntimeServices(configPath, codexPath string) (*containerRuntim
 	bridge := &containerRoutingBridge{
 		controller: controller, maintenance: routing.NewSocketRuntimeMaintenance(configPath),
 	}
-	manager, err := containerruntime.NewManager(containerruntime.ManagerOptions{
+	manager, err = containerruntime.NewManager(containerruntime.ManagerOptions{
 		Root: root, Account: account, RelayVersion: productionRuntimeRelayVersion(), PublicKeyPEM: publicKey,
 		Checker: checker, Runtime: containerruntime.NewAppleCLI(), Prober: containerruntime.NewRuntimeHTTPProber(),
 		Cloner: containerruntime.NewAPFSCloner(), SecretServer: secretServer, Keychain: keychain,
@@ -351,7 +403,13 @@ func newContainerRuntimeServices(configPath, codexPath string) (*containerRuntim
 	if err != nil {
 		return nil, err
 	}
-	oauth, err := containerruntime.NewOAuthSessionManager(root, containerruntime.NewHTTPManagementAPI(), keychain, account)
+	oauth, err := containerruntime.NewOAuthSessionManager(
+		root,
+		containerruntime.NewHTTPManagementAPI(manager.ValidateStableRuntimeBeforeCredentials),
+		keychain,
+		account,
+		manager.AcquireStableRuntimeCredentialLease,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -15,6 +15,7 @@ final class ContainerRuntimeControllerTests: XCTestCase {
         private(set) var stageCalls: [(String, String, UInt64)] = []
         private(set) var activateCalls: [(String, UInt64, Bool)] = []
         private(set) var stopCalls: [(String, UInt64, Bool)] = []
+        private(set) var parkCalls: [(String, UInt64)] = []
         private(set) var recoverCalls: [(String, Bool)] = []
         private(set) var submitted: [(String?, String?)] = []
         var inspection: ContainerRuntimeInspection
@@ -70,6 +71,15 @@ final class ContainerRuntimeControllerTests: XCTestCase {
             return Self.makeMutation(inspection)
         }
 
+        func park(
+            expectedStateDigest: String,
+            expectedRoutingGeneration: UInt64
+        ) async throws -> ContainerRuntimeMutationReceipt {
+            parkCalls.append((expectedStateDigest, expectedRoutingGeneration))
+            inspection = Self.makeInspection(state: .recoveryRequired, staged: false, active: true)
+            return Self.makeMutation(inspection)
+        }
+
         func recover(
             expectedStateDigest: String,
             confirmDesktopExited: Bool
@@ -114,6 +124,7 @@ final class ContainerRuntimeControllerTests: XCTestCase {
         func stageWitness() -> (String, String, UInt64)? { stageCalls.last }
         func activationWitness() -> (String, UInt64, Bool)? { activateCalls.last }
         func stopWitness() -> (String, UInt64, Bool)? { stopCalls.last }
+        func parkWitness() -> (String, UInt64)? { parkCalls.last }
         func recoveryWitness() -> (String, Bool)? { recoverCalls.last }
         func submission() -> (String?, String?)? { submitted.last }
 
@@ -466,6 +477,25 @@ final class ContainerRuntimeControllerTests: XCTestCase {
         XCTAssertTrue(recoveryAccepted)
         let recordedRecovery = await client.recoveryWitness()
         XCTAssertEqual(recordedRecovery?.1, true)
+    }
+
+    func testDesktopRestartDurablyParksActiveRuntimeProjectedUnavailable() async throws {
+        let client = Client()
+        let suite = "ContainerRuntimeUnavailablePark.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        await client.setInspection(state: .unavailable, staged: false, active: true)
+        let controller = ContainerRuntimeController(client: client, defaults: defaults)
+
+        controller.start()
+        try await wait { controller.inspection?.state == .unavailable }
+        let parked = await controller.parkAfterDesktopRestart(confirmDesktopExited: false)
+
+        XCTAssertTrue(parked)
+        XCTAssertEqual(controller.inspection?.state, .recoveryRequired)
+        let witness = await client.parkWitness()
+        XCTAssertEqual(witness?.0, String(repeating: "a", count: 64))
+        XCTAssertEqual(witness?.1, 11)
     }
 
     func testOAuthSubmissionRequiresExplicitAction() async throws {

@@ -84,15 +84,26 @@ class FakeClient:
                 version: {
                     "name": upstream.NPM_PACKAGE,
                     "version": version,
+                    "gitHead": REVISION,
                     "dist": {
                         "integrity": self.integrity,
                         "tarball": upstream.NPM_REGISTRY
                         + upstream.expected_tarball_path(version),
+                        "attestations": {
+                            "url": (
+                                "https://registry.npmjs.org/-/npm/v1/attestations/"
+                                f"@bitkyc08%2fopencodex@{version}"
+                            ),
+                            "provenance": {
+                                "predicateType": "https://slsa.dev/provenance/v1"
+                            },
+                        },
                     },
                 }
             },
         }
         self.github_calls = []
+        self.provenance_error = None
 
     def listed_release(self, **overrides):
         value = {
@@ -129,13 +140,23 @@ class FakeClient:
             return copy.deepcopy(self.contents)
         raise AssertionError(path)
 
-    def npm_json(self, package):
+    def npm_version_json(self, package, version):
         self.asserted_package = package
-        return copy.deepcopy(self.npm)
+        self.asserted_version = version
+        versions = self.npm["versions"]
+        if version not in versions:
+            raise upstream.AwaitingNPM("npm metadata disappeared")
+        return copy.deepcopy(versions[version])
 
     def tarball_bytes(self, url):
         self.asserted_tarball = url
         return self.tarball
+
+    def verify_npm_provenance(self, version, revision, integrity, tarball):
+        if self.provenance_error is not None:
+            raise self.provenance_error
+        self.asserted_provenance = (version, revision, integrity, tarball)
+        return {"status": "verified"}
 
 
 class OpenCodexUpstreamTests(unittest.TestCase):
@@ -152,6 +173,7 @@ class OpenCodexUpstreamTests(unittest.TestCase):
         self.assertEqual(status, "update-available")
         self.assertEqual(candidate["version"], "2.41.0")
         self.assertEqual(candidate["image_revision"], 1)
+        self.assertEqual(client.asserted_version, "2.41.0")
         self.assertTrue(any(path.endswith("/releases/41") for path in client.github_calls))
 
     def test_release_scan_is_bounded_to_five_complete_pages(self):
@@ -218,7 +240,7 @@ class OpenCodexUpstreamTests(unittest.TestCase):
         self.assertEqual((status, candidate), ("awaiting-npm", None))
 
         class MissingPackageClient(FakeClient):
-            def npm_json(self, package):
+            def npm_version_json(self, package, version):
                 raise upstream.AwaitingNPM("not propagated")
 
         status, candidate = upstream.detect(MissingPackageClient(), lock())
@@ -276,6 +298,39 @@ class OpenCodexUpstreamTests(unittest.TestCase):
         with self.assertRaisesRegex(upstream.ContractError, "npm version metadata identity"):
             upstream.detect(client, lock())
 
+    def test_npm_git_head_and_provenance_metadata_are_commit_bound(self):
+        client = FakeClient()
+        client.npm["versions"][client.version]["gitHead"] = "d" * 40
+        with self.assertRaisesRegex(upstream.ContractError, "gitHead"):
+            upstream.detect(client, lock())
+
+        client = FakeClient()
+        client.npm["versions"][client.version]["dist"]["attestations"][
+            "provenance"
+        ]["predicateType"] = "https://slsa.dev/provenance/v0.2"
+        with self.assertRaisesRegex(upstream.ContractError, "predicate metadata"):
+            upstream.detect(client, lock())
+
+    def test_absent_new_provenance_is_a_quiet_propagation_delay(self):
+        client = FakeClient()
+        del client.npm["versions"][client.version]["dist"]["attestations"]
+        self.assertEqual(upstream.detect(client, lock()), ("awaiting-npm", None))
+
+        client = FakeClient()
+        client.provenance_error = upstream.AwaitingNPM("provenance bundle pending")
+        self.assertEqual(upstream.detect(client, lock()), ("awaiting-npm", None))
+
+    def test_same_version_missing_provenance_fails_closed(self):
+        client = FakeClient(version="2.40.0")
+        current = lock(
+            version="2.40.0", revision=REVISION, release_id=client.release_id
+        )
+        current["release"]["published_at"] = client.release["published_at"]
+        current["npm"]["integrity"] = client.integrity
+        del client.npm["versions"][client.version]["dist"]["attestations"]
+        with self.assertRaisesRegex(upstream.ContractError, "same-version npm provenance"):
+            upstream.detect(client, current)
+
     def test_tarball_sri_and_internal_package_are_verified(self):
         client = FakeClient()
         client.tarball += b"tampered"
@@ -289,6 +344,13 @@ class OpenCodexUpstreamTests(unittest.TestCase):
         ).decode()
         client.npm["versions"][client.version]["dist"]["integrity"] = client.integrity
         with self.assertRaisesRegex(upstream.ContractError, "tarball package identity"):
+            upstream.detect(client, lock())
+
+        client = FakeClient()
+        client.provenance_error = upstream.ContractError(
+            "npm provenance subject does not match the downloaded tarball"
+        )
+        with self.assertRaisesRegex(upstream.ContractError, "provenance subject"):
             upstream.detect(client, lock())
 
     def test_same_version_is_current_only_for_identical_immutable_identity(self):

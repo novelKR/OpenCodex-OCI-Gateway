@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/containerruntime"
@@ -19,11 +23,81 @@ func TestContainerRuntimeUsageDocumentsDesktopExitConfirmation(t *testing.T) {
 	for _, required := range []string{
 		"container-runtime activate --expected-state-digest SHA256\n      --expected-routing-generation N --confirm-desktop-exited --json",
 		"container-runtime stop --expected-state-digest SHA256\n      --expected-routing-generation N --confirm-desktop-exited --json",
+		"container-runtime park --expected-state-digest SHA256\n      --expected-routing-generation N --json",
 		"container-runtime recover --expected-state-digest SHA256\n      --confirm-desktop-exited --json",
 	} {
 		if !strings.Contains(usage, required) {
 			t.Fatalf("usage omits the required Desktop exit contract %q: %q", required, usage)
 		}
+	}
+}
+
+func TestContainerRuntimeOperationContextHonorsDeadline(t *testing.T) {
+	ctx, cancel := containerRuntimeOperationContext(25 * time.Millisecond)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("context error = %v", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("mutation context did not reach its deadline")
+	}
+}
+
+func TestContainerRuntimeOperationContextHonorsSIGTERM(t *testing.T) {
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	command := exec.Command(os.Args[0], "-test.run=^TestContainerRuntimeMutationSignalHelper$")
+	command.Env = append(os.Environ(), "OPENCODEX_MUTATION_SIGNAL_READY="+readyPath)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(readyPath); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal("signal helper did not become ready")
+	}
+	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("signal helper failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = command.Process.Kill()
+		_ = <-done
+		t.Fatal("signal helper did not stop")
+	}
+}
+
+func TestContainerRuntimeMutationSignalHelper(t *testing.T) {
+	readyPath := os.Getenv("OPENCODEX_MUTATION_SIGNAL_READY")
+	if readyPath == "" {
+		return
+	}
+	ctx, cancel := containerRuntimeOperationContext(time.Minute)
+	defer cancel()
+	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("signal context error = %v", ctx.Err())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SIGTERM did not cancel mutation context")
 	}
 }
 

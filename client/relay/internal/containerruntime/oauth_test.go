@@ -41,9 +41,13 @@ type fakeManagementAPI struct {
 	starts         int
 	statuses       int
 	cancels        int
+	requestHook    func()
 }
 
 func (f *fakeManagementAPI) capture(admin []byte, flow ManagementFlow) {
+	if f.requestHook != nil {
+		f.requestHook()
+	}
 	f.lastAdminToken = append(f.lastAdminToken[:0], admin...)
 	f.lastFlow = flow
 }
@@ -161,6 +165,7 @@ func TestOAuthSessionManagerConstructionDoesNotCreateRuntimeState(t *testing.T) 
 		&fakeManagementAPI{},
 		validFakeOAuthKeychain(),
 		"test-account",
+		func(context.Context) (func() error, error) { return func() error { return nil }, nil },
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -326,12 +331,83 @@ func TestOAuthSessionManagerRejectsEqualOrInvalidCredentials(t *testing.T) {
 	}
 }
 
+func TestOAuthSessionManagerRejectsLiveRuntimeDriftBeforeKeychainOrAPI(t *testing.T) {
+	root := t.TempDir()
+	api := &fakeManagementAPI{providers: []OAuthProvider{{ID: "chatgpt", Name: "ChatGPT Codex", Kind: OAuthKindCodex}}}
+	keychain := validFakeOAuthKeychain()
+	guardCalls := 0
+	manager, err := NewOAuthSessionManager(
+		root,
+		api,
+		keychain,
+		"test-account",
+		func(context.Context) (func() error, error) {
+			guardCalls++
+			return nil, ErrRecoveryRequired
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Providers(context.Background()); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("runtime drift error = %v", err)
+	}
+	if guardCalls != 1 || keychain.loads != 0 || api.lastAdminToken != nil {
+		t.Fatalf("drift crossed credential/API boundary: guards=%d loads=%d token=%q", guardCalls, keychain.loads, api.lastAdminToken)
+	}
+}
+
+func TestOAuthSessionManagerHoldsRuntimeLeaseThroughManagementRequest(t *testing.T) {
+	held := false
+	released := 0
+	api := &fakeManagementAPI{
+		providers: []OAuthProvider{{ID: "chatgpt", Name: "ChatGPT Codex", Kind: OAuthKindCodex}},
+		requestHook: func() {
+			if !held {
+				t.Fatal("management request ran outside runtime lease")
+			}
+		},
+	}
+	manager, err := NewOAuthSessionManager(
+		t.TempDir(),
+		api,
+		validFakeOAuthKeychain(),
+		"test-account",
+		func(context.Context) (func() error, error) {
+			if held {
+				t.Fatal("runtime lease was acquired twice")
+			}
+			held = true
+			return func() error {
+				held = false
+				released++
+				return nil
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Providers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if held || released != 1 {
+		t.Fatalf("runtime lease held=%t released=%d", held, released)
+	}
+}
+
 func newTestOAuthManager(t *testing.T, root string, api ManagementAPI, keychain Keychain) *OAuthSessionManager {
 	t.Helper()
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewOAuthSessionManager(root, api, keychain, "test-account")
+	manager, err := NewOAuthSessionManager(
+		root,
+		api,
+		keychain,
+		"test-account",
+		func(context.Context) (func() error, error) { return func() error { return nil }, nil },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

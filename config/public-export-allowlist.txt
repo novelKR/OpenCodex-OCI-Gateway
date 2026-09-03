@@ -40,9 +40,10 @@ tools/opencodex_runtime_hosted_qualification.py
 tools/opencodex_runtime_image_test.py
 tools/opencodex_runtime_lifecycle_canary.py
 tools/opencodex_runtime_manifest.py
+tools/opencodex_npm_provenance.py
 tools/opencodex_upstream.py
+tools/verify_npm_slsa_identity.cjs
 tools/prepare-public-core.sh
-tools/publish-opencodex-runtime-release.sh
 tools/public-hygiene.sh
 tools/public_hygiene.py
 tools/validate-public-core.sh

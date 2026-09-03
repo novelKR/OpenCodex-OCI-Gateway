@@ -71,6 +71,12 @@ func (e *LocalUnavailableError) Unwrap() error { return ErrLocalOpenCodexUnavail
 // shape or performs a raw TCP check.
 type LocalProbe func(context.Context) (LocalAvailability, error)
 
+// ConnectionLease is the cross-process read side of the Apple runtime
+// lifecycle boundary. It must be acquired before the resident admission gate
+// so a lifecycle writer can never hold the file lock while waiting for a
+// request that is itself waiting for that lock.
+type ConnectionLease func(context.Context) (func() error, error)
+
 // LocalProbeAllowed is an optional admission check owned by the embedding
 // runtime.  It lets a routing watcher stop periodic loopback identity probes
 // as soon as a profile enters applying/native/recovery, without coupling the
@@ -155,6 +161,7 @@ type RuntimeSpec struct {
 	// LocalProbe is required for the local profile. It is run before a local
 	// profile becomes active and periodically while it remains active.
 	LocalProbe         LocalProbe
+	ConnectionLease    ConnectionLease
 	LocalProbeInterval time.Duration
 	LocalProbeTimeout  time.Duration
 	LocalProbeAllowed  LocalProbeAllowed
@@ -174,6 +181,9 @@ func (s RuntimeSpec) normalized() (RuntimeSpec, error) {
 	case RuntimeProfileLocalOpenCodex, RuntimeProfileLocalAppleContainer:
 		if s.LocalProbe == nil {
 			return RuntimeSpec{}, ErrMissingLocalOpenCodexProbe
+		}
+		if s.Profile == RuntimeProfileLocalAppleContainer && s.ConnectionLease == nil {
+			return RuntimeSpec{}, fmt.Errorf("%w: Apple connection lease is required", ErrInvalidRuntimeProfile)
 		}
 		if s.LocalProbeInterval <= 0 {
 			s.LocalProbeInterval = defaultLocalProbeInterval
@@ -432,20 +442,48 @@ func (m *RuntimeManager) serveHTTP(lane scheduler.Lane, w http.ResponseWriter, r
 		}
 		switch admission {
 		case runtimeAdmissionActive:
+			var connectionLease *runtimeConnectionLease
+			if current != nil && current.spec.Profile == RuntimeProfileLocalAppleContainer {
+				if current.spec.ConnectionLease == nil {
+					writeError(w, http.StatusServiceUnavailable, "upstream_unavailable")
+					return
+				}
+				var leaseErr error
+				release, leaseErr := current.spec.ConnectionLease(r.Context())
+				if leaseErr != nil || release == nil {
+					writeError(w, http.StatusServiceUnavailable, "upstream_unavailable")
+					return
+				}
+				connectionLease = &runtimeConnectionLease{release: release}
+			}
 			m.gate.RLock()
-			admission, current, _ = m.snapshotForHandler()
-			if admission != runtimeAdmissionActive || current == nil {
+			admission, checked, _ := m.snapshotForHandler()
+			if admission != runtimeAdmissionActive || checked == nil || checked != current {
 				m.gate.RUnlock()
+				if connectionLease != nil {
+					_ = connectionLease.Close()
+				}
 				continue
 			}
-			handler := current.runtime.handlerForLane(lane)
+			handler := checked.runtime.handlerForLane(lane)
 			if handler == nil {
 				m.gate.RUnlock()
+				if connectionLease != nil {
+					_ = connectionLease.Close()
+				}
 				writeError(w, http.StatusServiceUnavailable, "upstream_unavailable")
 				return
 			}
-			handler.ServeHTTP(w, r)
-			m.gate.RUnlock()
+			if connectionLease != nil {
+				r = r.WithContext(context.WithValue(r.Context(), runtimeConnectionLeaseContextKey{}, connectionLease))
+			}
+			func() {
+				defer m.gate.RUnlock()
+				if connectionLease != nil {
+					defer connectionLease.Close()
+				}
+				handler.ServeHTTP(w, r)
+			}()
 			return
 		case runtimeAdmissionTransitioning:
 			// A transition deliberately pauses new admission rather than sending
@@ -477,6 +515,38 @@ func (m *RuntimeManager) serveHTTP(lane scheduler.Lane, w http.ResponseWriter, r
 			return
 		}
 	}
+}
+
+type runtimeConnectionLeaseContextKey struct{}
+
+type runtimeConnectionLease struct {
+	once    sync.Once
+	release func() error
+}
+
+func (l *runtimeConnectionLease) Close() error {
+	if l == nil {
+		return nil
+	}
+	var err error
+	l.once.Do(func() {
+		if l.release != nil {
+			err = l.release()
+			l.release = nil
+		}
+	})
+	return err
+}
+
+func requireRuntimeConnectionLease(ctx context.Context) (func() error, error) {
+	if ctx == nil {
+		return nil, ErrRuntimeMaintenanceState
+	}
+	lease, _ := ctx.Value(runtimeConnectionLeaseContextKey{}).(*runtimeConnectionLease)
+	if lease == nil {
+		return nil, ErrRuntimeMaintenanceState
+	}
+	return lease.Close, nil
 }
 
 func (m *RuntimeManager) snapshotForHandler() (runtimeAdmission, *runtimeSlot, <-chan struct{}) {

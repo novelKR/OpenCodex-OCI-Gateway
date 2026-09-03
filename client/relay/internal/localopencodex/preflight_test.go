@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
-	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -50,12 +53,11 @@ func TestPreflightAcceptsOpenCodexIdentityAndVisibleModels(t *testing.T) {
 
 func TestAppleContainerPreflightSeparatesHostAndGuestPortsAndUsesOnlyAPIKeyForModels(t *testing.T) {
 	apiToken := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	values := credentials.Values{LocalOpenCodexAPIKey: apiToken}
-	var calls int
-	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		calls++
-		if request.URL.Host != "127.0.0.1:10210" {
-			t.Fatalf("Apple preflight host = %q", request.URL.Host)
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.Host != "127.0.0.1:10210" {
+			t.Fatalf("Apple preflight host = %q", request.Host)
 		}
 		if request.Header.Get("CF-Access-Client-Id") != "" || request.Header.Get("CF-Access-Client-Secret") != "" || request.Header.Get("X-OpenCodex-Relay") != "" {
 			t.Fatalf("Apple preflight leaked unrelated admission headers: %#v", request.Header)
@@ -65,25 +67,47 @@ func TestAppleContainerPreflightSeparatesHostAndGuestPortsAndUsesOnlyAPIKeyForMo
 			if request.Header.Get("X-OpenCodex-API-Key") != "" {
 				t.Fatalf("health request was authenticated: %#v", request.Header)
 			}
-			return jsonResponse(http.StatusOK, `{"service":"opencodex","status":"ok","port":10100}`), nil
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(response, `{"service":"opencodex","status":"ok","port":10100}`)
 		case "/v1/models":
 			if request.Header.Get("X-OpenCodex-API-Key") != apiToken {
 				t.Fatalf("models API key = %q", request.Header.Get("X-OpenCodex-API-Key"))
 			}
-			return jsonResponse(http.StatusOK, `{"data":[{"id":"apple-local"}]}`), nil
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(response, `{"data":[{"id":"apple-local"}]}`)
 		default:
 			t.Fatalf("unexpected Apple preflight path %q", request.URL.Path)
-			return nil, nil
 		}
-	})}
-	result := preflightTarget(context.Background(), AppleContainerTarget(values), client)
-	if !result.Ready() || result.ModelCount != 1 || calls != 2 {
-		t.Fatalf("Apple preflight = %#v calls=%d", result, calls)
+	}))
+	defer server.Close()
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp4", server.Listener.Addr().String())
+	}}
+	client := &http.Client{Transport: transport}
+	var leaseCalls, authorizeCalls atomic.Int64
+	target := AppleContainerTarget(
+		func(context.Context) (func() error, error) {
+			leaseCalls.Add(1)
+			return func() error { return nil }, nil
+		},
+		func(context.Context) (loopbackauth.Authorization, error) {
+			authorizeCalls.Add(1)
+			return loopbackauth.Authorization{Token: []byte(apiToken)}, nil
+		},
+	)
+	result := preflightTarget(context.Background(), target, client)
+	if !result.Ready() || result.ModelCount != 1 || calls.Load() != 2 {
+		t.Fatalf("Apple preflight = %#v calls=%d", result, calls.Load())
+	}
+	if leaseCalls.Load() != 1 || authorizeCalls.Load() != 1 {
+		t.Fatalf("Apple binding lease=%d authorize=%d", leaseCalls.Load(), authorizeCalls.Load())
 	}
 
-	invalid := AppleContainerTarget(credentials.Values{LocalOpenCodexAPIKey: "not-a-token"})
-	if result := preflightTarget(context.Background(), invalid, client); result.Availability != AvailabilityInvalid || calls != 2 {
-		t.Fatalf("invalid Apple token preflight = %#v calls=%d", result, calls)
+	invalid := AppleContainerTarget(nil, target.AuthorizeConnection)
+	if result := preflightTarget(context.Background(), invalid, client); result.Availability != AvailabilityInvalid || calls.Load() != 2 {
+		t.Fatalf("invalid Apple token preflight = %#v calls=%d", result, calls.Load())
 	}
 }
 

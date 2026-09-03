@@ -111,9 +111,15 @@ final class MenuBarModelTests: XCTestCase {
         private(set) var quitTargets: [URL] = []
         private(set) var waitTargets: [URL] = []
         private(set) var relaunchTargets: [URL] = []
+        private(set) var newInstanceLaunchTargets: [URL] = []
+        private var launchObservations: [TestDesktopLaunchObservation] = []
+        var relaunchProcessIdentifier: Int32 = 4242
+        var relaunchValidationValues: [Bool] = []
+        var launchOnObservationStopProcessIdentifier: Int32?
 
         var quitRequests: Int { quitTargets.count }
         var relaunches: Int { relaunchTargets.count }
+        var newInstanceLaunches: Int { newInstanceLaunchTargets.count }
 
         init(runningValues: [Bool], eventRecorder: RemovalEventRecorder? = nil) {
             self.runningValues = runningValues
@@ -138,9 +144,75 @@ final class MenuBarModelTests: XCTestCase {
             return waitResult
         }
 
+        func beginLaunchObservation(
+            at target: URL
+        ) -> any DesktopApplicationLaunchObserving {
+            let observation = TestDesktopLaunchObservation(target: target)
+            observation.processIdentifierOnStop = launchOnObservationStopProcessIdentifier
+            launchOnObservationStopProcessIdentifier = nil
+            launchObservations.append(observation)
+            return observation
+        }
+
+        func simulateObservedLaunch() {
+            launchObservations.forEach { $0.observeLaunch() }
+        }
+
         func relaunch(at target: URL) async throws {
             relaunchTargets.append(target)
             eventRecorder?.record("desktop_relaunch")
+        }
+
+        func launchNewInstance(at target: URL) async throws -> DesktopApplicationRelaunchWitness {
+            newInstanceLaunchTargets.append(target)
+            eventRecorder?.record("desktop_relaunch")
+            launchObservations.forEach {
+                $0.observeLaunch(processIdentifier: relaunchProcessIdentifier)
+            }
+            return DesktopApplicationRelaunchWitness(
+                processIdentifier: relaunchProcessIdentifier
+            )
+        }
+
+        func validateRelaunch(
+            _: DesktopApplicationRelaunchWitness,
+            at _: URL
+        ) -> Bool {
+            guard !relaunchValidationValues.isEmpty else { return true }
+            return relaunchValidationValues.removeFirst()
+        }
+    }
+
+    private final class TestDesktopLaunchObservation: DesktopApplicationLaunchObserving {
+        let target: URL
+        let events: AsyncStream<Void>
+        private(set) var didObserveLaunch = false
+        private(set) var observedProcessIdentifiers: Set<Int32> = []
+        private var continuation: AsyncStream<Void>.Continuation?
+        private var stopped = false
+        var processIdentifierOnStop: Int32?
+
+        init(target: URL) {
+            self.target = target
+            var captured: AsyncStream<Void>.Continuation?
+            events = AsyncStream(bufferingPolicy: .bufferingNewest(1)) { captured = $0 }
+            continuation = captured
+        }
+
+        func observeLaunch(processIdentifier: Int32 = 9999) {
+            didObserveLaunch = true
+            observedProcessIdentifiers.insert(processIdentifier)
+            continuation?.yield(())
+        }
+
+        func stop() {
+            guard !stopped else { return }
+            stopped = true
+            if let processIdentifierOnStop {
+                observeLaunch(processIdentifier: processIdentifierOnStop)
+            }
+            continuation?.finish()
+            continuation = nil
         }
     }
 
@@ -262,10 +334,13 @@ final class MenuBarModelTests: XCTestCase {
         private var activationSuccesses = 0
         private var stopAttempts = 0
         private var stopSuccesses = 0
+        private var parkAttempts = 0
         private var recoveryAttempts = 0
         private var recoverySuccesses = 0
+        private let waitForMutationCancellation: Bool
 
-        init() {
+        init(waitForMutationCancellation: Bool = false) {
+            self.waitForMutationCancellation = waitForMutationCancellation
             inspectionValue = Self.inspection(state: .stopped, generation: 11)
         }
 
@@ -294,6 +369,7 @@ final class MenuBarModelTests: XCTestCase {
                   expectedRoutingGeneration == inspectionValue.routingGeneration else {
                 throw ContainerRuntimeContractError.invalidArgument
             }
+            try await awaitCancellationIfRequested()
             inspectionValue = Self.inspection(
                 state: .healthy,
                 generation: expectedRoutingGeneration + 3
@@ -314,11 +390,29 @@ final class MenuBarModelTests: XCTestCase {
                   inspectionValue.state == .healthy else {
                 throw ContainerRuntimeContractError.invalidArgument
             }
+            try await awaitCancellationIfRequested()
             inspectionValue = Self.inspection(
                 state: .stopped,
                 generation: expectedRoutingGeneration + 5
             )
             stopSuccesses += 1
+            return Self.receipt(inspectionValue)
+        }
+
+        func park(
+            expectedStateDigest: String,
+            expectedRoutingGeneration: UInt64
+        ) async throws -> ContainerRuntimeMutationReceipt {
+            parkAttempts += 1
+            guard expectedStateDigest == inspectionValue.stateDigest,
+                  expectedRoutingGeneration == inspectionValue.routingGeneration,
+                  inspectionValue.state == .healthy || inspectionValue.state == .recoveryRequired else {
+                throw ContainerRuntimeContractError.invalidArgument
+            }
+            inspectionValue = Self.inspection(
+                state: .recoveryRequired,
+                generation: expectedRoutingGeneration
+            )
             return Self.receipt(inspectionValue)
         }
 
@@ -332,6 +426,7 @@ final class MenuBarModelTests: XCTestCase {
                   inspectionValue.state == .recoveryRequired else {
                 throw ContainerRuntimeContractError.invalidArgument
             }
+            try await awaitCancellationIfRequested()
             inspectionValue = Self.inspection(
                 state: .stopped,
                 generation: inspectionValue.routingGeneration + 1
@@ -379,6 +474,8 @@ final class MenuBarModelTests: XCTestCase {
             (stopAttempts, stopSuccesses)
         }
 
+        func parkCount() -> Int { parkAttempts }
+
         func recoveryCounts() -> (attempts: Int, successes: Int) {
             (recoveryAttempts, recoverySuccesses)
         }
@@ -389,6 +486,20 @@ final class MenuBarModelTests: XCTestCase {
 
         func forceRecoveryRequired(generation: UInt64 = 19) {
             inspectionValue = Self.inspection(state: .recoveryRequired, generation: generation)
+        }
+
+        private func awaitCancellationIfRequested() async throws {
+            guard waitForMutationCancellation else { return }
+            do {
+                try await Task.sleep(for: .seconds(30))
+                throw ContainerRuntimeContractError.invalidState
+            } catch is CancellationError {
+                inspectionValue = Self.inspection(
+                    state: .recoveryRequired,
+                    generation: inspectionValue.routingGeneration + 1
+                )
+                throw RelayctlError.cancelled
+            }
         }
 
         private static func inspection(
@@ -898,9 +1009,9 @@ final class MenuBarModelTests: XCTestCase {
         let controller = ContainerRuntimeController(client: runtime, defaults: defaults)
         controller.start()
         try await waitUntil { controller.activationWitness != nil }
-        // Initialization, pre-quit observation, final restart check, and the
-        // post-relaunch status projection consume these snapshots in order.
-        let desktop = DesktopController(runningValues: [true, true, false, true])
+        // Initialization, exit, armed-observer, post-mutation, pre-relaunch,
+        // and post-relaunch checks consume these snapshots in order.
+        let desktop = DesktopController(runningValues: [true, true, false, false, false, false, true])
         let model = MenuBarModel(
             client: RelayctlClient(response: externalStatus(generation: 14)),
             targetStore: TargetStore(DesktopTarget(url: appURL)),
@@ -921,7 +1032,8 @@ final class MenuBarModelTests: XCTestCase {
         XCTAssertEqual(counts.successes, 1)
         XCTAssertEqual(desktop.quitRequests, 1)
         XCTAssertEqual(desktop.waitTargets.count, 1)
-        XCTAssertEqual(desktop.relaunches, 1)
+        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 1)
     }
 
     func testContainerRuntimeActivationRejectsQuitRefusalAndTimeoutWithoutMutation() async throws {
@@ -960,7 +1072,7 @@ final class MenuBarModelTests: XCTestCase {
             let counts = await runtime.activationCounts()
             XCTAssertEqual(counts.attempts, 0)
             XCTAssertEqual(counts.successes, 0)
-            XCTAssertEqual(desktop.relaunches, 0)
+            XCTAssertEqual(desktop.newInstanceLaunches, 0)
         }
     }
 
@@ -993,7 +1105,7 @@ final class MenuBarModelTests: XCTestCase {
         let counts = await runtime.activationCounts()
         XCTAssertEqual(counts.attempts, 0)
         XCTAssertEqual(counts.successes, 0)
-        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 0)
     }
 
     func testContainerRuntimeActivationCarriesCapturedCASAndFailsClosedIfItChanges() async throws {
@@ -1028,7 +1140,7 @@ final class MenuBarModelTests: XCTestCase {
         let counts = await runtime.activationCounts()
         XCTAssertEqual(counts.attempts, 1)
         XCTAssertEqual(counts.successes, 0)
-        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 0)
     }
 
     func testContainerRuntimeActivationSucceedsWhenExactDesktopIsAlreadyStopped() async throws {
@@ -1041,7 +1153,7 @@ final class MenuBarModelTests: XCTestCase {
         let controller = ContainerRuntimeController(client: runtime, defaults: defaults)
         controller.start()
         try await waitUntil { controller.activationWitness != nil }
-        let desktop = DesktopController(runningValues: [false, false, false, true])
+        let desktop = DesktopController(runningValues: [false, false, false, false, false, false, true])
         let model = MenuBarModel(
             client: RelayctlClient(response: externalStatus(generation: 14)),
             targetStore: TargetStore(DesktopTarget(url: appURL)),
@@ -1060,7 +1172,8 @@ final class MenuBarModelTests: XCTestCase {
         let counts = await runtime.activationCounts()
         XCTAssertEqual(counts.successes, 1)
         XCTAssertEqual(desktop.quitRequests, 0)
-        XCTAssertEqual(desktop.relaunches, 1)
+        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 1)
     }
 
     func testContainerRuntimeStopAndRecoveryQuitExactDesktopBeforeMutation() async throws {
@@ -1083,7 +1196,7 @@ final class MenuBarModelTests: XCTestCase {
             } else {
                 try await waitUntil { controller.stopWitness != nil }
             }
-            let desktop = DesktopController(runningValues: [true, true, false, true])
+            let desktop = DesktopController(runningValues: [true, true, false, false, false, false, true])
             let model = MenuBarModel(
                 client: RelayctlClient(response: externalStatus()),
                 targetStore: TargetStore(DesktopTarget(url: appURL)),
@@ -1114,7 +1227,8 @@ final class MenuBarModelTests: XCTestCase {
             }
             XCTAssertEqual(desktop.quitRequests, 1)
             XCTAssertEqual(desktop.waitTargets.count, 1)
-            XCTAssertEqual(desktop.relaunches, 1)
+            XCTAssertEqual(desktop.relaunches, 0)
+            XCTAssertEqual(desktop.newInstanceLaunches, 1)
         }
     }
 
@@ -1168,7 +1282,7 @@ final class MenuBarModelTests: XCTestCase {
             let recoveryCounts = await runtime.recoveryCounts()
             XCTAssertEqual(stopCounts.attempts, 0)
             XCTAssertEqual(recoveryCounts.attempts, 0)
-            XCTAssertEqual(desktop.relaunches, 0)
+            XCTAssertEqual(desktop.newInstanceLaunches, 0)
         }
     }
 
@@ -1202,7 +1316,173 @@ final class MenuBarModelTests: XCTestCase {
         let counts = await runtime.recoveryCounts()
         XCTAssertEqual(counts.attempts, 0)
         XCTAssertEqual(counts.successes, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 0)
+    }
+
+    func testContainerRuntimeMutationCancelsAndRequiresRecoveryIfDesktopLaunchesInFlight() async throws {
+        for operation in ["activate", "stop", "recover"] {
+            let appURL = try makeAppBundle()
+            defer { try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent()) }
+            let runtime = ContainerRuntimeClient(waitForMutationCancellation: true)
+            if operation == "stop" {
+                await runtime.forceHealthy()
+            } else if operation == "recover" {
+                await runtime.forceRecoveryRequired()
+            }
+            let defaults = try XCTUnwrap(
+                UserDefaults(suiteName: "ContainerRuntimeInFlightRestart.\(operation).\(UUID().uuidString)")
+            )
+            let controller = ContainerRuntimeController(client: runtime, defaults: defaults)
+            controller.start()
+            switch operation {
+            case "activate":
+                try await waitUntil { controller.activationWitness != nil }
+            case "stop":
+                try await waitUntil { controller.stopWitness != nil }
+            default:
+                try await waitUntil { controller.recoveryWitness != nil }
+            }
+            let desktop = DesktopController(runningValues: [false, false, false, false])
+            let model = MenuBarModel(
+                client: RelayctlClient(response: externalStatus()),
+                targetStore: TargetStore(DesktopTarget(url: appURL)),
+                desktopApplication: desktop,
+                desktopTrustPolicy: trustedPolicy,
+                desktopTrustValidator: TrustValidator(),
+                desktopDiscoverer: DesktopDiscoverer(),
+                loginRegistration: LoginRegistration(),
+                startsPolling: false,
+                localization: englishLocalization()
+            )
+
+            switch operation {
+            case "activate": model.activateContainerRuntime(controller)
+            case "stop": model.stopContainerRuntime(controller)
+            default: model.recoverContainerRuntime(controller)
+            }
+
+            let deadline = Date().addingTimeInterval(1)
+            while Date() < deadline {
+                let attempted: Int
+                switch operation {
+                case "activate": attempted = await runtime.activationCounts().attempts
+                case "stop": attempted = await runtime.stopCounts().attempts
+                default: attempted = await runtime.recoveryCounts().attempts
+                }
+                if attempted == 1 { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            desktop.simulateObservedLaunch()
+
+            try await waitUntil(timeout: 2) {
+                !model.isBusy && controller.inspection?.state == .recoveryRequired &&
+                    model.message?.code == "desktop_restarted"
+            }
+            XCTAssertEqual(controller.inspection?.recoveryRequired, true)
+            XCTAssertEqual(desktop.newInstanceLaunches, 0)
+            switch operation {
+            case "activate":
+                let counts = await runtime.activationCounts()
+                XCTAssertEqual(counts.attempts, 1)
+                XCTAssertEqual(counts.successes, 0)
+            case "stop":
+                let counts = await runtime.stopCounts()
+                XCTAssertEqual(counts.attempts, 1)
+                XCTAssertEqual(counts.successes, 0)
+            default:
+                let counts = await runtime.recoveryCounts()
+                XCTAssertEqual(counts.attempts, 1)
+                XCTAssertEqual(counts.successes, 0)
+            }
+        }
+    }
+
+    func testContainerRuntimeActivationStopsRouteIfDesktopAppearsBeforeRelaunch() async throws {
+        for runningValues in [
+            [false, false, false, false, true, true, false, false, false, false],
+            [false, false, false, false, false, true, true, false, false, false, false],
+        ] {
+            let appURL = try makeAppBundle()
+            defer { try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent()) }
+            let runtime = ContainerRuntimeClient()
+            let defaults = try XCTUnwrap(
+                UserDefaults(suiteName: "ContainerRuntimePostMutationRestart.\(UUID().uuidString)")
+            )
+            let controller = ContainerRuntimeController(client: runtime, defaults: defaults)
+            controller.start()
+            try await waitUntil { controller.activationWitness != nil }
+            let desktop = DesktopController(runningValues: runningValues)
+            let model = MenuBarModel(
+                client: RelayctlClient(response: externalStatus()),
+                targetStore: TargetStore(DesktopTarget(url: appURL)),
+                desktopApplication: desktop,
+                desktopTrustPolicy: trustedPolicy,
+                desktopTrustValidator: TrustValidator(),
+                desktopDiscoverer: DesktopDiscoverer(),
+                loginRegistration: LoginRegistration(),
+                startsPolling: false,
+                localization: englishLocalization()
+            )
+
+            model.activateContainerRuntime(controller)
+
+            try await waitUntil(timeout: 2) {
+                !model.isBusy && controller.inspection?.state == .stopped &&
+                    model.message?.code == "desktop_restarted"
+            }
+            let counts = await runtime.activationCounts()
+            XCTAssertEqual(counts.attempts, 1)
+            XCTAssertEqual(counts.successes, 1)
+            let stopCounts = await runtime.stopCounts()
+            XCTAssertEqual(stopCounts.attempts, 1)
+            XCTAssertEqual(stopCounts.successes, 1)
+            XCTAssertEqual(desktop.quitRequests, 1)
+            XCTAssertEqual(desktop.newInstanceLaunches, 0)
+        }
+    }
+
+    func testContainerRuntimeActivationRejectsUnexpectedLaunchWhileRelaunchObserverStops() async throws {
+        let appURL = try makeAppBundle()
+        defer { try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent()) }
+        let runtime = ContainerRuntimeClient()
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: "ContainerRuntimeRelaunchStopRace.\(UUID().uuidString)")
+        )
+        let controller = ContainerRuntimeController(client: runtime, defaults: defaults)
+        controller.start()
+        try await waitUntil { controller.activationWitness != nil }
+        let desktop = DesktopController(
+            runningValues: [true, true, false, false, false, false, true, false, false, false]
+        )
+        desktop.launchOnObservationStopProcessIdentifier = 9999
+        desktop.relaunchValidationValues = [true, true]
+        let model = MenuBarModel(
+            client: RelayctlClient(response: externalStatus()),
+            targetStore: TargetStore(DesktopTarget(url: appURL)),
+            desktopApplication: desktop,
+            desktopTrustPolicy: trustedPolicy,
+            desktopTrustValidator: TrustValidator(),
+            desktopDiscoverer: DesktopDiscoverer(),
+            loginRegistration: LoginRegistration(),
+            startsPolling: false,
+            localization: englishLocalization()
+        )
+
+        model.activateContainerRuntime(controller)
+
+        try await waitUntil(timeout: 2) {
+            !model.isBusy && controller.inspection?.state == .stopped &&
+                model.message?.code == "desktop_restarted"
+        }
+        let activation = await runtime.activationCounts()
+        XCTAssertEqual(activation.attempts, 1)
+        XCTAssertEqual(activation.successes, 1)
+        let stop = await runtime.stopCounts()
+        XCTAssertEqual(stop.attempts, 1)
+        XCTAssertEqual(stop.successes, 1)
         XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 1)
+        XCTAssertNotEqual(model.message?.code, "routing_applied")
     }
 
     func testContainerRuntimeStopCarriesCapturedCASAndFailsClosedIfItChanges() async throws {
@@ -1238,10 +1518,10 @@ final class MenuBarModelTests: XCTestCase {
         let counts = await runtime.stopCounts()
         XCTAssertEqual(counts.attempts, 1)
         XCTAssertEqual(counts.successes, 0)
-        XCTAssertEqual(desktop.relaunches, 0)
+        XCTAssertEqual(desktop.newInstanceLaunches, 0)
     }
 
-    func testRelaunchTargetsOnlyTheRegisteredDesktopApplication() async throws {
+    func testManualRelaunchKeepsOrdinaryWorkspaceSemanticsAndExactTarget() async throws {
         let appURL = try makeAppBundle()
         defer { try? FileManager.default.removeItem(at: appURL.deletingLastPathComponent()) }
         let client = RelayctlClient(response: externalStatus())
@@ -1260,8 +1540,14 @@ final class MenuBarModelTests: XCTestCase {
 
         model.relaunchSelectedDesktop()
         try await waitUntil { desktop.relaunches == 1 }
-        XCTAssertEqual(desktop.relaunches, 1)
-        XCTAssertEqual(desktop.relaunchTargets, [appURL.resolvingSymlinksInPath().standardizedFileURL])
+        model.relaunchSelectedDesktop()
+        try await waitUntil { desktop.relaunches == 2 }
+        XCTAssertEqual(desktop.relaunches, 2)
+        XCTAssertEqual(desktop.newInstanceLaunches, 0)
+        XCTAssertEqual(
+            desktop.relaunchTargets,
+            Array(repeating: appURL.resolvingSymlinksInPath().standardizedFileURL, count: 2)
+        )
     }
 
     func testConsumerSwitchBindsRequestToValidatedGatewayWitness() async throws {

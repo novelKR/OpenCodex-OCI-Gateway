@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -19,7 +22,7 @@ func (f managementRoundTripFunc) RoundTrip(request *http.Request) (*http.Respons
 }
 
 func TestHTTPManagementAPIUsesHardenedFixedLoopbackClient(t *testing.T) {
-	api := NewHTTPManagementAPI()
+	api := NewHTTPManagementAPI(func(context.Context) error { return nil })
 	if api.client.Timeout != managementRequestTimeout || api.client.CheckRedirect == nil {
 		t.Fatal("management client timeout or redirect policy is missing")
 	}
@@ -50,14 +53,14 @@ func TestHTTPManagementAPIGenericRoutesAndAdminHeader(t *testing.T) {
 		{http.MethodPost, "/api/oauth/login/code", map[string]any{"provider": "xai", "input": "https://localhost/callback?code=opaque"}, `{"ok":true}`},
 		{http.MethodPost, "/api/oauth/login/cancel", map[string]any{"provider": "xai"}, `{"ok":true,"cancelled":true}`},
 	}
-	index := 0
-	api := &HTTPManagementAPI{client: &http.Client{Transport: managementRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if index >= len(requests) {
+	var index atomic.Int64
+	api := newTestManagementAPI(t, managementRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestIndex := int(index.Add(1) - 1)
+		if requestIndex >= len(requests) {
 			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
 		}
-		expected := requests[index]
-		index++
-		if request.URL.Scheme != "http" || request.URL.Host != "127.0.0.1:10210" || request.Method != expected.method || request.URL.RequestURI() != expected.path {
+		expected := requests[requestIndex]
+		if request.Host != "127.0.0.1:10210" || request.Method != expected.method || request.URL.RequestURI() != expected.path {
 			t.Fatalf("request escaped fixed contract: %s %s", request.Method, request.URL)
 		}
 		if request.Header.Get(adminTokenHeader) != string(token) || request.Header.Get("Authorization") != "" {
@@ -80,7 +83,7 @@ func TestHTTPManagementAPIGenericRoutesAndAdminHeader(t *testing.T) {
 			}
 		}
 		return managementResponse(http.StatusOK, expected.result), nil
-	})}}
+	}))
 
 	providers, err := api.Providers(context.Background(), token)
 	if err != nil {
@@ -106,8 +109,8 @@ func TestHTTPManagementAPIGenericRoutesAndAdminHeader(t *testing.T) {
 	if err := api.Cancel(context.Background(), token, flow); err != nil {
 		t.Fatal(err)
 	}
-	if index != len(requests) {
-		t.Fatalf("made %d requests, want %d", index, len(requests))
+	if index.Load() != int64(len(requests)) {
+		t.Fatalf("made %d requests, want %d", index.Load(), len(requests))
 	}
 }
 
@@ -125,16 +128,19 @@ func TestHTTPManagementAPICodexRoutesRemainSeparate(t *testing.T) {
 		`{"ok":true}`,
 		`{"ok":true,"cancelled":true}`,
 	}
-	index := 0
-	api := &HTTPManagementAPI{client: &http.Client{Transport: managementRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+	var index atomic.Int64
+	api := newTestManagementAPI(t, managementRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestIndex := int(index.Add(1) - 1)
 		got := request.Method + " " + request.URL.RequestURI()
-		if index >= len(paths) || got != paths[index] {
-			t.Fatalf("request %d = %q, want %q", index, got, paths[index])
+		if requestIndex >= len(paths) || got != paths[requestIndex] {
+			if requestIndex >= len(paths) {
+				t.Fatalf("unexpected request %d = %q", requestIndex, got)
+			}
+			t.Fatalf("request %d = %q, want %q", requestIndex, got, paths[requestIndex])
 		}
-		response := managementResponse(http.StatusOK, responses[index])
-		index++
+		response := managementResponse(http.StatusOK, responses[requestIndex])
 		return response, nil
-	})}}
+	}))
 	flow, err := api.Start(context.Background(), token, "chatgpt", OAuthKindCodex)
 	if err != nil || flow.UpstreamFlowID != "flow-opaque" {
 		t.Fatalf("flow = %#v, %v", flow, err)
@@ -159,9 +165,9 @@ func TestHTTPManagementAPICancelRequiresPositiveUpstreamAcknowledgement(t *testi
 	}
 	for _, flow := range flows {
 		t.Run(string(flow.Kind), func(t *testing.T) {
-			api := &HTTPManagementAPI{client: &http.Client{Transport: managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			api := newTestManagementAPI(t, managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
 				return managementResponse(http.StatusOK, `{"ok":true,"cancelled":false}`), nil
-			})}}
+			}))
 			if err := api.Cancel(context.Background(), token, flow); !errors.Is(err, errManagementAPI) {
 				t.Fatalf("false cancellation acknowledgement error=%v", err)
 			}
@@ -185,9 +191,9 @@ func TestHTTPManagementAPIRejectsUnsafeOrUnboundedResponsesWithoutLeakingBody(t 
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			api := &HTTPManagementAPI{client: &http.Client{Transport: managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			api := newTestManagementAPI(t, managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
 				return managementResponse(test.status, test.body), nil
-			})}}
+			}))
 			var err error
 			if test.name == "javascript authorization URL" {
 				_, err = api.Start(context.Background(), token, "xai", OAuthKindGeneric)
@@ -215,18 +221,18 @@ func TestHTTPManagementAPIStatusMappingFailsClosed(t *testing.T) {
 		"expired":  OAuthStatusFailed,
 	} {
 		t.Run(upstream, func(t *testing.T) {
-			api := &HTTPManagementAPI{client: &http.Client{Transport: managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			api := newTestManagementAPI(t, managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
 				return managementResponse(http.StatusOK, `{"status":"`+upstream+`"}`), nil
-			})}}
+			}))
 			status, err := api.Status(context.Background(), token, flow)
 			if err != nil || status != expected {
 				t.Fatalf("status = %q, %v; want %q", status, err, expected)
 			}
 		})
 	}
-	api := &HTTPManagementAPI{client: &http.Client{Transport: managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
+	api := newTestManagementAPI(t, managementRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return managementResponse(http.StatusOK, `{"status":"idle"}`), nil
-	})}}
+	}))
 	if _, err := api.Status(context.Background(), token, flow); err == nil {
 		t.Fatal("unknown/idle Codex flow must fail closed")
 	}
@@ -238,6 +244,33 @@ func managementResponse(status int, body string) *http.Response {
 		Header:     http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+}
+
+func newTestManagementAPI(t *testing.T, handler managementRoundTripFunc) *HTTPManagementAPI {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		upstream, err := handler(request)
+		if err != nil || upstream == nil {
+			response.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer upstream.Body.Close()
+		for name, values := range upstream.Header {
+			for _, value := range values {
+				response.Header().Add(name, value)
+			}
+		}
+		response.WriteHeader(upstream.StatusCode)
+		_, _ = io.Copy(response, upstream.Body)
+	}))
+	t.Cleanup(server.Close)
+	api := NewHTTPManagementAPI(func(context.Context) error { return nil })
+	transport := api.client.Transport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp4", server.Listener.Addr().String())
+	}
+	api.client.Transport = transport
+	return api
 }
 
 func testOAuthToken(fill byte) []byte {

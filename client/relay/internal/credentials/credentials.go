@@ -4,6 +4,7 @@ package credentials
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -63,6 +64,19 @@ func (v Values) ValidateForProfile(profile string) error {
 }
 
 func Load(cfg config.CredentialsConfig) (Values, error) {
+	return LoadContext(context.Background(), cfg)
+}
+
+// LoadContext bounds Keychain subprocess access to the caller's request or
+// lifecycle operation. In particular, an Apple runtime reader/writer lease
+// must never survive a canceled security(1) authorization prompt.
+func LoadContext(ctx context.Context, cfg config.CredentialsConfig) (Values, error) {
+	if ctx == nil {
+		return Values{}, errors.New("credential context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return Values{}, fmt.Errorf("credential access cancelled: %w", err)
+	}
 	profile := cfg.RemoteAuthenticationProfile()
 	if profile == config.RemoteAuthenticationNone {
 		return Values{}, nil
@@ -80,7 +94,7 @@ func Load(cfg config.CredentialsConfig) (Values, error) {
 				return Values{}, errors.New("local OpenCodex API key account must be the current user")
 			}
 		}
-		values, err = loadKeychain(cfg.Account, profile)
+		values, err = loadKeychain(ctx, cfg.Account, profile)
 	case config.CredentialsSourceFile:
 		values, err = loadFile(cfg.File)
 	case config.CredentialsSourceNone:
@@ -111,13 +125,13 @@ func ResolveKeychainAccount(account string) (string, error) {
 	return current.Username, nil
 }
 
-func loadKeychain(account, profile string) (Values, error) {
+func loadKeychain(ctx context.Context, account, profile string) (Values, error) {
 	account, err := ResolveKeychainAccount(account)
 	if err != nil {
 		return Values{}, err
 	}
 	read := func(service string) (string, error) {
-		command := exec.Command("/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w")
+		command := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w")
 		output, err := command.Output()
 		if err != nil {
 			return "", fmt.Errorf("read Keychain item %q: %w", service, err)

@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	gort "runtime"
+	"time"
 
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/config"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/credentials"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/localopencodex"
+	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/loopbackauth"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/proxy"
 	"github.com/novelKR/OpenCodex-OCI-Gateway/client/relay/internal/routing"
 )
@@ -18,13 +20,16 @@ import (
 // profile and the optional macOS-local profile. It deliberately does not own
 // routing state or Codex TOML: those remain in routing.Controller.
 type relayRuntime struct {
-	configPath      string
-	watcher         *routing.Watcher
-	tracker         *proxy.Tracker
-	logger          *slog.Logger
-	manager         *proxy.RuntimeManager
-	localPreflight  localTargetPreflight
-	loadCredentials credentialLoader
+	configPath          string
+	watcher             *routing.Watcher
+	tracker             *proxy.Tracker
+	logger              *slog.Logger
+	manager             *proxy.RuntimeManager
+	localPreflight      localTargetPreflight
+	loadCredentials     credentialLoader
+	loadAppleCredential contextCredentialLoader
+	appleLease          loopbackauth.LeaseAcquirer
+	appleGuard          appleRuntimeCredentialGuard
 }
 
 // localOpenCodexPreflight is intentionally private. It keeps the runtime's
@@ -34,6 +39,13 @@ type relayRuntime struct {
 type localOpenCodexPreflight func(context.Context, string) localopencodex.Result
 type localTargetPreflight func(context.Context, localopencodex.Target) localopencodex.Result
 type credentialLoader func(config.CredentialsConfig) (credentials.Values, error)
+type contextCredentialLoader func(context.Context, config.CredentialsConfig) (credentials.Values, error)
+type appleRuntimeCredentialGuard func(context.Context, uint64) error
+type appleRuntimeAccess struct {
+	lease          loopbackauth.LeaseAcquirer
+	guard          appleRuntimeCredentialGuard
+	loadCredential contextCredentialLoader
+}
 
 func newRelayRuntime(
 	ctx context.Context,
@@ -42,8 +54,12 @@ func newRelayRuntime(
 	watcher *routing.Watcher,
 	tracker *proxy.Tracker,
 	logger *slog.Logger,
+	apple appleRuntimeAccess,
 ) (*relayRuntime, error) {
-	return newRelayRuntimeWithDependencies(ctx, configPath, cfg, watcher, tracker, logger, localopencodex.PreflightTarget, credentials.Load)
+	return newRelayRuntimeWithDependencies(
+		ctx, configPath, cfg, watcher, tracker, logger,
+		localopencodex.PreflightTarget, credentials.Load, apple,
+	)
 }
 
 func newRelayRuntimeWithLocalPreflight(
@@ -79,6 +95,7 @@ func newRelayRuntimeWithDependencies(
 	logger *slog.Logger,
 	preflight localTargetPreflight,
 	loadCredentials credentialLoader,
+	appleAccesses ...appleRuntimeAccess,
 ) (*relayRuntime, error) {
 	if cfg.UpstreamMode != config.UpstreamModeExternalGateway {
 		return nil, errors.New("runtime profile switching requires an external_gateway canonical config")
@@ -89,13 +106,29 @@ func newRelayRuntimeWithDependencies(
 	if loadCredentials == nil {
 		loadCredentials = credentials.Load
 	}
+	var apple appleRuntimeAccess
+	if len(appleAccesses) > 0 {
+		apple = appleAccesses[0]
+	}
+	loadAppleCredential := apple.loadCredential
+	if loadAppleCredential == nil {
+		loadAppleCredential = func(ctx context.Context, cfg config.CredentialsConfig) (credentials.Values, error) {
+			if ctx == nil || ctx.Err() != nil {
+				return credentials.Values{}, errors.New("Apple credential request was cancelled")
+			}
+			return loadCredentials(cfg)
+		}
+	}
 	runtime := &relayRuntime{
-		configPath:      configPath,
-		watcher:         watcher,
-		tracker:         tracker,
-		logger:          logger,
-		localPreflight:  preflight,
-		loadCredentials: loadCredentials,
+		configPath:          configPath,
+		watcher:             watcher,
+		tracker:             tracker,
+		logger:              logger,
+		localPreflight:      preflight,
+		loadCredentials:     loadCredentials,
+		loadAppleCredential: loadAppleCredential,
+		appleLease:          apple.lease,
+		appleGuard:          apple.guard,
 	}
 
 	// A durable Local selection must never restart as External merely because
@@ -207,15 +240,23 @@ func (r *relayRuntime) build(ctx context.Context, cfg config.Config, backend rou
 	}
 	observation := proxy.NewConnectionObservation(cfg.UpstreamMode)
 	loader := func() (credentials.Values, error) {
-		return r.loadCredentials(cfg.Credentials)
+		credentialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return r.credentialsForBackend(credentialCtx, cfg, backend)
+	}
+	options := []proxy.Option{
+		proxy.WithRouting(r.watcher),
+		proxy.WithConnectionObservation(observation),
+	}
+	if backend == routing.BackendLocalAppleContainer {
+		options = append(options, proxy.WithAppleRuntimeConnectionBinding(r.authorizeAppleConnection(cfg)))
 	}
 	server, err := proxy.New(
 		cfg,
 		loader,
 		r.tracker,
 		r.logger,
-		proxy.WithRouting(r.watcher),
-		proxy.WithConnectionObservation(observation),
+		options...,
 	)
 	if err != nil {
 		return proxy.Runtime{}, nil, err
@@ -228,8 +269,10 @@ func (r *relayRuntime) build(ctx context.Context, cfg config.Config, backend rou
 		switch backend {
 		case routing.BackendExternal:
 			runCatalogLifecycle(lifecycleCtx, cfg, loader, r.tracker, r.logger, r.watcher, observation)
-		case routing.BackendLocalOpenCodex, routing.BackendLocalAppleContainer:
-			runLocalOpenCodexCatalogLifecycle(lifecycleCtx, cfg, loader, r.tracker, r.logger, r.watcher, observation)
+		case routing.BackendLocalOpenCodex:
+			runLocalOpenCodexCatalogLifecycle(lifecycleCtx, cfg, nil, nil, r.tracker, r.logger, r.watcher, observation)
+		case routing.BackendLocalAppleContainer:
+			runLocalOpenCodexCatalogLifecycle(lifecycleCtx, cfg, r.appleLease, r.authorizeAppleConnection(cfg), r.tracker, r.logger, r.watcher, observation)
 		default:
 			observation.SetCatalogLifecycle(proxy.CatalogLifecyclePaused)
 		}
@@ -252,6 +295,7 @@ func (r *relayRuntime) specFor(cfg config.Config, backend routing.Backend, obser
 			spec.Profile = proxy.RuntimeProfileLocalOpenCodex
 		} else {
 			spec.Profile = proxy.RuntimeProfileLocalAppleContainer
+			spec.ConnectionLease = proxy.ConnectionLease(r.appleLease)
 		}
 		spec.LocalProbeAllowed = func() bool {
 			// A request transition may intentionally retain the current Local
@@ -266,13 +310,9 @@ func (r *relayRuntime) specFor(cfg config.Config, backend routing.Backend, obser
 			if preflight == nil {
 				preflight = localopencodex.PreflightTarget
 			}
-			values, err := r.loadCredentials(cfg.Credentials)
-			if err != nil {
-				return proxy.LocalAvailabilityUnknown, err
-			}
 			target := localopencodex.NativeTarget(cfg.UpstreamBaseURL)
 			if selectedBackend == routing.BackendLocalAppleContainer {
-				target = localopencodex.AppleContainerTarget(values)
+				target = localopencodex.AppleContainerTarget(r.appleProbeLease, r.authorizeAppleConnection(cfg))
 			}
 			result := preflight(ctx, target)
 			return localAvailabilityForRuntime(result.Availability), nil
@@ -288,6 +328,64 @@ func (r *relayRuntime) specFor(cfg config.Config, backend routing.Backend, obser
 		spec.Profile = proxy.RuntimeProfileNone
 	}
 	return spec
+}
+
+// credentialsForBackend is the last boundary before an Apple API token leaves
+// Keychain. Routing state alone is not a peer identity: the lifecycle guard
+// must re-read the signed durable witness and prove that the exact owned Apple
+// container is still running before every proxy, catalog, or health probe can
+// obtain the token.
+func (r *relayRuntime) credentialsForBackend(
+	ctx context.Context,
+	cfg config.Config,
+	backend routing.Backend,
+) (credentials.Values, error) {
+	if r == nil || r.loadCredentials == nil {
+		return credentials.Values{}, errors.New("credential loader is unavailable")
+	}
+	if backend == routing.BackendLocalAppleContainer {
+		return credentials.Values{}, errors.New("Apple credentials require a bound runtime connection")
+	}
+	return r.loadCredentials(cfg.Credentials)
+}
+
+func (r *relayRuntime) authorizeAppleConnection(cfg config.Config) loopbackauth.Authorizer {
+	return func(ctx context.Context) (loopbackauth.Authorization, error) {
+		if r == nil || ctx == nil || r.watcher == nil || r.appleGuard == nil || r.loadAppleCredential == nil {
+			return loopbackauth.Authorization{}, errors.New("Apple runtime authority is unavailable")
+		}
+		bounded, cancel := context.WithTimeout(ctx, loopbackauth.AuthorizationTimeout)
+		defer cancel()
+		snapshot := r.watcher.Snapshot()
+		if snapshot.Invalid || snapshot.State.Generation == 0 ||
+			(snapshot.State.AppliedBackend != routing.BackendLocalAppleContainer &&
+				snapshot.State.DesiredBackend != routing.BackendLocalAppleContainer) {
+			return loopbackauth.Authorization{}, errors.New("Apple runtime authority requires recovery")
+		}
+		if err := r.appleGuard(bounded, snapshot.State.Generation); err != nil {
+			return loopbackauth.Authorization{}, errors.New("Apple runtime authority requires recovery")
+		}
+		values, err := r.loadAppleCredential(bounded, cfg.Credentials)
+		if err != nil || values.ValidateForProfile(config.LocalAuthenticationOpenCodexAPIKey) != nil {
+			return loopbackauth.Authorization{}, errors.New("Apple runtime credential is unavailable")
+		}
+		return loopbackauth.Authorization{Token: []byte(values.LocalOpenCodexAPIKey)}, nil
+	}
+}
+
+type lifecycleOwnedAppleProbeContextKey struct{}
+
+func (r *relayRuntime) appleProbeLease(ctx context.Context) (func() error, error) {
+	if ctx != nil {
+		owned, _ := ctx.Value(lifecycleOwnedAppleProbeContextKey{}).(bool)
+		if owned {
+			return func() error { return nil }, nil
+		}
+	}
+	if r == nil || r.appleLease == nil {
+		return nil, errors.New("Apple runtime lifecycle lease is unavailable")
+	}
+	return r.appleLease(ctx)
 }
 
 func localAvailabilityForRuntime(value localopencodex.Availability) proxy.LocalAvailability {
@@ -356,7 +454,11 @@ func (r *relayRuntime) apply(ctx context.Context, request routing.ControlRequest
 	}
 	// RuntimeManager builds the candidate before invoking a Local probe, so the
 	// observer has the candidate Server health projection available by then.
-	if err := r.manager.Apply(ctx, r.specFor(runtimeCfg, request.Backend, func() *proxy.ConnectionObservation { return candidateObservation }), factory); err != nil {
+	applyCtx := ctx
+	if request.Backend == routing.BackendLocalAppleContainer {
+		applyCtx = context.WithValue(ctx, lifecycleOwnedAppleProbeContextKey{}, true)
+	}
+	if err := r.manager.Apply(applyCtx, r.specFor(runtimeCfg, request.Backend, func() *proxy.ConnectionObservation { return candidateObservation }), factory); err != nil {
 		return routing.ControlResponse{}, fmt.Errorf("apply runtime: %w", err)
 	}
 	return routing.ControlResponse{OK: true, Generation: request.Generation, Backend: request.Backend}, nil
@@ -373,7 +475,7 @@ func (r *relayRuntime) Verify(ctx context.Context, _ routing.ControlOperation) e
 	if r == nil || r.manager == nil {
 		return proxy.ErrRuntimeManagerClosed
 	}
-	return r.manager.VerifyMaintenance(ctx)
+	return r.manager.VerifyMaintenance(context.WithValue(ctx, lifecycleOwnedAppleProbeContextKey{}, true))
 }
 
 func (r *relayRuntime) Resume() {
