@@ -3,9 +3,11 @@
   "private": true,
   "version": "0.3.0",
   "dependencies": {
-    "@bitkyc08/opencodex": "2.40.0"
+    "@bitkyc08/opencodex": "2.42.0"
   },
-  "trustedDependencies": ["bun"],
+  "trustedDependencies": [
+    "bun"
+  ],
   "overrides": {
     "@hono/node-server": "2.1.0",
     "fast-uri": "^3.1.5",
