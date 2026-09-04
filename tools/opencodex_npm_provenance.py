@@ -248,16 +248,15 @@ def validate_registry_signature_evidence(
             fail("npm registry signing-key metadata is invalid")
         trusted.add(keyid)
 
-    seen: set[str] = set()
     matched = 0
     for signature in signatures:
         if not isinstance(signature, dict) or set(signature) != {"keyid", "sig"}:
             fail("npm registry signature metadata is invalid")
         keyid = signature.get("keyid")
-        if not isinstance(keyid, str) or keyid in seen:
+        if not isinstance(keyid, str):
             fail("npm registry signature metadata is invalid")
         strict_base64(signature.get("sig"), "npm registry signature")
-        seen.add(keyid)
+        # npm verifies every array entry and permits one key to sign more than once.
         if keyid in trusted:
             matched += 1
     if matched == 0:

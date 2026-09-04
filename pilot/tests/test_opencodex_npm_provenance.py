@@ -159,7 +159,7 @@ def audit_receipt():
     }
 
 
-def registry_evidence(keys=True):
+def registry_evidence(keys=True, signatures=None):
     keyid = "SHA256:" + encoded(hashlib.sha256(b"registry-key").digest()).rstrip("=")
     metadata = {
         "name": provenance.NPM_PACKAGE,
@@ -170,7 +170,11 @@ def registry_evidence(keys=True):
                 provenance.NPM_REGISTRY
                 + f"/@bitkyc08/opencodex/-/opencodex-{VERSION}.tgz"
             ),
-            "signatures": [{"keyid": keyid, "sig": encoded(b"registry-signature")}],
+            "signatures": (
+                signatures
+                if signatures is not None
+                else [{"keyid": keyid, "sig": encoded(b"registry-signature")}]
+            ),
         },
     }
     keys_document = {
@@ -463,6 +467,31 @@ class OpenCodexNPMProvenanceTests(unittest.TestCase):
     def test_attestations_without_registry_keys_are_rejected(self):
         with self.assertRaisesRegex(provenance.ContractError, "no trusted signing key"):
             registry_evidence(keys=False)
+
+    def test_registry_accepts_multiple_signatures_from_the_same_trusted_key(self):
+        keyid = "SHA256:" + encoded(
+            hashlib.sha256(b"registry-key").digest()
+        ).rstrip("=")
+        evidence = registry_evidence(
+            signatures=[
+                {"keyid": keyid, "sig": encoded(b"registry-signature-one")},
+                {"keyid": keyid, "sig": encoded(b"registry-signature-two")},
+            ]
+        )
+        self.assertEqual(evidence.signature_count, 2)
+        self.assertEqual(evidence.trusted_key_count, 1)
+
+    def test_registry_rejects_malformed_repeated_key_signature(self):
+        keyid = "SHA256:" + encoded(
+            hashlib.sha256(b"registry-key").digest()
+        ).rstrip("=")
+        with self.assertRaisesRegex(provenance.ContractError, "registry signature"):
+            registry_evidence(
+                signatures=[
+                    {"keyid": keyid, "sig": encoded(b"registry-signature-one")},
+                    {"keyid": keyid, "sig": "not base64"},
+                ]
+            )
 
     def test_present_unexpected_package_or_extra_bundle_fails_immediately(self):
         value = audit_receipt()
