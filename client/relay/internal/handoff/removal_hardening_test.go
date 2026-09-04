@@ -914,10 +914,16 @@ func TestBoundedRemovalProcessCancellationStillProvesCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	result, runErr := (boundedRemovalProcess{}).Run(ctx, executable, []string{"-test.run=TestBoundedRemovalProcessCancellationStillProvesCleanup"}, environmentWith(os.Environ(), helperEnvironment, "sleep"), 1024)
-	if !errors.Is(runErr, context.DeadlineExceeded) || !result.Started || !result.CleanupVerified {
+	result, runErr := (boundedRemovalProcess{afterStart: cancel}).Run(
+		ctx,
+		executable,
+		[]string{"-test.run=TestBoundedRemovalProcessCancellationStillProvesCleanup"},
+		environmentWith(os.Environ(), helperEnvironment, "sleep"),
+		1024,
+	)
+	if !errors.Is(runErr, context.Canceled) || !result.Started || !result.CleanupVerified {
 		t.Fatalf("cancelled process result=%#v err=%v", result, runErr)
 	}
 }

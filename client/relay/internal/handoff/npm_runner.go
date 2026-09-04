@@ -283,14 +283,18 @@ func removalEnvironment(home string) ([]string, error) {
 	}, nil
 }
 
-type boundedRemovalProcess struct{}
+type boundedRemovalProcess struct {
+	// afterStart is a zero-value-inert test seam invoked only after the direct
+	// child has started and the reaping goroutine is ready.
+	afterStart func()
+}
 
 type removalReadResult struct {
 	payload []byte
 	err     error
 }
 
-func (boundedRemovalProcess) Run(ctx context.Context, program string, args, environment []string, maximum int64) (RemovalExecutionResult, error) {
+func (p boundedRemovalProcess) Run(ctx context.Context, program string, args, environment []string, maximum int64) (RemovalExecutionResult, error) {
 	if err := ctx.Err(); err != nil {
 		return RemovalExecutionResult{}, err
 	}
@@ -334,6 +338,9 @@ func (boundedRemovalProcess) Run(ctx context.Context, program string, args, envi
 	result := RemovalExecutionResult{Started: true}
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- command.Wait() }()
+	if p.afterStart != nil {
+		p.afterStart()
+	}
 	var waitErr error
 	haveWait := false
 	cleanupStartedProcess := func() bool {
