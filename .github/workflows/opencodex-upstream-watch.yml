@@ -167,7 +167,7 @@ jobs:
             --env BUN_INSTALL_CACHE_DIR=/tmp/bun-cache \
             --mount "type=bind,source=${GITHUB_WORKSPACE}/containers/opencodex,target=/workspace" \
             --workdir /workspace \
-            "$bun_image" install --lockfile-only --ignore-scripts
+            "$bun_image" bun install --lockfile-only --ignore-scripts
           first_lock_hash="$(sha256sum containers/opencodex/bun.lock | awk '{print $1}')"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
@@ -175,7 +175,7 @@ jobs:
             --env BUN_INSTALL_CACHE_DIR=/tmp/bun-cache \
             --mount "type=bind,source=${GITHUB_WORKSPACE}/containers/opencodex,target=/workspace" \
             --workdir /workspace \
-            "$bun_image" install --lockfile-only --ignore-scripts
+            "$bun_image" bun install --lockfile-only --ignore-scripts
           [[ "$(sha256sum containers/opencodex/bun.lock | awk '{print $1}')" == "$first_lock_hash" ]] || {
             printf 'ERROR: Bun lock regeneration is not deterministic\n' >&2
             exit 1

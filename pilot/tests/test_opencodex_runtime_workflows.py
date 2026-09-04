@@ -181,6 +181,13 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("Bun lock regeneration is not deterministic", propose)
         self.assertIn('["git", "ls-files", "--others", "--exclude-standard"]', propose)
         self.assertEqual(propose.count("BUN_INSTALL_CACHE_DIR=/tmp/bun-cache"), 2)
+        bun_lock_command = (
+            '"$bun_image" bun install --lockfile-only --ignore-scripts'
+        )
+        self.assertEqual(propose.count(bun_lock_command), 2)
+        self.assertNotIn(
+            '"$bun_image" install --lockfile-only --ignore-scripts', propose
+        )
         for path in (
             "containers/opencodex/UPSTREAM_NOTICES.md",
             "containers/opencodex/bun.lock",
