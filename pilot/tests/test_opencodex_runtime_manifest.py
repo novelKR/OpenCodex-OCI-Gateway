@@ -22,6 +22,19 @@ DIGESTS = {
     "amd64": "sha256:" + "b" * 64,
     "arm64": "sha256:" + "c" * 64,
 }
+INDEX_METADATA = {
+    "title": "OpenCodex Runtime Candidate",
+    "description": (
+        "Multi-architecture OpenCodex Runtime image built from a pinned immutable "
+        "upstream release. Candidate qualification is separate from stable publication "
+        "and live Apple Container acceptance; verify the selected exact digest and "
+        "signed release status."
+    ),
+    "documentation": (
+        "https://github.com/novelKR/OpenCodex-OCI-Gateway/blob/main/"
+        "containers/opencodex/README.md"
+    ),
+}
 
 
 def index_document():
@@ -63,6 +76,16 @@ def index_document():
             },
         ],
     }
+
+
+def annotated_index_document():
+    document = index_document()
+    document["annotations"] = {
+        "org.opencontainers.image.title": INDEX_METADATA["title"],
+        "org.opencontainers.image.description": INDEX_METADATA["description"],
+        "org.opencontainers.image.documentation": INDEX_METADATA["documentation"],
+    }
+    return document
 
 
 def sbom_document():
@@ -301,6 +324,67 @@ class RuntimeManifestTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(runtime.ContractError, "unexpected"):
             runtime.inspect_index(foreign, DIGESTS["index"])
+
+    def test_index_annotations_are_required_only_when_expected(self):
+        legacy = runtime.inspect_index(index_document(), DIGESTS["index"])
+        self.assertEqual(legacy["index_digest"], DIGESTS["index"])
+
+        inspected = runtime.inspect_index(
+            annotated_index_document(),
+            DIGESTS["index"],
+            INDEX_METADATA["title"],
+            INDEX_METADATA["description"],
+            INDEX_METADATA["documentation"],
+        )
+        self.assertEqual(inspected["attestation_descriptors"], "2")
+
+        with self.assertRaisesRegex(runtime.ContractError, "annotations are missing"):
+            runtime.inspect_index(
+                index_document(),
+                DIGESTS["index"],
+                expected_title=INDEX_METADATA["title"],
+            )
+
+        missing = annotated_index_document()
+        missing["annotations"].pop("org.opencontainers.image.documentation")
+        with self.assertRaisesRegex(runtime.ContractError, "documentation.*is missing"):
+            runtime.inspect_index(
+                missing,
+                DIGESTS["index"],
+                expected_documentation=INDEX_METADATA["documentation"],
+            )
+
+        for field in ("title", "description", "documentation"):
+            mismatched = annotated_index_document()
+            mismatched["annotations"][f"org.opencontainers.image.{field}"] = "wrong"
+            with self.subTest(field=field), self.assertRaisesRegex(
+                runtime.ContractError, rf"{field}.*does not match"
+            ):
+                runtime.inspect_index(
+                    mismatched,
+                    DIGESTS["index"],
+                    **{f"expected_{field}": INDEX_METADATA[field]},
+                )
+
+    def test_inspect_index_parser_accepts_optional_metadata_expectations(self):
+        arguments = runtime.parser().parse_args(
+            [
+                "inspect-index",
+                "--index",
+                "index.json",
+                "--expected-digest",
+                DIGESTS["index"],
+                "--expected-title",
+                INDEX_METADATA["title"],
+                "--expected-description",
+                INDEX_METADATA["description"],
+                "--expected-documentation",
+                INDEX_METADATA["documentation"],
+            ]
+        )
+        self.assertEqual(arguments.expected_title, INDEX_METADATA["title"])
+        self.assertEqual(arguments.expected_description, INDEX_METADATA["description"])
+        self.assertEqual(arguments.expected_documentation, INDEX_METADATA["documentation"])
 
     def test_index_file_bytes_are_bound_to_the_declared_digest(self):
         data = json.dumps(index_document(), separators=(",", ":")).encode("utf-8")

@@ -371,7 +371,13 @@ def canonical_candidate(document: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def inspect_index(document: Any, expected_index: str) -> dict[str, str]:
+def inspect_index(
+    document: Any,
+    expected_index: str,
+    expected_title: str | None = None,
+    expected_description: str | None = None,
+    expected_documentation: str | None = None,
+) -> dict[str, str]:
     if (
         not isinstance(document, dict)
         or set(document) - {"schemaVersion", "mediaType", "manifests", "annotations"}
@@ -380,6 +386,22 @@ def inspect_index(document: Any, expected_index: str) -> dict[str, str]:
         or not isinstance(document.get("manifests"), list)
     ):
         fail("OCI index is invalid")
+    expected_annotations = {
+        "org.opencontainers.image.title": expected_title,
+        "org.opencontainers.image.description": expected_description,
+        "org.opencontainers.image.documentation": expected_documentation,
+    }
+    if any(value is not None for value in expected_annotations.values()):
+        annotations = document.get("annotations")
+        if not isinstance(annotations, dict):
+            fail("OCI index annotations are missing")
+        for key, expected in expected_annotations.items():
+            if expected is None:
+                continue
+            if key not in annotations:
+                fail(f"OCI index annotation {key} is missing")
+            if annotations[key] != expected:
+                fail(f"OCI index annotation {key} does not match the expected value")
     images: dict[str, str] = {}
     attestation_subjects: list[str] = []
     for descriptor in document["manifests"]:
@@ -434,14 +456,26 @@ def inspect_index(document: Any, expected_index: str) -> dict[str, str]:
     }
 
 
-def load_index(path: pathlib.Path, expected_digest: str) -> dict[str, str]:
+def load_index(
+    path: pathlib.Path,
+    expected_digest: str,
+    expected_title: str | None = None,
+    expected_description: str | None = None,
+    expected_documentation: str | None = None,
+) -> dict[str, str]:
     data = load_regular(path, "OCI index", 4 * 1024 * 1024)
     expected = digest_string(expected_digest, "expected index digest")
     actual = "sha256:" + hashlib.sha256(data).hexdigest()
     if actual != expected:
         fail("OCI index bytes do not match the expected digest")
     document = load_json_bytes(data, "OCI index", 4 * 1024 * 1024)
-    return inspect_index(document, expected)
+    return inspect_index(
+        document,
+        expected,
+        expected_title,
+        expected_description,
+        expected_documentation,
+    )
 
 
 def validate_spdx_sbom(document: Any, platform: str) -> None:
@@ -632,7 +666,13 @@ def inspect_attestations(
 def command_inspect_index(arguments: argparse.Namespace) -> int:
     print(
         json.dumps(
-            load_index(arguments.index, arguments.expected_digest),
+            load_index(
+                arguments.index,
+                arguments.expected_digest,
+                arguments.expected_title,
+                arguments.expected_description,
+                arguments.expected_documentation,
+            ),
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -773,6 +813,9 @@ def parser() -> argparse.ArgumentParser:
     inspect = commands.add_parser("inspect-index")
     inspect.add_argument("--index", type=pathlib.Path, required=True)
     inspect.add_argument("--expected-digest", required=True)
+    inspect.add_argument("--expected-title")
+    inspect.add_argument("--expected-description")
+    inspect.add_argument("--expected-documentation")
     inspect.set_defaults(handler=command_inspect_index)
 
     inspect_attestation = commands.add_parser("inspect-attestations")

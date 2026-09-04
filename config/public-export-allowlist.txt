@@ -20,6 +20,7 @@ docs/architecture.ko.md
 docs/architecture.md
 docs/container-profile.md
 docs/deployment-configuration.md
+docs/gateway.md
 docs/local-codex-relay.ko.md
 docs/local-codex-relay.md
 docs/public-core-and-overlay.md

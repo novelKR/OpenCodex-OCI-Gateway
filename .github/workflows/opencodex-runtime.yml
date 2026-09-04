@@ -7,6 +7,8 @@ on:
       - ".github/workflows/opencodex-runtime.yml"
       - "client/relay/**"
       - "containers/opencodex/**"
+      - "!containers/opencodex/README.md"
+      - "!containers/opencodex/README.ko.md"
       - "tools/opencodex_runtime_apple_canary.py"
       - "tools/opencodex_runtime_hosted_qualification.py"
       - "tools/opencodex_runtime_image_test.py"
@@ -33,6 +35,9 @@ concurrency:
 
 env:
   RUNTIME_IMAGE: ghcr.io/novelkr/opencodex-runtime
+  RUNTIME_OCI_TITLE: OpenCodex Runtime Candidate
+  RUNTIME_OCI_DESCRIPTION: Multi-architecture OpenCodex Runtime image built from a pinned immutable upstream release. Candidate qualification is separate from stable publication and live Apple Container acceptance; verify the selected exact digest and signed release status.
+  RUNTIME_OCI_DOCUMENTATION: https://github.com/novelKR/OpenCodex-OCI-Gateway/blob/main/containers/opencodex/README.md
   BUILDX_DOWNLOAD_URL: https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-amd64
   BUILDX_SHA256: c37114fcd034025ec68e224657c8a5a850df472ded3ddcbca75ad3a7ebb9710d
   BUILDX_VERSION_OUTPUT: github.com/docker/buildx v0.30.1 9e66234aa13328a5e75b75aa5574e1ca6d6d9c01
@@ -229,12 +234,16 @@ jobs:
           sbom: true
           provenance: mode=max
           tags: ${{ env.RUNTIME_IMAGE }}:${{ steps.identity.outputs.candidate_tag }}
+          annotations: |
+            index:org.opencontainers.image.title=${{ env.RUNTIME_OCI_TITLE }}
+            index:org.opencontainers.image.description=${{ env.RUNTIME_OCI_DESCRIPTION }}
+            index:org.opencontainers.image.documentation=${{ env.RUNTIME_OCI_DOCUMENTATION }}
           build-args: |
             IMAGE_VERSION=${{ steps.identity.outputs.artifact_version }}
             OPENCODEX_VERSION=${{ steps.identity.outputs.version }}
             OPENCODEX_REVISION=${{ steps.identity.outputs.upstream_revision }}
             PUBLIC_CORE_REVISION=${{ github.sha }}
-      - name: Verify the attestation registry credential binding
+      - name: Verify the candidate registry credential binding
         run: |
           set -euo pipefail
           canonical_home="$(node -p 'require("os").homedir()')"
@@ -294,7 +303,8 @@ jobs:
         with:
           subject-name: ${{ env.RUNTIME_IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          push-to-registry: false
+          create-storage-record: false
       - name: Read back index, platforms, attestations, and candidate descriptor
         id: descriptor
         run: |
@@ -316,7 +326,11 @@ jobs:
             exit 1
           }
           inspection="$(python3 tools/opencodex_runtime_manifest.py inspect-index \
-            --index "$output/index.json" --expected-digest '${{ steps.build.outputs.digest }}')"
+            --index "$output/index.json" \
+            --expected-digest '${{ steps.build.outputs.digest }}' \
+            --expected-title "$RUNTIME_OCI_TITLE" \
+            --expected-description "$RUNTIME_OCI_DESCRIPTION" \
+            --expected-documentation "$RUNTIME_OCI_DOCUMENTATION")"
           amd64_digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["amd64_digest"])' <<<"$inspection")"
           arm64_digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["arm64_digest"])' <<<"$inspection")"
           python3 tools/opencodex_runtime_manifest.py create-candidate \

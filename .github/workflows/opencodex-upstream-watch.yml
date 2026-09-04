@@ -17,7 +17,7 @@ env:
 
 jobs:
   detect:
-    if: github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false
+    if: github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -93,7 +93,7 @@ jobs:
 
   propose:
     needs: detect
-    if: needs.detect.outputs.status == 'update-available'
+    if: needs.detect.outputs.status == 'update-available' && github.repository == 'novelKR/OpenCodex-OCI-Gateway' && github.event.repository.private == false && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: upstream-watch
@@ -104,12 +104,13 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.OPENCODEX_UPSTREAM_WATCH_APP_ID }}
+          client-id: ${{ vars.OPENCODEX_UPSTREAM_WATCH_APP_CLIENT_ID }}
           private-key: ${{ secrets.OPENCODEX_UPSTREAM_WATCH_APP_PRIVATE_KEY }}
           owner: novelKR
           repositories: OpenCodex-OCI-Gateway
           permission-contents: write
           permission-pull-requests: write
+          skip-token-revoke: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
