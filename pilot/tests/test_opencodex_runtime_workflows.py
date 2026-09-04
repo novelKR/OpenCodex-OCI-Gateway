@@ -131,6 +131,13 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("permissions: {}", workflow)
         detect = workflow.split("  detect:\n", 1)[1].split("\n  propose:\n", 1)[0]
         propose = workflow.split("\n  propose:\n", 1)[1]
+        for job in (detect, propose):
+            self.assertIn(
+                "github.repository == 'novelKR/OpenCodex-OCI-Gateway'",
+                job,
+            )
+            self.assertIn("github.event.repository.private == false", job)
+            self.assertIn("github.ref == 'refs/heads/main'", job)
         self.assertIn("contents: read", detect)
         self.assertIn("timeout-minutes: 15", detect)
         self.assertNotIn("contents: write", detect)
@@ -140,8 +147,21 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("candidate_sha256: ${{ steps.detect.outputs.candidate_sha256 }}", detect)
         self.assertIn("downloaded candidate bytes differ from the detector witness", propose)
         self.assertIn("actions/create-github-app-token@", propose)
+        self.assertIn(
+            "client-id: ${{ vars.OPENCODEX_UPSTREAM_WATCH_APP_CLIENT_ID }}",
+            propose,
+        )
+        self.assertIn(
+            "private-key: ${{ secrets.OPENCODEX_UPSTREAM_WATCH_APP_PRIVATE_KEY }}",
+            propose,
+        )
+        self.assertIn("owner: novelKR", propose)
+        self.assertIn("repositories: OpenCodex-OCI-Gateway", propose)
         self.assertIn("permission-contents: write", propose)
         self.assertIn("permission-pull-requests: write", propose)
+        self.assertIn("skip-token-revoke: false", propose)
+        self.assertNotIn("app-id:", propose)
+        self.assertNotIn("OPENCODEX_UPSTREAM_WATCH_APP_ID", workflow)
         self.assertNotIn("permission-actions:", propose)
         self.assertNotIn("permission-workflows:", propose)
         self.assertNotIn("permission-packages:", propose)
@@ -263,6 +283,19 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("tag:", dispatch)
         self.assertNotIn("pull_request:", workflow)
         self.assertNotIn("DOCKER_CONFIG: ${{ runner.temp }}", workflow)
+        self.assertIn("RUNTIME_OCI_TITLE: OpenCodex Runtime Candidate", workflow)
+        self.assertIn(
+            "RUNTIME_OCI_DESCRIPTION: Multi-architecture OpenCodex Runtime image "
+            "built from a pinned immutable upstream release. Candidate qualification "
+            "is separate from stable publication and live Apple Container acceptance; "
+            "verify the selected exact digest and signed release status.",
+            workflow,
+        )
+        self.assertIn(
+            "RUNTIME_OCI_DOCUMENTATION: https://github.com/novelKR/"
+            "OpenCodex-OCI-Gateway/blob/main/containers/opencodex/README.md",
+            workflow,
+        )
         self.assertEqual(
             re.findall(r"^    runs-on: (.+)$", workflow, flags=re.MULTILINE),
             [
@@ -287,9 +320,34 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("platforms: linux/amd64,linux/arm64", candidate)
         self.assertIn("sbom: true", candidate)
         self.assertIn("provenance: mode=max", candidate)
+        self.assertIn('!containers/opencodex/README.md', workflow)
+        self.assertIn('!containers/opencodex/README.ko.md', workflow)
+        self.assertIn(
+            "index:org.opencontainers.image.title=${{ env.RUNTIME_OCI_TITLE }}",
+            candidate,
+        )
+        self.assertIn(
+            "index:org.opencontainers.image.description=${{ env.RUNTIME_OCI_DESCRIPTION }}",
+            candidate,
+        )
+        self.assertIn(
+            "index:org.opencontainers.image.documentation=${{ env.RUNTIME_OCI_DOCUMENTATION }}",
+            candidate,
+        )
         self.assertEqual(workflow.count("docker/build-push-action@"), 1)
         self.assertIn("subject-digest: ${{ steps.build.outputs.digest }}", candidate)
+        self.assertIn("push-to-registry: false", candidate)
+        self.assertIn("create-storage-record: false", candidate)
+        self.assertNotIn("push-to-registry: true", candidate)
+        self.assertNotIn("--bundle-from-oci", workflow)
         self.assertIn("create-candidate", candidate)
+        self.assertIn('--expected-title "$RUNTIME_OCI_TITLE"', candidate)
+        self.assertIn(
+            '--expected-description "$RUNTIME_OCI_DESCRIPTION"', candidate
+        )
+        self.assertIn(
+            '--expected-documentation "$RUNTIME_OCI_DOCUMENTATION"', candidate
+        )
         self.assertEqual(candidate.count("--builder-platform linux/amd64"), 1)
         for platform in ("linux/amd64", "linux/arm64"):
             self.assertIn(f'(index .SBOM "{platform}").SPDX', candidate)
@@ -374,7 +432,7 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, workflow)
         self.assertNotIn(":latest", workflow)
 
-    def test_candidate_attestation_uses_canonical_owner_only_registry_credentials(self):
+    def test_candidate_attestation_uses_api_and_canonical_registry_credentials(self):
         workflow = self.text(".github/workflows/opencodex-runtime.yml")
         candidate = workflow.split("  candidate:\n", 1)[1].split(
             "\n  linux_arm64_canary:\n", 1
@@ -389,7 +447,7 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
             "Install the reviewed Buildx CLI before first execution", 1
         )[1].split("- uses: docker/setup-qemu-action@", 1)[0]
         credential_check = candidate.split(
-            "Verify the attestation registry credential binding", 1
+            "Verify the candidate registry credential binding", 1
         )[1].split("- name: Attest the exact candidate index", 1)[0]
         attest = candidate.split("- name: Attest the exact candidate index", 1)[
             1
@@ -575,7 +633,10 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         self.assertEqual(candidate.count("actions/attest-build-provenance@"), 1)
         self.assertIn("subject-name: ${{ env.RUNTIME_IMAGE }}", attest)
         self.assertIn("subject-digest: ${{ steps.build.outputs.digest }}", attest)
-        self.assertIn("push-to-registry: true", attest)
+        self.assertIn("push-to-registry: false", attest)
+        self.assertIn("create-storage-record: false", attest)
+        self.assertNotIn("push-to-registry: true", attest)
+        self.assertNotIn("--bundle-from-oci", qualification)
 
         self.assertLess(
             candidate.index("docker/login-action@"),
@@ -583,10 +644,10 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         )
         self.assertLess(
             candidate.index("Build and push the two-platform candidate exactly once"),
-            candidate.index("Verify the attestation registry credential binding"),
+            candidate.index("Verify the candidate registry credential binding"),
         )
         self.assertLess(
-            candidate.index("Verify the attestation registry credential binding"),
+            candidate.index("Verify the candidate registry credential binding"),
             candidate.index("Attest the exact candidate index"),
         )
         self.assertLess(
@@ -771,6 +832,8 @@ class RuntimeWorkflowContractTests(unittest.TestCase):
         allowlist = set(
             self.text("config/public-export-allowlist.txt").splitlines()
         )
+        self.assertIn("containers/", allowlist)
+        self.assertIn("docs/gateway.md", allowlist)
         for path in (
             "config/trust/opencodex-runtime-release-ed25519.pub",
             "tools/opencodex_runtime_apple_canary.py",

@@ -32,6 +32,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD ["bun", "-e", "fetch('http://127.0.0.1:10100/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
 
 FROM common AS runtime
+LABEL org.opencontainers.image.title="OpenCodex Runtime Candidate"
+LABEL org.opencontainers.image.description="Multi-architecture OpenCodex Runtime image built from a pinned immutable upstream release. Candidate qualification is separate from stable publication and live Apple Container acceptance; verify the selected exact digest and signed release status."
+LABEL org.opencontainers.image.documentation="https://github.com/novelKR/OpenCodex-OCI-Gateway/blob/main/containers/opencodex/README.md"
 ENV OPENCODEX_HOME=/var/lib/opencodex
 ENTRYPOINT ["bun", "/opt/opencodex/bootstrap.mjs"]
 
