@@ -3,16 +3,16 @@
   "image_revision": 1,
   "repository": "lidge-jun/opencodex",
   "release": {
-    "id": 387873590,
-    "tag": "v2.53.0",
-    "published_at": "2026-09-13T11:08:50Z"
+    "id": 405655089,
+    "tag": "v2.80.0",
+    "published_at": "2026-10-07T10:45:35Z"
   },
-  "version": "2.53.0",
-  "revision": "aa05b3ec53bb9d0e645651b5c3344ae1841f27d6",
+  "version": "2.80.0",
+  "revision": "250f17afd8ff44c93c620d87c1f346ef56f64fb4",
   "npm": {
     "package": "@bitkyc08/opencodex",
-    "version": "2.53.0",
-    "integrity": "sha512-1q66oVVPnrBBgrw4hbTb4+PwveNGwBpHQDQ5Rk8CGTc72arlsTRvvsPV4UW+4gVuN9US/1CV8uXwrBfpVJHJOw==",
-    "tarball": "https://registry.npmjs.org/@bitkyc08/opencodex/-/opencodex-2.53.0.tgz"
+    "version": "2.80.0",
+    "integrity": "sha512-0xiyz9PMs9R2D/7CzzZ6eOmVEQFLMK6Zfcu8EUFE7nfWB/xbwcMHL+iKw55T4KDfXF713iEobAfq8i+h5NTVdQ==",
+    "tarball": "https://registry.npmjs.org/@bitkyc08/opencodex/-/opencodex-2.80.0.tgz"
   }
 }
