@@ -5,7 +5,7 @@
     "": {
       "name": "opencodex-container-runtime",
       "dependencies": {
-        "@bitkyc08/opencodex": "2.53.0",
+        "@bitkyc08/opencodex": "2.86.0",
       },
     },
   },
@@ -19,7 +19,7 @@
     "ip-address": "^10.4.0",
   },
   "packages": {
-    "@bitkyc08/opencodex": ["@bitkyc08/opencodex@2.53.0", "", { "dependencies": { "@bufbuild/protobuf": "^2.14.0", "@modelcontextprotocol/sdk": "^1.30.0", "@napi-rs/keyring": "1.3.0", "bun": "1.4.2", "zod": "4.4.3" }, "bin": { "ocx": "bin/ocx.mjs", "opencodex": "bin/ocx.mjs" } }, "sha512-1q66oVVPnrBBgrw4hbTb4+PwveNGwBpHQDQ5Rk8CGTc72arlsTRvvsPV4UW+4gVuN9US/1CV8uXwrBfpVJHJOw=="],
+    "@bitkyc08/opencodex": ["@bitkyc08/opencodex@2.86.0", "", { "dependencies": { "@bufbuild/protobuf": "^2.14.0", "@modelcontextprotocol/sdk": "^1.30.0", "@napi-rs/keyring": "1.3.0", "bun": "1.4.2", "zod": "4.4.3" }, "optionalDependencies": { "wreq-js": "2.3.1" }, "bin": { "ocx": "bin/ocx.mjs", "opencodex": "bin/ocx.mjs" } }, "sha512-MfN/TVFe/McShDrnZ0n5lPu3GxTc5SwksDdYg+BVgLg58z/2R3ChL/ahNewQ9B5pk1RQNI+IBijY9WBH8BGHww=="],
 
     "@bufbuild/protobuf": ["@bufbuild/protobuf@2.14.0", "", {}, "sha512-C3UGsiCwSprE2NKIIFA3hCDlpXTMCAXRZuEVp88L1GY36Y41+rYL5fryE+nOFhp4p4JPQvdV8PQ4DWgHgeTE+w=="],
 
@@ -252,6 +252,8 @@
     "which": ["which@2.0.2", "", { "dependencies": { "isexe": "^2.0.0" }, "bin": { "node-which": "./bin/node-which" } }, "sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA=="],
 
     "wrappy": ["wrappy@1.0.2", "", {}, "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ=="],
+
+    "wreq-js": ["wreq-js@2.3.1", "", { "os": [ "linux", "win32", "darwin", ], "cpu": [ "x64", "arm64", ] }, "sha512-vaKasaKeskrDKEuuO5Q5uamEG9a6FrF5ZSicH7TCvYS4RxF7/gzaU/vYqwJzcs+uydyJPVWY1KCvfVCgp0tiGA=="],
 
     "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
